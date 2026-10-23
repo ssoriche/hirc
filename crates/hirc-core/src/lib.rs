@@ -9,6 +9,7 @@ pub mod event;
 pub mod isupport;
 pub mod proto;
 pub mod sasl;
+pub mod session;
 pub mod split;
 pub mod store;
 pub mod theme;
