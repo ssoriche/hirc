@@ -1,0 +1,28 @@
+[package]
+name = "hirc-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "IRC protocol, state and storage for hirc. No UI."
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+indexmap.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[features]
+# Integration tests against a local Ergo (scripts/ergo-test.sh setup first).
+ergo-tests = []

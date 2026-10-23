@@ -1,0 +1,11 @@
+/target
+# Flox local state
+/.flox/run
+/.flox/cache
+/.flox/log
+/.flox/telemetry_id
+# Not part of the project: the requirements doc, the user's own Halloy
+# config, and generated design specs and plans.
+/irc-client-spec.md
+/dot_config/
+/docs/superpowers/

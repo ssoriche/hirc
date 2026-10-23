@@ -1,0 +1,27 @@
+# Flox development environment: `flox activate`, then `cargo run --release`.
+schema-version = "1.14.0"
+
+[install]
+cargo.pkg-path = "cargo"
+cargo.pkg-group = "rust-toolchain"
+rustc.pkg-path = "rustc"
+rustc.pkg-group = "rust-toolchain"
+clippy.pkg-path = "clippy"
+clippy.pkg-group = "rust-toolchain"
+rustfmt.pkg-path = "rustfmt"
+rustfmt.pkg-group = "rust-toolchain"
+rust-lib-src.pkg-path = "rustPlatform.rustLibSrc"
+rust-lib-src.pkg-group = "rust-toolchain"
+rust-analyzer.pkg-path = "rust-analyzer"
+rust-analyzer.pkg-group = "rust-analyzer"
+
+# A C compiler and libclang for gpui's build scripts.
+clang.pkg-path = "clang"
+clang.systems = ["aarch64-darwin", "x86_64-darwin"]
+libiconv.pkg-path = "libiconv"
+libiconv.systems = ["aarch64-darwin", "x86_64-darwin"]
+# Test certificates (scripts/ergo-test.sh).
+openssl.pkg-path = "openssl"
+
+[options]
+systems = ["aarch64-darwin", "x86_64-darwin"]
