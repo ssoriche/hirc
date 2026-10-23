@@ -7,10 +7,8 @@ use crate::caps::Caps;
 use crate::event::{Command, ConnStatus, Event, Target};
 use crate::isupport::Isupport;
 use crate::proto::Message;
-use crate::sasl;
-#[allow(unused_imports)]
-use crate::split;
 use crate::store::{Line, LineKind};
+use crate::{sasl, split};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
@@ -158,8 +156,30 @@ impl Session {
             },
             "001" => self.on_welcome(&msg, now, &mut out),
             "005" => self.isupport.apply(&msg.params),
-            // Task 12 adds PRIVMSG, NOTICE, JOIN, PART, KICK, QUIT, NICK,
-            // TOPIC, 332, 353, MODE, ERROR and the numeric fallback here.
+            "PRIVMSG" | "NOTICE" => self.on_message(&msg, now, &mut out),
+            "JOIN" => self.on_join(&msg, now, &mut out),
+            "PART" => self.on_part(&msg, now, &mut out),
+            "KICK" => self.on_kick(&msg, now, &mut out),
+            "QUIT" => self.on_quit(&msg, now, &mut out),
+            "NICK" => self.on_nick(&msg, now, &mut out),
+            "TOPIC" => self.on_topic(&msg, now, &mut out),
+            "332" => {
+                if let [_, chan, topic, ..] = msg.params.as_slice() {
+                    out.push(Output::Event(Event::Topic { network: self.network.clone(), channel: chan.clone(), topic: Some(topic.clone()) }));
+                }
+            }
+            "353" => self.on_names(&msg),
+            "MODE" => self.on_mode(&msg, now, &mut out),
+            "ERROR" => {
+                let line = self.line(&msg, now, LineKind::Error, None, last(&msg).to_owned(), false);
+                out.push(self.event_line(Target::Server, line));
+            }
+            "BATCH" | "TAGMSG" | "366" => {}
+            c if c.len() == 3 && c.bytes().all(|b| b.is_ascii_digit()) => {
+                let text = msg.params.get(1..).unwrap_or_default().join(" ");
+                let line = self.line(&msg, now, LineKind::Server, None, text, false);
+                out.push(self.event_line(Target::Server, line));
+            }
             _ => {}
         }
         out
@@ -283,11 +303,199 @@ impl Session {
     fn event_line(&self, target: Target, line: Line) -> Output {
         Output::Event(Event::Line { network: self.network.clone(), target, line })
     }
-}
 
-impl Session {
-    pub fn command(&mut self, _cmd: Command, _now: DateTime<Utc>) -> Vec<Output> {
-        Vec::new()
+    fn is_me(&self, nick: &str) -> bool {
+        nick.eq_ignore_ascii_case(&self.nick)
+    }
+
+    fn on_message(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let Some(to) = msg.params.first() else { return };
+        let mut text = msg.params.get(1).map_or("", String::as_str);
+        let from_user = msg.source.as_deref().is_some_and(|s| s.contains('!'));
+        let from = msg.nick().unwrap_or("");
+        let own = from_user && self.is_me(from);
+        let mut kind = if msg.command == "NOTICE" { LineKind::Notice } else { LineKind::Privmsg };
+        if let Some(ctcp) = text.strip_prefix('\x01') {
+            let ctcp = ctcp.strip_suffix('\x01').unwrap_or(ctcp);
+            match ctcp.strip_prefix("ACTION") {
+                Some(rest) if msg.command == "PRIVMSG" => {
+                    kind = LineKind::Action;
+                    text = rest.strip_prefix(' ').unwrap_or(rest);
+                }
+                // Other CTCP (VERSION, PING, ...) isn't shown.
+                _ => return,
+            }
+        }
+        let target = if !from_user {
+            Target::Server
+        } else if self.isupport.is_channel(to) {
+            Target::Channel(to.clone())
+        } else if own {
+            Target::Query(to.clone())
+        } else {
+            Target::Query(from.to_owned())
+        };
+        let nick = from_user.then_some(from);
+        let line = self.line(msg, now, kind, nick, text.to_owned(), own);
+        out.push(self.event_line(target, line));
+    }
+
+    fn members_of(&mut self, chan: &str) -> &mut HashSet<String> {
+        self.members.entry(chan.to_ascii_lowercase()).or_default()
+    }
+
+    fn on_join(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let (Some(nick), Some(chan)) = (msg.nick().map(str::to_owned), msg.params.first().cloned()) else { return };
+        if self.is_me(&nick) {
+            self.members.insert(chan.to_ascii_lowercase(), HashSet::new());
+            out.push(Output::Event(Event::Joined { network: self.network.clone(), channel: chan.clone() }));
+        }
+        self.members_of(&chan).insert(nick.to_ascii_lowercase());
+        let line = self.line(msg, now, LineKind::Join, Some(&nick), format!("{nick} joined"), self.is_me(&nick));
+        out.push(self.event_line(Target::Channel(chan), line));
+    }
+
+    fn left(&mut self, chan: &str, nick: &str, out: &mut Vec<Output>) {
+        if self.is_me(nick) {
+            self.members.remove(&chan.to_ascii_lowercase());
+            out.push(Output::Event(Event::Parted { network: self.network.clone(), channel: chan.to_owned() }));
+        } else {
+            self.members_of(chan).remove(&nick.to_ascii_lowercase());
+        }
+    }
+
+    fn on_part(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let (Some(nick), Some(chan)) = (msg.nick().map(str::to_owned), msg.params.first().cloned()) else { return };
+        let text = match msg.params.get(1).filter(|r| !r.is_empty()) {
+            Some(r) => format!("{nick} left ({r})"),
+            None => format!("{nick} left"),
+        };
+        let line = self.line(msg, now, LineKind::Part, Some(&nick), text, self.is_me(&nick));
+        out.push(self.event_line(Target::Channel(chan.clone()), line));
+        self.left(&chan, &nick, out);
+    }
+
+    fn on_kick(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let [chan, victim, rest @ ..] = msg.params.as_slice() else { return };
+        let (chan, victim) = (chan.clone(), victim.clone());
+        let by = msg.nick().unwrap_or("").to_owned();
+        let text = match rest.first().filter(|r| !r.is_empty()) {
+            Some(r) => format!("{by} kicked {victim} ({r})"),
+            None => format!("{by} kicked {victim}"),
+        };
+        let line = self.line(msg, now, LineKind::Kick, Some(&by), text, self.is_me(&by));
+        out.push(self.event_line(Target::Channel(chan.clone()), line));
+        self.left(&chan, &victim, out);
+    }
+
+    /// Channels `nick` is in, as they're spelled in our member map.
+    fn channels_with(&self, nick: &str) -> Vec<String> {
+        let key = nick.to_ascii_lowercase();
+        let mut chans: Vec<String> = self.members.iter().filter(|(_, m)| m.contains(&key)).map(|(c, _)| c.clone()).collect();
+        chans.sort();
+        chans
+    }
+
+    fn on_quit(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let Some(nick) = msg.nick().map(str::to_owned) else { return };
+        let text = match msg.params.first().filter(|r| !r.is_empty()) {
+            Some(r) => format!("{nick} quit ({r})"),
+            None => format!("{nick} quit"),
+        };
+        for chan in self.channels_with(&nick) {
+            self.members_of(&chan).remove(&nick.to_ascii_lowercase());
+            let line = self.line(msg, now, LineKind::Quit, Some(&nick), text.clone(), false);
+            out.push(self.event_line(Target::Channel(chan), line));
+        }
+    }
+
+    fn on_nick(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let (Some(old), Some(new)) = (msg.nick().map(str::to_owned), msg.params.first().cloned()) else { return };
+        let own = self.is_me(&old);
+        if own {
+            self.nick = new.clone();
+            out.push(Output::Event(Event::OwnNick { network: self.network.clone(), nick: new.clone() }));
+        }
+        for chan in self.channels_with(&old) {
+            let m = self.members_of(&chan);
+            m.remove(&old.to_ascii_lowercase());
+            m.insert(new.to_ascii_lowercase());
+            let line = self.line(msg, now, LineKind::Nick, Some(&old), format!("{old} is now known as {new}"), own);
+            out.push(self.event_line(Target::Channel(chan), line));
+        }
+    }
+
+    fn on_topic(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let [chan, topic, ..] = msg.params.as_slice() else { return };
+        let (chan, topic) = (chan.clone(), topic.clone());
+        let by = msg.nick().unwrap_or("").to_owned();
+        out.push(Output::Event(Event::Topic { network: self.network.clone(), channel: chan.clone(), topic: Some(topic.clone()).filter(|t| !t.is_empty()) }));
+        let line = self.line(msg, now, LineKind::Topic, Some(&by), format!("{by} changed the topic to: {topic}"), self.is_me(&by));
+        out.push(self.event_line(Target::Channel(chan), line));
+    }
+
+    fn on_names(&mut self, msg: &Message) {
+        let [_, _, chan, names, ..] = msg.params.as_slice() else { return };
+        let nicks: Vec<String> = names.split_whitespace().map(|n| self.isupport.bare_nick(n).to_ascii_lowercase()).collect();
+        let chan = chan.clone();
+        self.members_of(&chan).extend(nicks);
+    }
+
+    fn on_mode(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let Some(target) = msg.params.first().cloned() else { return };
+        let by = msg.nick().unwrap_or("").to_owned();
+        let modes = msg.params[1..].join(" ");
+        let (dest, own) = if self.isupport.is_channel(&target) { (Target::Channel(target), self.is_me(&by)) } else { (Target::Server, true) };
+        let line = self.line(msg, now, LineKind::Mode, Some(&by), format!("{by} set mode {modes}"), own);
+        out.push(self.event_line(dest, line));
+    }
+
+    pub fn command(&mut self, cmd: Command, now: DateTime<Utc>) -> Vec<Output> {
+        match cmd {
+            Command::Say { target, text, .. } => self.say(&target, &text, false, now),
+            Command::Action { target, text, .. } => self.say(&target, &text, true, now),
+            Command::Join { channel, key, .. } => vec![send("JOIN", std::iter::once(channel).chain(key))],
+            Command::Part { channel, reason, .. } => vec![send("PART", std::iter::once(channel).chain(reason))],
+            Command::Nick { nick, .. } => vec![send("NICK", [nick])],
+            Command::Raw { line, .. } => match Message::parse(&line) {
+                Ok(m) => vec![Output::Send(m)],
+                Err(e) => {
+                    let line = self.local(LineKind::Error, format!("Can't send {line:?}: {e}"), now);
+                    vec![self.event_line(Target::Server, line)]
+                }
+            },
+            Command::Disconnect { reason, .. } => {
+                vec![send("QUIT", reason.into_iter().collect::<Vec<_>>()), Output::Stop("disconnected".into())]
+            }
+            Command::Reconnect { .. } => Vec::new(),
+        }
+    }
+
+    fn local(&mut self, kind: LineKind, text: String, now: DateTime<Utc>) -> Line {
+        self.seq += 1;
+        Line { seq: self.seq, time: now, msgid: None, kind, nick: None, text, own: true }
+    }
+
+    /// PRIVMSG, split to fit. With echo-message the server's echo is the
+    /// copy we show (right time, msgid, order); without it we show ours.
+    fn say(&mut self, target: &str, text: &str, action: bool, now: DateTime<Utc>) -> Vec<Output> {
+        let echo = self.caps.is_enabled("echo-message");
+        let wrap = if action { "\x01ACTION \x01".len() } else { 0 };
+        let budget = split::body_budget("PRIVMSG", target, self.nick.len() + 75).saturating_sub(wrap).max(1);
+        let dest = if self.isupport.is_channel(target) { Target::Channel(target.to_owned()) } else { Target::Query(target.to_owned()) };
+        let mut out = Vec::new();
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            for chunk in split::split_utf8(line, budget) {
+                let body = if action { format!("\x01ACTION {chunk}\x01") } else { chunk.to_owned() };
+                out.push(send("PRIVMSG", [target.to_owned(), body]));
+                if !echo {
+                    let mut l = self.local(if action { LineKind::Action } else { LineKind::Privmsg }, chunk.to_owned(), now);
+                    l.nick = Some(self.nick.clone());
+                    out.push(self.event_line(dest.clone(), l));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -445,5 +653,160 @@ mod tests {
         let mut s = Session::new("net", cfg());
         s.start();
         assert!(sent(&feed(&mut s, ":srv 903 alice :ok")).is_empty());
+    }
+
+    fn registered(caps: &str) -> Session {
+        let mut s = Session::new("net", cfg());
+        s.start();
+        feed(&mut s, &format!(":srv CAP * LS :{caps}"));
+        feed(&mut s, &format!(":srv CAP alice ACK :{caps}"));
+        feed(&mut s, ":srv 001 alice :hi");
+        feed(&mut s, ":srv 005 alice CHANTYPES=# PREFIX=(ov)@+ :are supported");
+        s
+    }
+
+    fn lines(out: &[Output]) -> Vec<(Target, Line)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Event(Event::Line { target, line, .. }) => Some((target.clone(), line.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const ECHO: &str = "message-tags server-time echo-message";
+
+    #[test]
+    fn channel_message_uses_server_time_and_msgid() {
+        let mut s = registered(ECHO);
+        let out = feed(&mut s, "@time=2026-10-22T10:00:00.000Z;msgid=abc :bob!b@h PRIVMSG #test :hello there");
+        let (t, l) = &lines(&out)[0];
+        assert_eq!(*t, Target::Channel("#test".into()));
+        assert_eq!(l.time, "2026-10-22T10:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(l.msgid.as_deref(), Some("abc"));
+        assert_eq!((l.kind, l.nick.as_deref(), l.text.as_str(), l.own), (LineKind::Privmsg, Some("bob"), "hello there", false));
+    }
+
+    #[test]
+    fn missing_time_tag_uses_receive_time() {
+        let mut s = registered(ECHO);
+        assert_eq!(lines(&feed(&mut s, ":bob!b@h PRIVMSG #test :x"))[0].1.time, now());
+    }
+
+    #[test]
+    fn dms_route_to_the_other_party() {
+        let mut s = registered(ECHO);
+        let (t, l) = lines(&feed(&mut s, ":bob!b@h PRIVMSG alice :psst")).remove(0);
+        assert_eq!((t, l.own), (Target::Query("bob".into()), false));
+        let (t, l) = lines(&feed(&mut s, ":alice!a@h PRIVMSG bob :hey")).remove(0);
+        assert_eq!((t, l.own), (Target::Query("bob".into()), true));
+    }
+
+    #[test]
+    fn actions_notices_and_ctcp() {
+        let mut s = registered(ECHO);
+        let (_, l) = lines(&feed(&mut s, ":bob!b@h PRIVMSG #test :\x01ACTION waves\x01")).remove(0);
+        assert_eq!((l.kind, l.text.as_str()), (LineKind::Action, "waves"));
+        let (t, l) = lines(&feed(&mut s, ":srv NOTICE alice :server says hi")).remove(0);
+        assert_eq!((t, l.kind), (Target::Server, LineKind::Notice));
+        let (t, _) = lines(&feed(&mut s, ":NickServ!NickServ@services NOTICE alice :You are now identified")).remove(0);
+        assert_eq!(t, Target::Query("NickServ".into()));
+        assert!(lines(&feed(&mut s, ":bob!b@h PRIVMSG alice :\x01VERSION\x01")).is_empty());
+    }
+
+    #[test]
+    fn say_with_echo_message_only_sends() {
+        let mut s = registered(ECHO);
+        let out = s.command(Command::Say { network: "net".into(), target: "#test".into(), text: "hi".into() }, now());
+        assert_eq!(sent(&out), ["PRIVMSG #test hi"]);
+        assert!(lines(&out).is_empty(), "the echo is the copy we show");
+    }
+
+    #[test]
+    fn say_without_echo_message_shows_locally() {
+        let mut s = registered("server-time");
+        let out = s.command(Command::Say { network: "net".into(), target: "#test".into(), text: "hi".into() }, now());
+        let (t, l) = lines(&out).remove(0);
+        assert_eq!((t, l.own, l.nick.as_deref()), (Target::Channel("#test".into()), true, Some("alice")));
+    }
+
+    #[test]
+    fn long_and_multiline_say_is_split() {
+        let mut s = registered(ECHO);
+        let out = s.command(Command::Say { network: "net".into(), target: "#test".into(), text: format!("{}\nsecond", "a".repeat(1000)) }, now());
+        let msgs = sent(&out);
+        assert_eq!(msgs.len(), 4);
+        assert!(msgs.iter().all(|m| m.len() + 2 + 1 + "alice".len() + 75 < 512), "{msgs:?}");
+        assert_eq!(msgs[3], "PRIVMSG #test second");
+    }
+
+    #[test]
+    fn action_command() {
+        let mut s = registered(ECHO);
+        let out = s.command(Command::Action { network: "net".into(), target: "#test".into(), text: "waves".into() }, now());
+        assert_eq!(sent(&out), ["PRIVMSG #test :\x01ACTION waves\x01"]);
+    }
+
+    #[test]
+    fn own_join_part_and_members_route_quit_and_nick() {
+        let mut s = registered(ECHO);
+        let out = feed(&mut s, ":alice!a@h JOIN #test");
+        assert!(out.contains(&Output::Event(Event::Joined { network: "net".into(), channel: "#test".into() })));
+        feed(&mut s, ":srv 353 alice = #test :alice @bob +carol");
+        feed(&mut s, ":srv 366 alice #test :End of /NAMES list");
+        let (t, l) = lines(&feed(&mut s, ":bob!b@h QUIT :bye")).remove(0);
+        assert_eq!((t, l.kind, l.text.as_str()), (Target::Channel("#test".into()), LineKind::Quit, "bob quit (bye)"));
+        let (_, l) = lines(&feed(&mut s, ":carol!c@h NICK carla")).remove(0);
+        assert_eq!(l.text, "carol is now known as carla");
+        assert!(lines(&feed(&mut s, ":carol!c@h QUIT :gone")).is_empty(), "carol was renamed");
+        let out = feed(&mut s, ":alice!a@h PART #test :later");
+        assert!(out.contains(&Output::Event(Event::Parted { network: "net".into(), channel: "#test".into() })));
+    }
+
+    #[test]
+    fn own_nick_change() {
+        let mut s = registered(ECHO);
+        let out = feed(&mut s, ":alice!a@h NICK alicia");
+        assert!(out.contains(&Output::Event(Event::OwnNick { network: "net".into(), nick: "alicia".into() })));
+        assert_eq!(s.nick(), "alicia");
+    }
+
+    #[test]
+    fn topics_kicks_modes() {
+        let mut s = registered(ECHO);
+        feed(&mut s, ":alice!a@h JOIN #test");
+        let out = feed(&mut s, ":bob!b@h TOPIC #test :new topic");
+        assert!(out.contains(&Output::Event(Event::Topic { network: "net".into(), channel: "#test".into(), topic: Some("new topic".into()) })));
+        assert_eq!(lines(&out)[0].1.text, "bob changed the topic to: new topic");
+        let out = feed(&mut s, ":srv 332 alice #test :old topic");
+        assert!(out.contains(&Output::Event(Event::Topic { network: "net".into(), channel: "#test".into(), topic: Some("old topic".into()) })));
+        assert_eq!(lines(&feed(&mut s, ":bob!b@h MODE #test +o carol"))[0].1.text, "bob set mode +o carol");
+        let out = feed(&mut s, ":bob!b@h KICK #test alice :out");
+        assert_eq!(lines(&out)[0].1.text, "bob kicked alice (out)");
+        assert!(out.contains(&Output::Event(Event::Parted { network: "net".into(), channel: "#test".into() })));
+    }
+
+    #[test]
+    fn numerics_and_errors_go_to_server_buffer() {
+        let mut s = registered(ECHO);
+        let (t, l) = lines(&feed(&mut s, ":srv 372 alice :- MOTD line")).remove(0);
+        assert_eq!((t, l.kind, l.text.as_str()), (Target::Server, LineKind::Server, "- MOTD line"));
+        let (_, l) = lines(&feed(&mut s, "ERROR :Closing link")).remove(0);
+        assert_eq!(l.kind, LineKind::Error);
+    }
+
+    #[test]
+    fn simple_commands() {
+        let mut s = registered(ECHO);
+        let n = || "net".to_owned();
+        assert_eq!(sent(&s.command(Command::Join { network: n(), channel: "#x".into(), key: Some("k".into()) }, now())), ["JOIN #x k"]);
+        assert_eq!(sent(&s.command(Command::Part { network: n(), channel: "#x".into(), reason: None }, now())), ["PART #x"]);
+        assert_eq!(sent(&s.command(Command::Nick { network: n(), nick: "z".into() }, now())), ["NICK z"]);
+        assert_eq!(sent(&s.command(Command::Raw { network: n(), line: "WHO #x".into() }, now())), ["WHO #x"]);
+        let bad = s.command(Command::Raw { network: n(), line: "".into() }, now());
+        assert_eq!(lines(&bad)[0].1.kind, LineKind::Error);
+        let out = s.command(Command::Disconnect { network: n(), reason: Some("bye".into()) }, now());
+        assert_eq!(sent(&out), ["QUIT bye"]);
+        assert!(out.iter().any(|o| matches!(o, Output::Stop(_))));
     }
 }
