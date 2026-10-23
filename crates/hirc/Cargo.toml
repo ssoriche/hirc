@@ -9,6 +9,7 @@ description = "A native IRC client for Ergo"
 hirc-core = { path = "../hirc-core" }
 chrono.workspace = true
 gpui.workspace = true
+gpui_platform.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

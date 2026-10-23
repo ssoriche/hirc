@@ -94,7 +94,8 @@ impl HircApp {
         });
         cx.subscribe(&input, |this, _, ev: &Submit, cx| this.submit(ev.0.clone(), cx)).detach();
         cx.subscribe(&input, |this, _, ev: &VimEvent, cx| this.vim_effect(&ev.0, cx)).detach();
-        window.focus(&input.read(cx).focus_handle(cx));
+        let handle = input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
         let mut events = init.events;
         cx.spawn(async move |this, cx| {
             while let Some(ev) = events.recv().await {
@@ -205,7 +206,7 @@ impl HircApp {
     /// Scroll in pixel space, as the scrollbar does. `scroll_by` is a no-op
     /// while the list follows the tail (no logical scroll top yet).
     fn scroll_px(&mut self, delta: gpui::Pixels) {
-        let cur = (-self.lines.scroll_px_offset_for_scrollbar().y).min(self.lines.max_offset_for_scrollbar().height);
+        let cur = (-self.lines.scroll_px_offset_for_scrollbar().y).min(self.lines.max_offset_for_scrollbar().y);
         self.lines.set_offset_from_scrollbar(gpui::point(px(0.), (cur + delta).max(px(0.))));
     }
 

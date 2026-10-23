@@ -225,7 +225,7 @@ impl Plan {
             }
         }
         if !interactive {
-            let _ = cx.update(|cx| cx.quit());
+            cx.update(|cx| cx.quit());
         }
     }
 }

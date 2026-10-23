@@ -8,7 +8,7 @@ mod views;
 mod vim;
 
 use app::{HircApp, Init, Quit};
-use gpui::{App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size};
+use gpui::{App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size};
 use hirc_core::config;
 
 fn main() {
@@ -60,12 +60,12 @@ fn main() {
     #[cfg(not(feature = "snapshot"))]
     let (width, height) = (1200., 800.);
 
-    Application::new().run(move |cx: &mut App| {
+    gpui_platform::application().run(move |cx: &mut App| {
         input::bind_keys(cx);
         app::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _id| {
             if cx.windows().is_empty() {
                 cx.quit();
             }

@@ -439,7 +439,7 @@ impl Element for TextElement {
             if let Some(selection) = selection {
                 window.paint_quad(selection)
             }
-            if let Err(e) = line.paint(origin, window.line_height(), window, cx) {
+            if let Err(e) = line.paint(origin, window.line_height(), gpui::TextAlign::Left, None, window, cx) {
                 tracing::debug!("input paint failed: {e}");
             }
             if let Some(cursor) = cursor {
