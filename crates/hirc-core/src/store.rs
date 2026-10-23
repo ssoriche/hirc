@@ -140,6 +140,12 @@ impl Store {
                     ConnStatus::Failed { reason } => Some(format!("Stopped: {reason}. Use /reconnect to try again.")),
                     _ => None,
                 };
+                if matches!(status, ConnStatus::Connecting | ConnStatus::Disconnected { .. } | ConnStatus::Failed { .. }) {
+                    // The server forgets our channels with the connection.
+                    for b in &mut self.networks[n].buffers {
+                        b.joined = false;
+                    }
+                }
                 self.networks[n].status = status;
                 match reason {
                     Some(text) => Applied::Line { network: n, buffer: 0, index: self.push_local(n, 0, LineKind::Error, text) },
@@ -250,5 +256,14 @@ mod tests {
         assert_eq!(applied, Applied::Line { network: 0, buffer: 0, index: 0 });
         assert_eq!(s.networks[0].buffers[0].lines[0].kind, LineKind::Error);
         assert!(s.networks[0].buffers[0].lines[0].text.contains("SASL failed"));
+    }
+
+    #[test]
+    fn disconnect_clears_joined_flags() {
+        let mut s = Store::new(["net".to_string()]);
+        s.apply(Event::Joined { network: "net".into(), channel: "#a".into() });
+        assert!(s.networks[0].buffers[1].joined);
+        s.apply(Event::Status { network: "net".into(), status: ConnStatus::Disconnected { reason: "x".into() } });
+        assert!(!s.networks[0].buffers[1].joined);
     }
 }

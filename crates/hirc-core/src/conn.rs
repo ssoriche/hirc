@@ -88,10 +88,12 @@ async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Co
     // Resolved secrets live for the process so reconnects don't re-run
     // `password_command` (each run can prompt). A Stop clears them.
     let mut cached: Option<SessionConfig> = None;
+    // Channels joined at runtime, rejoined after a reconnect.
+    let mut rejoin: Vec<String> = Vec::new();
     loop {
         status(ConnStatus::Connecting);
         let mut registered = false;
-        match connect_once(&name, &server, &mut cached, &mut registered, &mut cmds, &events).await {
+        match connect_once(&name, &server, &mut cached, &mut rejoin, &mut registered, &mut cmds, &events).await {
             Ok(End::Stopped(reason)) => {
                 cached = None;
                 status(ConnStatus::Failed { reason });
@@ -126,6 +128,19 @@ async fn wait_reconnect(cmds: &mut UnboundedReceiver<Command>) -> Option<()> {
             _ => continue,
         }
     }
+}
+
+/// Configured channels plus those joined at runtime, deduplicated on the
+/// channel name (a configured entry may carry a key after the name).
+fn merge_channels(configured: &[String], rejoin: &[String]) -> Vec<String> {
+    let name = |c: &str| c.split(' ').next().unwrap_or("").to_ascii_lowercase();
+    let mut out = configured.to_vec();
+    for ch in rejoin {
+        if !out.iter().any(|o| name(o) == name(ch)) {
+            out.push(ch.clone());
+        }
+    }
+    out
 }
 
 fn session_config(s: &Server) -> Result<SessionConfig, ConfigError> {
@@ -173,6 +188,7 @@ async fn connect_once(
     name: &str,
     server: &Server,
     cached: &mut Option<SessionConfig>,
+    rejoin: &mut Vec<String>,
     registered: &mut bool,
     cmds: &mut UnboundedReceiver<Command>,
     events: &UnboundedSender<Event>,
@@ -217,6 +233,8 @@ async fn connect_once(
     .map_err(|_| Error::from("connect timed out"))??;
     let (r, mut w) = tokio::io::split(stream);
     let mut reader = LineReader::new(BufReader::new(r));
+    let mut cfg = cfg;
+    cfg.channels = merge_channels(&cfg.channels, rejoin);
     let mut session = Session::new(name, cfg);
     let mut outs = session.start();
     let mut last_rx = Instant::now();
@@ -232,6 +250,11 @@ async fn connect_once(
                 Output::Event(e) => {
                     if matches!(e, Event::Status { status: ConnStatus::Connected { .. }, .. }) {
                         *registered = true;
+                    }
+                    match &e {
+                        Event::Joined { channel, .. } if !rejoin.iter().any(|c| c.eq_ignore_ascii_case(channel)) => rejoin.push(channel.clone()),
+                        Event::Parted { channel, .. } => rejoin.retain(|c| !c.eq_ignore_ascii_case(channel)),
+                        _ => {}
                     }
                     let _ = events.send(e);
                 }
@@ -298,5 +321,12 @@ mod tests {
         assert!(tls_config(Some(&empty)).is_err());
         std::fs::write(&empty, "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n").unwrap();
         assert!(tls_config(Some(&empty)).is_err());
+    }
+
+    #[test]
+    fn merge_rejoin_dedups_case_insensitively_on_channel_name() {
+        let configured = vec!["#a key".to_string(), "#b".to_string()];
+        let rejoin = vec!["#A".to_string(), "#c".to_string()];
+        assert_eq!(merge_channels(&configured, &rejoin), ["#a key", "#b", "#c"]);
     }
 }
