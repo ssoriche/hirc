@@ -177,7 +177,7 @@ impl Default for Button {
 pub fn load(config_dir: &Path, name: &str) -> Result<Theme, ConfigError> {
     let path = config_dir.join("themes").join(format!("{name}.toml"));
     let text = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read { path: path.clone(), source })?;
-    toml::from_str(&text).map_err(|source| ConfigError::Parse { path, source })
+    toml::from_str(&text).map_err(|e| crate::config::parse_error(&path, &text, &e))
 }
 
 #[cfg(test)]

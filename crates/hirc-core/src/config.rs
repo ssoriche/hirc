@@ -96,15 +96,26 @@ pub enum Sasl {
 pub enum ConfigError {
     #[error("reading {}: {source}", path.display())]
     Read { path: PathBuf, source: std::io::Error },
-    #[error("parsing {}: {source}", path.display())]
-    Parse { path: PathBuf, source: toml::de::Error },
+    /// No source snippet: toml would print the offending line, which may
+    /// be a password.
+    #[error("parsing {}: {message} (line {line}, column {col})", path.display())]
+    Parse { path: PathBuf, message: String, line: usize, col: usize },
     #[error("password command `{}` failed: {}", program(.command), clip(.message))]
     Command { command: String, message: String },
 }
 
 /// Only the program name: the rest of the command line may hold a secret.
 fn program(command: &str) -> &str {
-    command.split_whitespace().next().unwrap_or("")
+    command.split_whitespace().find(|w| !w.contains('=')).unwrap_or("command")
+}
+
+/// A parse error with a line and column but never the source text.
+pub(crate) fn parse_error(path: &Path, text: &str, e: &toml::de::Error) -> ConfigError {
+    let start = e.span().map_or(0, |s| s.start).min(text.len());
+    let before = &text.as_bytes()[..start];
+    let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+    let col = start - before.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1) + 1;
+    ConfigError::Parse { path: path.to_owned(), message: e.message().to_owned(), line, col }
 }
 
 /// The command's stderr could echo a secret, so cap what we show.
@@ -123,7 +134,7 @@ pub fn dir() -> PathBuf {
 
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read { path: path.to_owned(), source })?;
-    toml::from_str(&text).map_err(|source| ConfigError::Parse { path: path.to_owned(), source })
+    toml::from_str(&text).map_err(|e| parse_error(path, &text, &e))
 }
 
 /// A password from, in order: the value itself, a file, or a command's
@@ -253,5 +264,23 @@ password_command = "printf hunter22"
         std::fs::write(&p, "servers = 3").unwrap();
         let err = load(&p).unwrap_err().to_string();
         assert!(err.contains("config.toml"), "{err}");
+    }
+
+    #[test]
+    fn parse_error_hides_secret_and_shows_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "[servers.x]\npassword = \"hunter2").unwrap();
+        let err = load(&p).unwrap_err().to_string();
+        assert!(!err.contains("hunter2"), "{err}");
+        assert!(err.contains("line 2"), "{err}");
+    }
+
+    #[test]
+    fn error_display_skips_env_assignments() {
+        let err = secret(None, None, Some("OP_SESSION=abc op read x; exit 1")).unwrap_err();
+        let shown = err.to_string();
+        assert!(!shown.contains("abc"), "{shown}");
+        assert!(shown.contains("`op`"), "{shown}");
     }
 }
