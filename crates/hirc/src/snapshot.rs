@@ -18,7 +18,7 @@
 //!
 //! | Variable | Effect |
 //! |---|---|
-//! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` is dropped, so nothing leaves the process. |
+//! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` is dropped (so nothing leaves the process), except that on an `echo_message` server a sent PRIVMSG/NOTICE comes back as a faked server echo. |
 //! | `HIRC_SCREENSHOT=<out.png>` | Final image, taken after the script. Window mode waits 300 ms for layout, captures, quits. |
 //! | `HIRC_OFFSCREEN=1` | Offscreen mode (above). Exits 0 when done; on failure prints `snapshot: <reason>` and exits 1. |
 //! | `HIRC_SIZE=WxH` | Logical size (default `1200x800`). |
@@ -61,7 +61,7 @@
 
 use crate::app::{self, HircApp, Init};
 use crate::views::sidebar;
-use chrono::{DateTime, Duration as Delta, Utc};
+use chrono::{DateTime, Duration as Delta, SecondsFormat, Utc};
 use gpui::{
     AppContext, AsyncApp, HeadlessAppContext, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta,
     ScrollWheelEvent, TouchPhase, WindowHandle, point, px, size,
@@ -206,6 +206,39 @@ pub fn feed(fx: &Fixture) -> Result<(Vec<Event>, HashMap<String, Session>), Stri
     Ok((events, sessions))
 }
 
+/// What an `echo-message` server would send back for `sent`: our own
+/// PRIVMSG/NOTICE with a server time and msgid. Anything else gets no echo.
+fn fake_echo(sent: &Message, nick: &str, now: DateTime<Utc>, n: u64) -> Option<Message> {
+    if !matches!(sent.command.as_str(), "PRIVMSG" | "NOTICE") {
+        return None;
+    }
+    let mut echo = sent.clone();
+    echo.tags = vec![("time".into(), Some(now.to_rfc3339_opts(SecondsFormat::Millis, true))), ("msgid".into(), Some(format!("echo-{n}")))];
+    echo.source = Some(format!("{nick}!u@fixture"));
+    Some(echo)
+}
+
+/// Answer one UI command through the session and return the events for the
+/// UI. Sends never leave the process; on an `echo-message` session the
+/// PRIVMSG/NOTICE ones come back as the server's echo, which is the copy
+/// the UI shows.
+fn answer(session: &mut Session, cmd: Command, now: DateTime<Utc>, echoes: &mut u64) -> Vec<Event> {
+    let mut events = Vec::new();
+    for out in session.command(cmd, now) {
+        match out {
+            Output::Event(e) => events.push(e),
+            Output::Send(sent) if session.caps().is_enabled("echo-message") => {
+                *echoes += 1;
+                if let Some(echo) = fake_echo(&sent, session.nick(), now, *echoes) {
+                    events.extend(session.handle(echo, now).into_iter().filter_map(|o| if let Output::Event(e) = o { Some(e) } else { None }));
+                }
+            }
+            _ => {}
+        }
+    }
+    events
+}
+
 pub struct Plan {
     pub size: (f32, f32),
     fixture: Fixture,
@@ -286,12 +319,11 @@ impl Plan {
                 let _ = ev_tx.send(ev);
             }
             fed.store(true, Ordering::SeqCst);
+            let mut echoes = 0;
             while let Some(cmd) = cmd_rx.blocking_recv() {
                 let Some(session) = sessions.get_mut(cmd.network()) else { continue };
-                for out in session.command(cmd, Utc::now()) {
-                    if let Output::Event(e) = out {
-                        let _ = ev_tx.send(e);
-                    }
+                for e in answer(session, cmd, Utc::now(), &mut echoes) {
+                    let _ = ev_tx.send(e);
                 }
             }
         });
@@ -447,12 +479,11 @@ fn offscreen(mut plan: Plan, init: Init) -> Result<(), String> {
     if let Some((mut sessions, mut cmd_rx, ev_tx)) = plan.serve.take() {
         cx.update(|cx| {
             cx.spawn(async move |_| {
+                let mut echoes = 0;
                 while let Some(cmd) = cmd_rx.recv().await {
                     let Some(session) = sessions.get_mut(cmd.network()) else { continue };
-                    for out in session.command(cmd, Utc::now()) {
-                        if let Output::Event(e) = out {
-                            let _ = ev_tx.send(e);
-                        }
+                    for e in answer(session, cmd, Utc::now(), &mut echoes) {
+                        let _ = ev_tx.send(e);
                     }
                 }
             })
@@ -642,6 +673,43 @@ mod tests {
         let s = sessions.get_mut("other").unwrap();
         let out = s.command(Command::Say { network: "other".into(), target: "#rust".into(), text: "hi".into() }, Utc::now());
         assert!(out.iter().any(|o| matches!(o, Output::Event(Event::Line { .. }))));
+    }
+
+    #[test]
+    fn fake_echo_mirrors_privmsg_and_notice() {
+        let now: DateTime<Utc> = DEFAULT_BASE.parse().unwrap();
+        let sent = Message::parse("PRIVMSG #general :hi there").unwrap();
+        let echo = fake_echo(&sent, "me", now, 3).unwrap();
+        assert_eq!(echo.nick(), Some("me"));
+        assert_eq!(echo.command, "PRIVMSG");
+        assert_eq!(echo.params, ["#general", "hi there"]);
+        assert_eq!(echo.tag("time"), Some("2026-01-01T12:00:00.000Z"));
+        assert_eq!(echo.tag("msgid"), Some("echo-3"));
+        assert!(fake_echo(&Message::parse("NOTICE bob :yo").unwrap(), "me", now, 4).is_some());
+    }
+
+    #[test]
+    fn fake_echo_ignores_everything_else() {
+        let now: DateTime<Utc> = DEFAULT_BASE.parse().unwrap();
+        for line in ["JOIN #a", "PART #a :bye", "NICK x", "PING :x", "TAGMSG #a"] {
+            assert!(fake_echo(&Message::parse(line).unwrap(), "me", now, 0).is_none(), "{line}");
+        }
+    }
+
+    #[test]
+    fn say_on_an_echo_session_yields_one_line() {
+        let fx = parse_fixture(DEMO).unwrap();
+        let (_, mut sessions) = feed(&fx).unwrap();
+        let s = sessions.get_mut("demo").unwrap();
+        let mut n = 0;
+        let events = answer(s, Command::Say { network: "demo".into(), target: "#general".into(), text: "hello world".into() }, Utc::now(), &mut n);
+        let lines: Vec<_> = events.iter().filter(|e| matches!(e, Event::Line { .. })).collect();
+        assert_eq!(lines.len(), 1, "{events:?}");
+        assert!(matches!(lines[0], Event::Line { line, .. } if line.text == "hello world"));
+        // A session without echo-message shows the line locally, once.
+        let s = sessions.get_mut("other").unwrap();
+        let events = answer(s, Command::Say { network: "other".into(), target: "#rust".into(), text: "yo".into() }, Utc::now(), &mut n);
+        assert_eq!(events.iter().filter(|e| matches!(e, Event::Line { .. })).count(), 1);
     }
 
     #[test]
