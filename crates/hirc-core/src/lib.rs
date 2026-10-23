@@ -3,6 +3,7 @@
 //! so it builds and tests without gpui.
 
 pub mod caps;
+pub mod isupport;
 pub mod proto;
 pub mod sasl;
 pub mod split;
