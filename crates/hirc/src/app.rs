@@ -102,13 +102,6 @@ impl HircApp {
         let net = &self.store.networks[n];
         let target = net.buffers[b].target.name().map(str::to_owned);
         let name = net.name.clone();
-        // `/me` with no text would send an empty action; refuse it here.
-        let t = text.trim();
-        if t == "/me" {
-            self.local_error(n, b, "Usage: /me <text>".to_owned());
-            cx.notify();
-            return;
-        }
         match command::parse(&text, &name, target.as_deref()) {
             Ok(Input::Send(cmd)) => {
                 let _ = self.commands.send(cmd);

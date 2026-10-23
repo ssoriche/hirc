@@ -109,12 +109,14 @@ impl TextInput {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.content[self.selected_range.clone()].to_string()));
+            let sel = clamp_range(&self.content, &self.selected_range);
+            cx.write_to_clipboard(ClipboardItem::new_string(self.content[sel].to_string()));
         }
     }
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.content[self.selected_range.clone()].to_string()));
+            let sel = clamp_range(&self.content, &self.selected_range);
+            cx.write_to_clipboard(ClipboardItem::new_string(self.content[sel].to_string()));
             self.replace_text_in_range(None, "", window, cx)
         }
     }
@@ -159,33 +161,11 @@ impl TextInput {
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-
-        utf8_offset
+        utf16_to_utf8(&self.content, offset)
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
-        let mut utf16_offset = 0;
-        let mut utf8_count = 0;
-
-        for ch in self.content.chars() {
-            if utf8_count >= offset {
-                break;
-            }
-            utf8_count += ch.len_utf8();
-            utf16_offset += ch.len_utf16();
-        }
-
-        utf16_offset
+        utf8_to_utf16(&self.content, offset)
     }
 
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
@@ -243,6 +223,7 @@ impl EntityInputHandler for TextInput {
     fn replace_text_in_range(&mut self, range_utf16: Option<Range<usize>>, new_text: &str, _: &mut Window, cx: &mut Context<Self>) {
         let range =
             range_utf16.as_ref().map(|range_utf16| self.range_from_utf16(range_utf16)).or(self.marked_range.clone()).unwrap_or(self.selected_range.clone());
+        let range = clamp_range(&self.content, &range);
 
         self.content = (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
@@ -260,6 +241,7 @@ impl EntityInputHandler for TextInput {
     ) {
         let range =
             range_utf16.as_ref().map(|range_utf16| self.range_from_utf16(range_utf16)).or(self.marked_range.clone()).unwrap_or(self.selected_range.clone());
+        let range = clamp_range(&self.content, &range);
 
         self.content = (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
         if !new_text.is_empty() {
@@ -267,11 +249,11 @@ impl EntityInputHandler for TextInput {
         } else {
             self.marked_range = None;
         }
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        // The IME's selection is relative to `new_text`, not the whole content.
+        self.selected_range = match new_selected_range_utf16 {
+            Some(r) => range.start + utf16_to_utf8(new_text, r.start)..range.start + utf16_to_utf8(new_text, r.end),
+            None => range.start + new_text.len()..range.start + new_text.len(),
+        };
 
         cx.notify();
     }
@@ -289,7 +271,9 @@ impl EntityInputHandler for TextInput {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
 
-        assert_eq!(last_layout.text, self.content);
+        if last_layout.text != self.content {
+            return None;
+        }
         let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
@@ -409,8 +393,12 @@ impl Element for TextElement {
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection)
         }
-        let line = prepaint.line.take().unwrap();
-        line.paint(bounds.origin, window.line_height(), window, cx).unwrap();
+        let Some(line) = prepaint.line.take() else {
+            return;
+        };
+        if let Err(e) = line.paint(bounds.origin, window.line_height(), window, cx) {
+            tracing::debug!("input paint failed: {e}");
+        }
 
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
@@ -507,4 +495,73 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", End, Some("TextInput")),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("TextInput")),
     ]);
+}
+
+/// UTF-16 offset in `s` to a UTF-8 byte offset, clamped to `s`.
+fn utf16_to_utf8(s: &str, offset: usize) -> usize {
+    let (mut utf8, mut utf16) = (0, 0);
+    for ch in s.chars() {
+        if utf16 >= offset {
+            break;
+        }
+        utf16 += ch.len_utf16();
+        utf8 += ch.len_utf8();
+    }
+    utf8
+}
+
+/// UTF-8 byte offset in `s` to a UTF-16 offset.
+fn utf8_to_utf16(s: &str, offset: usize) -> usize {
+    let (mut utf16, mut utf8) = (0, 0);
+    for ch in s.chars() {
+        if utf8 >= offset {
+            break;
+        }
+        utf8 += ch.len_utf8();
+        utf16 += ch.len_utf16();
+    }
+    utf16
+}
+
+/// Pull a range back inside `s` and onto char boundaries, so slicing can't panic.
+fn clamp_range(s: &str, r: &Range<usize>) -> Range<usize> {
+    let fix = |mut i: usize| {
+        i = i.min(s.len());
+        while !s.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let start = fix(r.start);
+    start..fix(r.end).max(start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf16_offsets_roundtrip() {
+        let s = "aあ😀b";
+        assert_eq!(utf16_to_utf8(s, 0), 0);
+        assert_eq!(utf16_to_utf8(s, 2), 4);
+        assert_eq!(utf16_to_utf8(s, 4), 8);
+        assert_eq!(utf16_to_utf8(s, 99), s.len());
+        assert_eq!(utf8_to_utf16(s, 4), 2);
+        assert_eq!(utf8_to_utf16(s, s.len()), 5);
+    }
+
+    #[test]
+    fn clamp_keeps_slicing_safe() {
+        let s = "あk";
+        assert_eq!(clamp_range(s, &(6..6)), 4..4);
+        assert_eq!(clamp_range(s, &(1..2)), 0..0);
+        assert_eq!(&s[clamp_range(s, &(0..99))], "あk");
+    }
+
+    #[test]
+    fn ime_selection_is_relative_to_new_text() {
+        // committed "あ" then composing "k": selection 1..1 in "k" is byte 3+1.
+        assert_eq!(3 + utf16_to_utf8("k", 1), 4);
+    }
 }

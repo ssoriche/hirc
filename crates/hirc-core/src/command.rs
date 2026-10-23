@@ -31,6 +31,7 @@ pub fn parse(input: &str, network: &str, target: Option<&str>) -> Result<Input, 
     let (first, tail) = args.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((args, ""));
     let opt = |s: &str| (!s.is_empty()).then(|| s.to_owned());
     let cmd = match cmd.to_ascii_lowercase().as_str() {
+        "me" if args.is_empty() => return Err("Usage: /me <text>".into()),
         "me" => Command::Action { network: net, target: here()?, text: args.to_owned() },
         "join" | "j" if !first.is_empty() => Command::Join { network: net, channel: first.to_owned(), key: opt(tail) },
         "part" | "leave" if is_channel(first) => Command::Part { network: net, channel: first.to_owned(), reason: opt(tail) },
@@ -58,6 +59,13 @@ mod tests {
 
     fn p(s: &str) -> Result<Input, String> {
         parse(s, "net", Some("#chan"))
+    }
+
+    #[test]
+    fn bare_me_is_a_usage_error() {
+        for s in ["/me", "/ME", "/me   "] {
+            assert_eq!(p(s), Err("Usage: /me <text>".to_owned()), "{s}");
+        }
     }
 
     fn send(s: &str) -> Command {
