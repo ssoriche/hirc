@@ -1,10 +1,11 @@
 //! App state and the event loop. The network thread sends `Event`s; we
 //! apply them to the `Store` and redraw. Input goes back as `Command`s.
 
-use crate::input::{Submit, TextInput};
+use crate::input::{Submit, TextInput, VimEvent};
 use crate::theme::{Palette, palette};
 use crate::views::{buffer, sidebar};
-use gpui::{App, Context, Entity, Focusable, KeyBinding, ListAlignment, ListState, SharedString, Window, actions, div, list, prelude::*, px};
+use crate::vim::{self, Effect, Ex, Nav, Scroll};
+use gpui::{App, Context, Entity, Focusable, KeyBinding, ListAlignment, ListOffset, ListState, SharedString, Window, actions, div, list, prelude::*, px};
 use hirc_core::command::{self, Input, WindowAction};
 use hirc_core::event::{Command, Event, Target};
 use hirc_core::layout::{self, Layout};
@@ -81,8 +82,14 @@ impl HircApp {
             tracing::warn!("could not save window layout: {e}");
         }
         let selected = layout.resolve(&store, 0).or_else(|| (!store.networks.is_empty()).then_some((0, 0)));
-        let input = cx.new(|cx| TextInput::new("Message", cx));
+        let palette = palette(&init.theme);
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new("Message", cx);
+            input.palette = Some(palette.clone());
+            input
+        });
         cx.subscribe(&input, |this, _, ev: &Submit, cx| this.submit(ev.0.clone(), cx)).detach();
+        cx.subscribe(&input, |this, _, ev: &VimEvent, cx| this.vim_effect(&ev.0, cx)).detach();
         window.focus(&input.read(cx).focus_handle(cx));
         let mut events = init.events;
         cx.spawn(async move |this, cx| {
@@ -98,7 +105,7 @@ impl HircApp {
             selected,
             layout,
             layout_path,
-            palette: palette(&init.theme),
+            palette,
             font_family: init.font_family.map(Into::into),
             font_size: init.font_size,
             banner: init.banner,
@@ -140,6 +147,75 @@ impl HircApp {
         if let Some((n, b)) = number.checked_sub(1).and_then(|pos| self.layout.resolve(&self.store, pos)) {
             self.select(n, b, cx);
         }
+    }
+
+    /// Number of numbered windows.
+    fn window_count(&self) -> usize {
+        (0..).take_while(|&pos| self.layout.resolve(&self.store, pos).is_some()).count()
+    }
+
+    /// Next or previous window after the selected one, wrapping around.
+    fn nav(&mut self, dir: Nav, cx: &mut Context<Self>) {
+        let count = self.window_count();
+        let Some((n, b)) = self.selected else { return };
+        let Some(pos) = self.layout.position_of(&self.store, n, b) else { return };
+        if count == 0 {
+            return;
+        }
+        let to = match dir {
+            Nav::Next => (pos + 1) % count,
+            Nav::Prev => (pos + count - 1) % count,
+        };
+        self.goto_window(to + 1, cx);
+    }
+
+    /// Go to the first window whose label starts with `name`, ignoring case.
+    fn goto_buffer(&mut self, name: &str, cx: &mut Context<Self>) {
+        let want = name.to_lowercase();
+        let found = (0..).map_while(|pos| self.layout.resolve(&self.store, pos)).find(|&(n, b)| {
+            let net = &self.store.networks[n];
+            let label = net.buffers[b].target.name().unwrap_or(&net.name);
+            label.to_lowercase().starts_with(&want)
+        });
+        match (found, self.selected) {
+            (Some((n, b)), _) => self.select(n, b, cx),
+            (None, Some((n, b))) => {
+                self.local_error(n, b, format!("No buffer matching {name}"));
+                cx.notify();
+            }
+            (None, None) => {}
+        }
+    }
+
+    fn scroll(&mut self, s: Scroll) {
+        let line = px(self.font_size * 1.4);
+        // The list reports its viewport once laid out; before that, guess.
+        let page = match self.lines.viewport_bounds().size.height {
+            h if h > px(0.) => h,
+            _ => px(400.),
+        };
+        match s {
+            Scroll::Lines(n) => self.lines.scroll_by(line * n as f32),
+            Scroll::HalfPage(n) => self.lines.scroll_by(page / 2. * n as f32),
+            Scroll::Top => self.lines.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) }),
+            Scroll::Bottom => self.lines.scroll_to(ListOffset { item_ix: self.lines.item_count(), offset_in_item: px(0.) }),
+        }
+    }
+
+    fn vim_effect(&mut self, effect: &Effect, cx: &mut Context<Self>) {
+        match effect {
+            Effect::Scroll(s) => self.scroll(*s),
+            Effect::Nav(dir) => self.nav(*dir, cx),
+            Effect::Ex(line) => match vim::ex(line) {
+                Ex::None => {}
+                Ex::Quit => cx.quit(),
+                Ex::Window(n) => self.goto_window(n, cx),
+                Ex::Buffer(name) => self.goto_buffer(&name, cx),
+                Ex::Slash(s) => self.submit(s, cx),
+            },
+            Effect::Pass | Effect::Edit { .. } | Effect::Submit => {}
+        }
+        cx.notify();
     }
 
     fn move_window(&mut self, number: usize, cx: &mut Context<Self>) {

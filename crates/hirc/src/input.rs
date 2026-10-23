@@ -4,10 +4,12 @@
 
 use std::ops::Range;
 
+use crate::theme::Palette;
+use crate::vim::{self, Effect, Key, Mode, Named, Vim};
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString,
-    Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
+    GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
+    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::*;
 
@@ -23,6 +25,9 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    vim: Vim,
+    /// For the mode label; set by the app.
+    pub palette: Option<Palette>,
 }
 
 impl TextInput {
@@ -64,6 +69,10 @@ impl TextInput {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        // Key bindings run before `capture_key_down`, so route through vim here.
+        if self.vim_key(named_key(Named::Backspace), cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             self.select_to(self.previous_boundary(self.cursor_offset()), cx)
         }
@@ -71,6 +80,9 @@ impl TextInput {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vim.mode == Mode::Normal {
+            return;
+        }
         if self.selected_range.is_empty() {
             self.select_to(self.next_boundary(self.cursor_offset()), cx)
         }
@@ -221,6 +233,10 @@ impl EntityInputHandler for TextInput {
     }
 
     fn replace_text_in_range(&mut self, range_utf16: Option<Range<usize>>, new_text: &str, _: &mut Window, cx: &mut Context<Self>) {
+        // Normal mode never inserts text.
+        if self.vim.mode == Mode::Normal {
+            return;
+        }
         let range =
             range_utf16.as_ref().map(|range_utf16| self.range_from_utf16(range_utf16)).or(self.marked_range.clone()).unwrap_or(self.selected_range.clone());
         let range = clamp_range(&self.content, &range);
@@ -239,6 +255,9 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.vim.mode == Mode::Normal {
+            return;
+        }
         let range =
             range_utf16.as_ref().map(|range_utf16| self.range_from_utf16(range_utf16)).or(self.marked_range.clone()).unwrap_or(self.selected_range.clone());
         let range = clamp_range(&self.content, &range);
@@ -335,6 +354,7 @@ impl Element for TextElement {
         let content = input.content.clone();
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
+        let normal = input.vim.mode == Mode::Normal;
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() { (input.placeholder.clone(), style.color.opacity(0.4)) } else { (content, style.color) };
@@ -362,7 +382,14 @@ impl Element for TextElement {
 
         let cursor_pos = line.x_for_index(cursor);
         let (selection, cursor) = if selected_range.is_empty() {
-            (None, Some(fill(Bounds::new(point(bounds.left() + cursor_pos, bounds.top()), size(px(2.), bounds.bottom() - bounds.top())), style.color)))
+            // Normal mode draws a translucent block over the char under the cursor.
+            let (width, color) = if normal {
+                let end = line.x_for_index(next_char_boundary(&line.text, cursor));
+                (if end > cursor_pos { end - cursor_pos } else { font_size * 0.6 }, style.color.opacity(0.5))
+            } else {
+                (px(2.), style.color)
+            };
+            (None, Some(fill(Bounds::new(point(bounds.left() + cursor_pos, bounds.top()), size(width, bounds.bottom() - bounds.top())), color)))
         } else {
             (
                 Some(fill(
@@ -415,10 +442,17 @@ impl Element for TextElement {
 
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = match self.vim.mode {
+            Mode::Insert => "INSERT",
+            Mode::Normal => "NORMAL",
+            Mode::Ex => ":",
+        };
+        let dim = self.palette.as_ref().map(|p| p.text_dim);
         div()
             .flex()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
+            .capture_key_down(cx.listener(Self::on_key_down))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::backspace))
@@ -438,7 +472,8 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .child(div().w_full().child(TextElement { input: cx.entity() }))
+            .child(div().flex_none().mr_2().text_xs().when_some(dim, |d, c| d.text_color(c)).child(label))
+            .child(div().flex_1().child(TextElement { input: cx.entity() }))
     }
 }
 
@@ -459,19 +494,106 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            vim: Vim::default(),
+            palette: None,
         }
     }
 
     fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        // Key bindings run before `capture_key_down`, so route through vim here.
+        if self.vim_key(named_key(Named::Enter), cx) {
+            return;
+        }
+        self.submit(cx);
+    }
+
+    fn submit(&mut self, cx: &mut Context<Self>) {
         let text = self.content.to_string();
         if text.trim().is_empty() {
             return;
         }
         self.reset();
+        self.vim.reset();
         cx.emit(Submit(text));
         cx.notify();
     }
+
+    /// Keys that are not bound to an action. Runs in the capture phase so
+    /// Normal-mode keys never reach the IME.
+    fn on_key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        // Enter and Backspace arrive as actions; alt/cmd chords are the app's.
+        if ks.modifiers.alt || ks.modifiers.platform || ks.modifiers.function || matches!(ks.key.as_str(), "enter" | "backspace") {
+            return;
+        }
+        let Some(key) = to_key(ks.key.as_str(), ks.key_char.as_deref(), ks.modifiers.shift, ks.modifiers.control) else { return };
+        if self.vim_key(key, cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Run a key through vim and apply the effects. True if vim consumed it.
+    fn vim_key(&mut self, key: Key, cx: &mut Context<Self>) -> bool {
+        let cursor = clamp_range(&self.content, &(self.cursor_offset()..self.cursor_offset())).start;
+        let effects = self.vim.key(&key, &self.content, cursor);
+        if effects == [Effect::Pass] {
+            return false;
+        }
+        for effect in effects {
+            match effect {
+                Effect::Pass => {}
+                Effect::Edit { text, cursor } => {
+                    self.content = text.into();
+                    self.selected_range = cursor..cursor;
+                    self.selection_reversed = false;
+                    self.marked_range = None;
+                }
+                Effect::Submit => self.submit(cx),
+                Effect::Ex(_) => {
+                    self.reset();
+                    cx.emit(VimEvent(effect));
+                }
+                Effect::Scroll(_) | Effect::Nav(_) => cx.emit(VimEvent(effect)),
+            }
+        }
+        cx.notify();
+        true
+    }
 }
+
+/// Convert a gpui keystroke to vim's key. `None` for keys vim ignores.
+fn to_key(key: &str, key_char: Option<&str>, shift: bool, ctrl: bool) -> Option<Key> {
+    let named = match key {
+        "escape" => Some(Named::Escape),
+        "enter" => Some(Named::Enter),
+        "backspace" => Some(Named::Backspace),
+        _ => None,
+    };
+    if named.is_some() {
+        return Some(Key { ch: None, named, ctrl });
+    }
+    let single = |s: &str| {
+        let mut it = s.chars();
+        it.next().filter(|_| it.next().is_none())
+    };
+    let from_key = || single(key).map(|c| if shift { c.to_uppercase().next().unwrap_or(c) } else { c });
+    // With ctrl, `key_char` can be a control character; use the key itself.
+    let ch = if ctrl { from_key()? } else { key_char.and_then(single).or_else(from_key)? };
+    Some(Key { ch: Some(ch), named: None, ctrl })
+}
+
+fn named_key(n: Named) -> Key {
+    Key { ch: None, named: Some(n), ctrl: false }
+}
+
+fn next_char_boundary(s: &str, at: usize) -> usize {
+    s.get(at..).and_then(|t| t.chars().next()).map_or(s.len(), |c| at + c.len_utf8())
+}
+
+/// A vim effect the app must handle (scroll, window nav, ex line).
+pub struct VimEvent(pub vim::Effect);
+
+impl EventEmitter<VimEvent> for TextInput {}
 
 pub struct Submit(pub String);
 
@@ -563,5 +685,17 @@ mod tests {
     fn ime_selection_is_relative_to_new_text() {
         // committed "あ" then composing "k": selection 1..1 in "k" is byte 3+1.
         assert_eq!(3 + utf16_to_utf8("k", 1), 4);
+    }
+
+    #[test]
+    fn keystrokes_become_vim_keys() {
+        let ch = |k: Option<Key>| k.and_then(|k| k.ch);
+        assert_eq!(ch(to_key("g", Some("G"), true, false)), Some('G'));
+        assert_eq!(ch(to_key("g", None, true, false)), Some('G'));
+        assert_eq!(ch(to_key(";", Some(":"), true, false)), Some(':'));
+        assert_eq!(ch(to_key("d", Some("\u{4}"), false, true)), Some('d'));
+        assert!(to_key("d", Some("d"), false, true).is_some_and(|k| k.ctrl));
+        assert_eq!(to_key("escape", None, false, false).and_then(|k| k.named), Some(Named::Escape));
+        assert!(to_key("left", None, false, false).is_none());
     }
 }

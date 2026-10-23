@@ -3,6 +3,7 @@ mod app;
 mod input;
 mod theme;
 mod views;
+mod vim;
 
 use app::{HircApp, Init, Quit};
 use gpui::{App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size};
