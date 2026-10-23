@@ -151,7 +151,7 @@ impl HircApp {
 
     /// Number of numbered windows.
     fn window_count(&self) -> usize {
-        (0..).take_while(|&pos| self.layout.resolve(&self.store, pos).is_some()).count()
+        (0..self.layout.windows.len()).filter_map(|pos| self.layout.resolve(&self.store, pos)).count()
     }
 
     /// Next or previous window after the selected one, wrapping around.
@@ -172,10 +172,11 @@ impl HircApp {
     /// Go to the first window whose label starts with `name`, ignoring case.
     fn goto_buffer(&mut self, name: &str, cx: &mut Context<Self>) {
         let want = name.to_lowercase();
-        let found = (0..).map_while(|pos| self.layout.resolve(&self.store, pos)).find(|&(n, b)| {
+        let found = (0..self.layout.windows.len()).filter_map(|pos| self.layout.resolve(&self.store, pos)).find(|&(n, b)| {
             let net = &self.store.networks[n];
             let label = net.buffers[b].target.name().unwrap_or(&net.name);
-            label.to_lowercase().starts_with(&want)
+            let label = label.to_lowercase();
+            label.starts_with(&want) || label.trim_start_matches(['#', '&']).starts_with(&want)
         });
         match (found, self.selected) {
             (Some((n, b)), _) => self.select(n, b, cx),
@@ -187,6 +188,13 @@ impl HircApp {
         }
     }
 
+    /// Scroll in pixel space, as the scrollbar does. `scroll_by` is a no-op
+    /// while the list follows the tail (no logical scroll top yet).
+    fn scroll_px(&mut self, delta: gpui::Pixels) {
+        let cur = (-self.lines.scroll_px_offset_for_scrollbar().y).min(self.lines.max_offset_for_scrollbar().height);
+        self.lines.set_offset_from_scrollbar(gpui::point(px(0.), (cur + delta).max(px(0.))));
+    }
+
     fn scroll(&mut self, s: Scroll) {
         let line = px(self.font_size * 1.4);
         // The list reports its viewport once laid out; before that, guess.
@@ -195,8 +203,8 @@ impl HircApp {
             _ => px(400.),
         };
         match s {
-            Scroll::Lines(n) => self.lines.scroll_by(line * n as f32),
-            Scroll::HalfPage(n) => self.lines.scroll_by(page / 2. * n as f32),
+            Scroll::Lines(n) => self.scroll_px(line * n as f32),
+            Scroll::HalfPage(n) => self.scroll_px(page / 2. * n as f32),
             Scroll::Top => self.lines.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) }),
             Scroll::Bottom => self.lines.scroll_to(ListOffset { item_ix: self.lines.item_count(), offset_in_item: px(0.) }),
         }

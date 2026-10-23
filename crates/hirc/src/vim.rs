@@ -152,9 +152,11 @@ impl Vim {
             Some(Named::Escape) => self.leave_ex(),
             Some(Named::Backspace) if text == ":" => self.leave_ex(),
             Some(Named::Enter) => {
-                self.mode = Mode::Normal;
-                self.saved = None;
-                vec![Effect::Ex(text.strip_prefix(':').unwrap_or(text).to_owned())]
+                // Run the line, then bring the unsent draft back: vim never loses text.
+                let line = text.strip_prefix(':').unwrap_or(text).to_owned();
+                let mut effects = vec![Effect::Ex(line)];
+                effects.extend(self.leave_ex());
+                effects
             }
             _ => vec![Effect::Pass],
         }
@@ -247,8 +249,8 @@ impl Vim {
             }
             'D' if !text.is_empty() => self.change(text, cursor, cursor..text.len(), text[cursor..].to_owned(), false),
             'C' => self.change(text, cursor, cursor..text.len(), text[cursor..].to_owned(), true),
-            'p' => self.paste(text, if text.is_empty() { 0 } else { next_char(text, cursor) }),
-            'P' => self.paste(text, cursor),
+            'p' => self.paste(text, cursor, if text.is_empty() { 0 } else { next_char(text, cursor) }),
+            'P' => self.paste(text, cursor, cursor),
             'u' => match self.undo.take() {
                 Some((t, c)) => {
                     let c = clamp_normal(&t, c);
@@ -299,11 +301,11 @@ impl Vim {
         }
     }
 
-    fn paste(&mut self, text: &str, at: usize) -> Vec<Effect> {
+    fn paste(&mut self, text: &str, cursor: usize, at: usize) -> Vec<Effect> {
         if self.register.is_empty() {
             return vec![];
         }
-        self.undo = Some((text.to_owned(), at));
+        self.undo = Some((text.to_owned(), cursor));
         let new = format!("{}{}{}", &text[..at], self.register, &text[at..]);
         let cursor = clamp_normal(&new, at + self.register.len());
         vec![Effect::Edit { text: new, cursor }]
@@ -316,7 +318,7 @@ fn edit(text: &str, cursor: usize) -> Effect {
 
 /// In Normal mode the cursor sits on a char: clamp to the start of the last
 /// char (0 when empty) and onto a char boundary.
-fn clamp_normal(text: &str, cursor: usize) -> usize {
+pub fn clamp_normal(text: &str, cursor: usize) -> usize {
     let last = text.char_indices().next_back().map_or(0, |(i, _)| i);
     let mut c = cursor.min(last);
     while !text.is_char_boundary(c) {
@@ -747,8 +749,27 @@ mod tests {
         s.feed(k('3'));
         assert_eq!(s.effects, vec![Effect::Pass]);
         s.type_str("3").feed(named(Named::Enter));
-        assert_eq!(s.effects.last(), Some(&Effect::Ex("3".into())));
+        assert!(s.effects.contains(&Effect::Ex("3".into())));
         assert_eq!(s.vim.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn ex_enter_keeps_the_draft() {
+        let mut s = Sim::new("hello", 5);
+        s.feed(esc()).feed(k(':'));
+        s.type_str("3").feed(named(Named::Enter));
+        assert_eq!(s.effects.iter().filter(|e| matches!(e, Effect::Ex(_))).count(), 1);
+        assert!(s.effects.contains(&Effect::Ex("3".into())));
+        assert_eq!(s.state(), ("hello", 4, Mode::Normal));
+    }
+
+    #[test]
+    fn undo_after_paste_restores_original_cursor() {
+        let mut s = Sim::normal("ab", 0);
+        s.keys("xp");
+        assert_eq!(s.text, "ba");
+        s.keys("u");
+        assert_eq!(s.state(), ("b", 0, Mode::Normal));
     }
 
     #[test]

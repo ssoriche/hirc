@@ -134,6 +134,8 @@ impl TextInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        // In Normal mode the cursor sits on a char, never at `len`.
+        let offset = if self.vim.mode == Mode::Normal { vim::clamp_normal(&self.content, offset) } else { offset };
         self.selected_range = offset..offset;
         cx.notify()
     }
@@ -549,11 +551,7 @@ impl TextInput {
                     self.marked_range = None;
                 }
                 Effect::Submit => self.submit(cx),
-                Effect::Ex(_) => {
-                    self.reset();
-                    cx.emit(VimEvent(effect));
-                }
-                Effect::Scroll(_) | Effect::Nav(_) => cx.emit(VimEvent(effect)),
+                Effect::Scroll(_) | Effect::Nav(_) | Effect::Ex(_) => cx.emit(VimEvent(effect)),
             }
         }
         cx.notify();
