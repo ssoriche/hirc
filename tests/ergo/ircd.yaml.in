@@ -1,0 +1,100 @@
+# Throwaway Ergo for hirc's integration tests. Ports are filled in per test
+# run. Plaintext is loopback-only; TLS uses the test CA from ergo-test.sh.
+network:
+    name: HircTest
+server:
+    name: ergo.test
+    listeners:
+        "127.0.0.1:@PLAIN_PORT@": {}
+        "127.0.0.1:@TLS_PORT@":
+            tls:
+                cert: fullchain.pem
+                key: privkey.pem
+    casemapping: "ascii"
+    enforce-utf8: true
+    max-sendq: 96k
+    relaymsg:
+        enabled: true
+        separators: "/"
+        available-to-chanops: true
+    ip-limits:
+        count: false
+        throttle: false
+    lookup-hostnames: false
+    check-ident: false
+accounts:
+    authentication-enabled: true
+    registration:
+        enabled: true
+        allow-before-connect: true
+        throttling:
+            enabled: false
+        bcrypt-cost: 4
+    login-throttling:
+        enabled: false
+    nick-reservation:
+        enabled: true
+        method: strict
+        force-nick-equals-account: true
+    multiclient:
+        enabled: true
+        allowed-by-default: true
+        always-on: "opt-in"
+channels:
+    default-modes: +nt
+    registration:
+        enabled: true
+datastore:
+    path: ircd.db
+    sqlite:
+        enabled: true
+        database-path: history.db
+limits:
+    nicklen: 32
+    identlen: 20
+    realnamelen: 150
+    channellen: 64
+    awaylen: 390
+    kicklen: 390
+    topiclen: 390
+    monitor-entries: 100
+    whowas-entries: 100
+    chan-list-modes: 60
+    registration-messages: 1024
+    multiline:
+        max-bytes: 4096
+        max-lines: 100
+fakelag:
+    enabled: false
+history:
+    enabled: true
+    channel-length: 2048
+    client-length: 256
+    autoresize-window: 3d
+    autoreplay-on-join: 0
+    chathistory-maxmessages: 1000
+    znc-maxmessages: 2048
+    restrictions:
+        expire-time: 1w
+        query-cutoff: 'none'
+        grace-period: 1h
+    persistent:
+        enabled: true
+        unregistered-channels: false
+        registered-channels: "opt-out"
+        direct-messages: "opt-out"
+    retention:
+        allow-individual-delete: true
+        enable-account-indexing: true
+    tagmsg-storage:
+        default: false
+        whitelist:
+            - "+draft/react"
+            - "+react"
+            - "+draft/reply"
+logging:
+    -
+        method: stderr
+        type: "* -userinput -useroutput"
+        level: info
+lock-file: ""
