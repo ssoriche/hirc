@@ -4,17 +4,38 @@
 use crate::input::{Submit, TextInput};
 use crate::theme::{Palette, palette};
 use crate::views::{buffer, sidebar};
-use gpui::{Context, Entity, Focusable, ListAlignment, ListState, SharedString, Window, actions, div, list, prelude::*, px};
-use hirc_core::command::{self, Input};
+use gpui::{App, Context, Entity, Focusable, KeyBinding, ListAlignment, ListState, SharedString, Window, actions, div, list, prelude::*, px};
+use hirc_core::command::{self, Input, WindowAction};
 use hirc_core::event::{Command, Event, Target};
+use hirc_core::layout::{self, Layout};
 use hirc_core::store::{Applied, Buffer, LineKind, Network, Store};
 use hirc_core::theme::Theme;
+use std::path::PathBuf;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-actions!(hirc, [Quit]);
+actions!(hirc, [Quit, Window1, Window2, Window3, Window4, Window5, Window6, Window7, Window8, Window9, Window10]);
+
+/// alt-1 .. alt-9 go to windows 1-9, alt-0 to window 10 (irssi). No key
+/// context, so they work while the text input has focus.
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("alt-1", Window1, None),
+        KeyBinding::new("alt-2", Window2, None),
+        KeyBinding::new("alt-3", Window3, None),
+        KeyBinding::new("alt-4", Window4, None),
+        KeyBinding::new("alt-5", Window5, None),
+        KeyBinding::new("alt-6", Window6, None),
+        KeyBinding::new("alt-7", Window7, None),
+        KeyBinding::new("alt-8", Window8, None),
+        KeyBinding::new("alt-9", Window9, None),
+        KeyBinding::new("alt-0", Window10, None),
+    ]);
+}
 
 pub struct Init {
     pub networks: Vec<String>,
+    /// Each configured server with its `channels`, in config order (seeds the window list).
+    pub servers: Vec<(String, Vec<String>)>,
     pub theme: Theme,
     pub font_family: Option<String>,
     pub font_size: f32,
@@ -26,6 +47,8 @@ pub struct Init {
 pub struct HircApp {
     pub store: Store,
     pub selected: Option<(usize, usize)>,
+    pub layout: Layout,
+    layout_path: PathBuf,
     pub palette: Palette,
     font_family: Option<SharedString>,
     font_size: f32,
@@ -37,8 +60,27 @@ pub struct HircApp {
 
 impl HircApp {
     pub fn new(init: Init, window: &mut Window, cx: &mut Context<Self>) -> HircApp {
-        let store = Store::new(init.networks);
-        let selected = (!store.networks.is_empty()).then_some((0, 0));
+        let mut store = Store::new(init.networks.clone());
+        let layout_path = layout::path();
+        let saved = Layout::load(&layout_path);
+        let missing = saved.is_none();
+        let mut layout = saved.unwrap_or_else(|| Layout::seed(&init.servers));
+        let mut changed = layout.prune(&init.networks);
+        // Materialise saved windows so their numbers are stable before the server sends JOIN.
+        for key in layout.windows.clone() {
+            let Some(n) = store.networks.iter().position(|net| net.name == key.network) else { continue };
+            if let Some(name) = &key.name {
+                let target = if name.starts_with(['#', '&']) { Target::Channel(name.clone()) } else { Target::Query(name.clone()) };
+                store.buffer_ix(n, &target);
+            }
+        }
+        changed |= layout.sync(&store);
+        if (missing || changed)
+            && let Err(e) = layout.save(&layout_path)
+        {
+            tracing::warn!("could not save window layout: {e}");
+        }
+        let selected = layout.resolve(&store, 0).or_else(|| (!store.networks.is_empty()).then_some((0, 0)));
         let input = cx.new(|cx| TextInput::new("Message", cx));
         cx.subscribe(&input, |this, _, ev: &Submit, cx| this.submit(ev.0.clone(), cx)).detach();
         window.focus(&input.read(cx).focus_handle(cx));
@@ -54,6 +96,8 @@ impl HircApp {
         HircApp {
             store,
             selected,
+            layout,
+            layout_path,
             palette: palette(&init.theme),
             font_family: init.font_family.map(Into::into),
             font_size: init.font_size,
@@ -78,6 +122,35 @@ impl HircApp {
         cx.notify();
     }
 
+    /// Give any new buffer a window number and persist the list.
+    fn sync_layout(&mut self) {
+        if self.layout.sync(&self.store) {
+            self.save_layout();
+        }
+    }
+
+    fn save_layout(&self) {
+        if let Err(e) = self.layout.save(&self.layout_path) {
+            tracing::warn!("could not save window layout: {e}");
+        }
+    }
+
+    /// `number` is 1-based, as typed; out of range does nothing.
+    pub fn goto_window(&mut self, number: usize, cx: &mut Context<Self>) {
+        if let Some((n, b)) = number.checked_sub(1).and_then(|pos| self.layout.resolve(&self.store, pos)) {
+            self.select(n, b, cx);
+        }
+    }
+
+    fn move_window(&mut self, number: usize, cx: &mut Context<Self>) {
+        let Some((n, b)) = self.selected else { return };
+        if let Some(from) = self.layout.position_of(&self.store, n, b) {
+            self.layout.move_to(from, number - 1);
+            self.save_layout();
+            cx.notify();
+        }
+    }
+
     fn on_event(&mut self, ev: Event, cx: &mut Context<Self>) {
         if let Applied::Line { network, buffer, index } = self.store.apply(ev)
             && self.selected == Some((network, buffer))
@@ -85,6 +158,7 @@ impl HircApp {
             self.lines.splice(index..index, 1);
             self.store.networks[network].buffers[buffer].unread = 0;
         }
+        self.sync_layout();
         cx.notify();
     }
 
@@ -108,11 +182,14 @@ impl HircApp {
             }
             Ok(Input::OpenQuery { nick, text }) => {
                 let q = self.store.buffer_ix(n, &Target::Query(nick.clone()));
+                self.sync_layout();
                 self.select(n, q, cx);
                 if let Some(text) = text {
                     let _ = self.commands.send(Command::Say { network: name, target: nick, text });
                 }
             }
+            Ok(Input::Window(WindowAction::Goto(number))) => self.goto_window(number, cx),
+            Ok(Input::Window(WindowAction::Move(number))) => self.move_window(number, cx),
             Err(msg) => self.local_error(n, b, msg),
         }
         cx.notify();
@@ -129,9 +206,14 @@ impl HircApp {
 impl Render for HircApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette.clone();
-        div()
-            .size_full()
-            .flex()
+        let mut root = div().size_full();
+        macro_rules! window_keys {
+            ($($action:ident => $n:expr),*) => {
+                $(root = root.on_action(cx.listener(|this, _: &$action, _, cx| this.goto_window($n, cx)));)*
+            };
+        }
+        window_keys!(Window1 => 1, Window2 => 2, Window3 => 3, Window4 => 4, Window5 => 5, Window6 => 6, Window7 => 7, Window8 => 8, Window9 => 9, Window10 => 10);
+        root.flex()
             .bg(p.background)
             .text_color(p.text)
             .text_size(px(self.font_size))

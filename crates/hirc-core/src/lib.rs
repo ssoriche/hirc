@@ -8,6 +8,7 @@ pub mod config;
 pub mod conn;
 pub mod event;
 pub mod isupport;
+pub mod layout;
 pub mod proto;
 pub mod sasl;
 pub mod session;

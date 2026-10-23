@@ -2,6 +2,13 @@
 
 use crate::event::Command;
 
+/// irssi-style window commands; numbers are 1-based, as typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowAction {
+    Goto(usize),
+    Move(usize),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
     Send(Command),
@@ -10,6 +17,7 @@ pub enum Input {
         nick: String,
         text: Option<String>,
     },
+    Window(WindowAction),
 }
 
 fn is_channel(s: &str) -> bool {
@@ -30,6 +38,16 @@ pub fn parse(input: &str, network: &str, target: Option<&str>) -> Result<Input, 
     let args = args.trim();
     let (first, tail) = args.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((args, ""));
     let opt = |s: &str| (!s.is_empty()).then(|| s.to_owned());
+    if matches!(cmd.to_ascii_lowercase().as_str(), "window" | "win") {
+        let number = |s: &str| s.parse::<usize>().ok().filter(|&n| n >= 1);
+        let action = match (first.to_ascii_lowercase().as_str(), tail) {
+            ("move", n) => number(n).map(WindowAction::Move),
+            ("goto", n) => number(n).map(WindowAction::Goto),
+            (n, "") => number(n).map(WindowAction::Goto),
+            _ => None,
+        };
+        return action.map(Input::Window).ok_or_else(|| "Usage: /window <number> | /window move <number>".to_owned());
+    }
     let cmd = match cmd.to_ascii_lowercase().as_str() {
         "me" if args.is_empty() => return Err("Usage: /me <text>".into()),
         "me" => Command::Action { network: net, target: here()?, text: args.to_owned() },
@@ -108,6 +126,18 @@ mod tests {
     fn query_opens_a_buffer() {
         assert_eq!(p("/query bob"), Ok(Input::OpenQuery { nick: "bob".into(), text: None }));
         assert_eq!(p("/query bob hey"), Ok(Input::OpenQuery { nick: "bob".into(), text: Some("hey".into()) }));
+    }
+
+    #[test]
+    fn window_commands() {
+        let w = |s: &str| parse(s, "net", None);
+        assert_eq!(w("/window 3"), Ok(Input::Window(WindowAction::Goto(3))));
+        assert_eq!(w("/WIN goto 2"), Ok(Input::Window(WindowAction::Goto(2))));
+        assert_eq!(w("/window move 1"), Ok(Input::Window(WindowAction::Move(1))));
+        let usage = Err("Usage: /window <number> | /window move <number>".to_owned());
+        for s in ["/window", "/window 0", "/window move x", "/window move", "/window 1 2"] {
+            assert_eq!(w(s), usage, "{s}");
+        }
     }
 
     #[test]

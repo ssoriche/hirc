@@ -28,12 +28,14 @@ fn main() {
         None => Default::default(),
     };
     let networks: Vec<String> = config.servers.keys().cloned().collect();
+    let servers: Vec<(String, Vec<String>)> = config.servers.iter().map(|(name, s)| (name.clone(), s.channels.clone())).collect();
     let font_family = config.font.family.clone();
     let font_size = config.font.size.unwrap_or(14.);
     let (commands, events) = hirc_core::conn::spawn(config);
 
     Application::new().run(move |cx: &mut App| {
         input::bind_keys(cx);
+        app::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_window_closed(|cx| {
@@ -43,7 +45,7 @@ fn main() {
         })
         .detach();
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-        let init = Init { networks, theme, font_family, font_size, banner, commands, events };
+        let init = Init { networks, servers, theme, font_family, font_size, banner, commands, events };
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
