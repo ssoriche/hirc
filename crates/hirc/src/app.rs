@@ -7,7 +7,7 @@ use crate::views::{buffer, sidebar};
 use crate::vim::{self, Effect, Ex, Nav, Scroll};
 use gpui::{App, Context, Entity, Focusable, KeyBinding, ListAlignment, ListOffset, ListState, SharedString, Window, actions, div, list, prelude::*, px};
 use hirc_core::command::{self, Input, WindowAction};
-use hirc_core::event::{Command, Event, Target};
+use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::layout::{self, Layout};
 use hirc_core::store::{Applied, Buffer, LineKind, Network, Store};
 use hirc_core::theme::Theme;
@@ -274,7 +274,12 @@ impl HircApp {
         let net = &self.store.networks[n];
         let target = net.buffers[b].target.name().map(str::to_owned);
         let name = net.name.clone();
+        let connected = matches!(net.status, ConnStatus::Connected { .. });
         match command::parse(&text, &name, target.as_deref()) {
+            // Chat sent while offline would vanish without a trace.
+            Ok(Input::Send(Command::Say { .. } | Command::Action { .. })) if !connected => {
+                self.local_error(n, b, format!("Not connected to {name}"));
+            }
             Ok(Input::Send(cmd)) => {
                 let _ = self.commands.send(cmd);
             }

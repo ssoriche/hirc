@@ -1,4 +1,4 @@
-// The UI never waits on the network: see app.rs.
+//! The UI never waits on the network: see app.rs.
 mod app;
 mod input;
 #[cfg(feature = "snapshot")]
