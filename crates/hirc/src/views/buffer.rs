@@ -39,5 +39,7 @@ pub fn line(app: &HircApp, line: &Line) -> AnyElement {
         LineKind::Error => div().flex_1().min_w(px(0.)).text_color(p.error).child(line.text.clone()),
         _ => div().flex_1().min_w(px(0.)).text_color(p.server).child(line.text.clone()),
     };
-    div().flex().gap_2().px_3().py(px(1.)).child(div().flex_none().text_color(p.timestamp).child(time)).child(body).into_any_element()
+    // `w_full`: gpui's list measures each row as a root with a definite width,
+    // and an auto-width flex root would size to its content and never wrap.
+    div().flex().w_full().min_w(px(0.)).gap_2().px_3().py(px(1.)).child(div().flex_none().text_color(p.timestamp).child(time)).child(body).into_any_element()
 }
