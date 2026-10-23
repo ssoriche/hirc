@@ -98,8 +98,18 @@ pub enum ConfigError {
     Read { path: PathBuf, source: std::io::Error },
     #[error("parsing {}: {source}", path.display())]
     Parse { path: PathBuf, source: toml::de::Error },
-    #[error("password command `{command}` failed: {message}")]
+    #[error("password command `{}` failed: {}", program(.command), clip(.message))]
     Command { command: String, message: String },
+}
+
+/// Only the program name: the rest of the command line may hold a secret.
+fn program(command: &str) -> &str {
+    command.split_whitespace().next().unwrap_or("")
+}
+
+/// The command's stderr could echo a secret, so cap what we show.
+fn clip(message: &str) -> String {
+    message.chars().take(200).collect()
 }
 
 /// `$XDG_CONFIG_HOME/hirc`, else `~/.config/hirc`. Not `~/Library/...`:
@@ -130,12 +140,13 @@ pub fn secret(value: Option<&str>, file: Option<&Path>, command: Option<&str>) -
         return Ok(None);
     };
     let fail = |message: String| ConfigError::Command { command: cmd.to_owned(), message };
-    let out = std::process::Command::new("sh").arg("-c").arg(cmd).output().map_err(|e| fail(e.to_string()))?;
+    let out = std::process::Command::new("sh").arg("-c").arg(cmd).stdin(std::process::Stdio::null()).output().map_err(|e| fail(e.to_string()))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
         return Err(fail(if stderr.is_empty() { out.status.to_string() } else { stderr }));
     }
-    Ok(Some(String::from_utf8_lossy(&out.stdout).trim_end_matches(['\r', '\n']).to_owned()))
+    let stdout = String::from_utf8(out.stdout).map_err(|_| fail("output is not valid UTF-8".to_owned()))?;
+    Ok(Some(stdout.trim_end_matches(['\r', '\n']).to_owned()))
 }
 
 #[cfg(test)]
@@ -211,6 +222,22 @@ password_command = "printf hunter22"
     fn failing_command_is_an_error() {
         let err = secret(None, None, Some("echo nope >&2; exit 3")).unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn error_display_hides_command_arguments() {
+        let err = secret(None, None, Some("printf hunter22 >&2; exit 1")).unwrap_err();
+        let shown = err.to_string();
+        assert!(!shown.contains("hunter22 >&2"), "{shown}");
+        assert!(shown.contains("printf"), "{shown}");
+        let err = secret(None, None, Some("printf hunter22; exit 1")).unwrap_err();
+        assert!(!err.to_string().contains("hunter22"), "{err}");
+    }
+
+    #[test]
+    fn non_utf8_output_is_an_error() {
+        let err = secret(None, None, Some("printf '\\377'")).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "{err}");
     }
 
     #[test]
