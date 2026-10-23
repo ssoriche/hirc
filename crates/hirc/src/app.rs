@@ -43,6 +43,8 @@ pub struct Init {
     pub banner: Option<String>,
     pub commands: UnboundedSender<Command>,
     pub events: UnboundedReceiver<Event>,
+    /// Snapshot runs neither read nor write the window layout.
+    pub no_layout_file: bool,
 }
 
 pub struct HircApp {
@@ -50,6 +52,7 @@ pub struct HircApp {
     pub selected: Option<(usize, usize)>,
     pub layout: Layout,
     layout_path: PathBuf,
+    no_layout_file: bool,
     pub palette: Palette,
     font_family: Option<SharedString>,
     font_size: f32,
@@ -63,7 +66,7 @@ impl HircApp {
     pub fn new(init: Init, window: &mut Window, cx: &mut Context<Self>) -> HircApp {
         let mut store = Store::new(init.networks.clone());
         let layout_path = layout::path();
-        let saved = Layout::load(&layout_path);
+        let saved = if init.no_layout_file { None } else { Layout::load(&layout_path) };
         let missing = saved.is_none();
         let mut layout = saved.unwrap_or_else(|| Layout::seed(&init.servers));
         let mut changed = layout.prune(&init.networks);
@@ -77,6 +80,7 @@ impl HircApp {
         }
         changed |= layout.sync(&store);
         if (missing || changed)
+            && !init.no_layout_file
             && let Err(e) = layout.save(&layout_path)
         {
             tracing::warn!("could not save window layout: {e}");
@@ -105,6 +109,7 @@ impl HircApp {
             selected,
             layout,
             layout_path,
+            no_layout_file: init.no_layout_file,
             palette,
             font_family: init.font_family.map(Into::into),
             font_size: init.font_size,
@@ -137,6 +142,9 @@ impl HircApp {
     }
 
     fn save_layout(&self) {
+        if self.no_layout_file {
+            return;
+        }
         if let Err(e) = self.layout.save(&self.layout_path) {
             tracing::warn!("could not save window layout: {e}");
         }
@@ -147,6 +155,12 @@ impl HircApp {
         if let Some((n, b)) = number.checked_sub(1).and_then(|pos| self.layout.resolve(&self.store, pos)) {
             self.select(n, b, cx);
         }
+    }
+
+    /// Snapshot scripts: type into the input as a person would.
+    #[cfg(feature = "snapshot")]
+    pub fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.type_text(text, window, cx));
     }
 
     /// Number of numbered windows.

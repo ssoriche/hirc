@@ -1,0 +1,78 @@
+# Invented demo content for `snapshot` runs (see src/snapshot.rs). No real
+# nicks, servers or channels belong here.
+#
+# Lines without a `time` tag get base_time + 1 s per line, so screenshots are
+# stable from run to run.
+base_time = "2026-01-01T12:00:00Z"
+
+[[server]]
+name = "demo"
+nick = "me"
+echo_message = true # pretend the server ACKed echo-message
+lines = [
+  ":irc.example 001 me :Welcome to the Demo network",
+  ":irc.example 005 me CHANTYPES=# PREFIX=(ov)@+ NETWORK=Demo :are supported by this server",
+  ":irc.example NOTICE me :This is a made-up server",
+  ":me!u@h JOIN #general",
+  ":irc.example 332 me #general :Welcome to #general - be kind, be curious",
+  ":irc.example 353 me = #general :me alice @bob +carol dave",
+  ":irc.example 366 me #general :End of /NAMES list.",
+  ":me!u@h JOIN #design",
+  ":irc.example 332 me #design :Pixels, kerning and other small joys",
+  ":irc.example 353 me = #design :me @erin frank",
+  ":irc.example 366 me #design :End of /NAMES list.",
+  "@time=2026-01-01T12:00:05Z;msgid=a1 :alice!a@h PRIVMSG #general :hello there",
+  ":bob!b@h PRIVMSG #general :morning, everyone",
+  ":bob!b@h PRIVMSG #general :\u0001ACTION waves\u0001",
+  ":carol!c@h PRIVMSG #general :has anyone tried the new build? it starts much faster now, and the window list finally stays put when I reorder things with /window move, even after a restart of the whole client",
+  ":dave!d@h PRIVMSG #general :日本語のテキストも大丈夫です。こんにちは、世界！",
+  ":alice!a@h PRIVMSG #general :emoji work too 🎉🚀 and combined ones like 👩‍💻 or 🇨🇦",
+  ":alice!a@h PRIVMSG #general :café, naïve, Ünïcödé and a very long unbroken token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  ":erin!e@h JOIN #general",
+  ":bob!b@h PRIVMSG #general :erin, welcome",
+  ":erin!e@h PRIVMSG #general :thanks! glad to be here",
+  ":dave!d@h NICK :dave_away",
+  ":dave_away!d@h PRIVMSG #general :brb, lunch",
+  ":carol!c@h PART #general :going offline",
+  ":frank!f@h QUIT :Ping timeout: 240 seconds",
+  ":alice!a@h PRIVMSG #general :me: did you see the notes from yesterday?",
+  ":bob!b@h PRIVMSG #general :line 01 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 02 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 03 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 04 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 05 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 06 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 07 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 08 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 09 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 10 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 11 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 12 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 13 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 14 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 15 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 16 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 17 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 18 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 19 of a long scrolling run",
+  ":bob!b@h PRIVMSG #general :line 20 of a long scrolling run",
+  ":alice!a@h PRIVMSG #general :and that is the end of the run",
+  ":erin!e@h PRIVMSG #design :does the sidebar need more contrast?",
+  ":frank!f@h PRIVMSG #design :\u0001ACTION squints at the screen\u0001",
+  ":erin!e@h PRIVMSG #design :try 4.5:1 for the text",
+  ":carol!c@h PRIVMSG me :a direct message, just for you",
+  ":carol!c@h PRIVMSG me :are you around later?",
+]
+
+[[server]]
+name = "other"
+nick = "me"
+lines = [
+  ":irc.other 001 me :Welcome to the Other network",
+  ":me!u@h JOIN #rust",
+  ":irc.other 332 me #rust :Fearless concurrency | be excellent to each other",
+  ":irc.other 353 me = #rust :me @gina henry",
+  ":irc.other 366 me #rust :End of /NAMES list.",
+  ":gina!g@h PRIVMSG #rust :the borrow checker is not your enemy",
+  ":henry!h@h PRIVMSG #rust :tell that to my lifetimes",
+]

@@ -13,3 +13,28 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 unicode-segmentation.workspace = true
+
+[features]
+# Developer-only: scripted, network-free UI runs with window screenshots.
+# See src/snapshot.rs. Nothing here is built without the feature.
+snapshot = ["dep:toml", "dep:serde", "dep:raw-window-handle", "dep:objc"]
+
+[dependencies.toml]
+workspace = true
+optional = true
+
+[dependencies.serde]
+workspace = true
+optional = true
+
+[dependencies.raw-window-handle]
+version = "=0.6.2"
+optional = true
+
+[target.'cfg(target_os = "macos")'.dependencies.objc]
+version = "=0.2.7"
+optional = true
+
+# objc 0.2's msg_send! probes `feature = "cargo-clippy"` in our crate.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

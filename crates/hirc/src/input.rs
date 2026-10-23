@@ -485,6 +485,12 @@ impl Focusable for TextInput {
     }
 }
 impl TextInput {
+    /// Snapshot scripts: same path as the platform's text input (ignored in Normal mode).
+    #[cfg(feature = "snapshot")]
+    pub fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_text_in_range(None, text, window, cx)
+    }
+
     pub fn new(placeholder: &str, cx: &mut Context<Self>) -> TextInput {
         TextInput {
             focus_handle: cx.focus_handle(),
