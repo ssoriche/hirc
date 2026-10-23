@@ -106,7 +106,13 @@ pub enum ConfigError {
 
 /// Only the program name: the rest of the command line may hold a secret.
 fn program(command: &str) -> &str {
-    command.split_whitespace().find(|w| !w.contains('=')).unwrap_or("command")
+    command.split_whitespace().find(|w| !w.contains(['=', '"', '\''])).unwrap_or("command")
+}
+
+/// toml quotes the rejected value in type errors (``invalid type: integer
+/// `123` ``), and that value may be a password, so blank every quoted span.
+fn redact(message: &str) -> String {
+    message.split(['`', '"', '\'']).enumerate().map(|(i, part)| if i % 2 == 1 { "…" } else { part }).collect::<Vec<_>>().join("`")
 }
 
 /// A parse error with a line and column but never the source text.
@@ -115,7 +121,7 @@ pub(crate) fn parse_error(path: &Path, text: &str, e: &toml::de::Error) -> Confi
     let before = &text.as_bytes()[..start];
     let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
     let col = start - before.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1) + 1;
-    ConfigError::Parse { path: path.to_owned(), message: e.message().to_owned(), line, col }
+    ConfigError::Parse { path: path.to_owned(), message: redact(e.message()), line, col }
 }
 
 /// The command's stderr could echo a secret, so cap what we show.
@@ -282,5 +288,21 @@ password_command = "printf hunter22"
         let shown = err.to_string();
         assert!(!shown.contains("abc"), "{shown}");
         assert!(shown.contains("`op`"), "{shown}");
+    }
+
+    #[test]
+    fn type_errors_hide_the_rejected_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        for body in ["password = 918273", "port = \"hunter2\"", "port = 'hunter2'"] {
+            std::fs::write(&p, format!("[servers.x]\nserver = \"h\"\n{body}")).unwrap();
+            let err = load(&p).unwrap_err().to_string();
+            assert!(!err.contains("918273") && !err.contains("hunter2"), "{err}");
+        }
+    }
+
+    #[test]
+    fn program_skips_quoted_env_values() {
+        assert_eq!(program("FOO=\"a b\" op read x"), "op");
     }
 }
