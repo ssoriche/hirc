@@ -25,7 +25,7 @@ ignored.
 The sidebar is an irssi-style flat numbered list of every buffer across all
 networks.
 
-- `/window N` (or `/win N`) jumps to window N; `/window move N` moves the
+- `/window N` (or `/win N`, or `/window goto N`) jumps to window N; `/window move N` moves the
   current window to position N.
 - `alt-1` to `alt-9` jump to windows 1 to 9; `alt-0` jumps to window 10.
 - The order is saved in `$XDG_STATE_HOME/hirc/layout.toml`, else
@@ -37,12 +37,14 @@ The input line is vim-style and starts in Insert mode.
 
 - `Esc` enters Normal mode; `i`, `a`, `I`, `A` go back to Insert.
 - Motions: `h`, `l`, `0`, `$`, `w`, `b`, `e`.
-- Edits: `x`, `D`, `C`, `dd`, `cc`, `dw`, `cw`, `p`, `P`, `u`.
+- Edits: `x`, `D`, `C`, `dd`, `cc`, `dw`, `cw`, `ciw`, `p`, `P`, `u`.
+- `Backspace` moves left; `Enter` submits the line from Normal mode too.
 - Scrolling the buffer: `j`/`k`, `ctrl-d`/`ctrl-u`, `gg`/`G`.
 - Windows: `gt` / `gT` for next / previous.
 - `:` opens an ex line: `:N` goes to window N, `:b name` (or `:buffer name`)
   goes to the named buffer, `:q` quits, and anything else is run as the
-  slash command `/cmd`.
+  slash command `/cmd`. `Esc` on the ex line abandons it and restores the
+  unsent draft; ex commands also keep the draft.
 
 ## Commands
 
@@ -81,7 +83,7 @@ be unlocked, and nothing touches the network.
 
 ```sh
 cargo build -p hirc --features snapshot
-HIRC_FIXTURE=fixture.toml \
+HIRC_FIXTURE=crates/hirc/fixtures/demo.toml \
 HIRC_SCRIPT="window:2;key:escape;shot:out.png" \
 HIRC_SIZE=1200x800 \
     target/debug/hirc
@@ -89,10 +91,13 @@ HIRC_SIZE=1200x800 \
 
 | Variable | Effect |
 |---|---|
-| `HIRC_FIXTURE=<file.toml>` | Canned servers and lines; enables snapshot mode. See `crates/hirc/src/snapshot.rs` for the format. |
+| `HIRC_FIXTURE=<file.toml>` | Canned servers and lines; enables snapshot mode. One `[[server]]` table per network (`name`, `nick`, optional `echo_message`, `lines` as raw IRC lines, optionally with an `@time=` tag), plus an optional top-level `base_time`. See `crates/hirc/fixtures/demo.toml`. |
 | `HIRC_SCRIPT="step;step"` | Steps: `window:N`, `key:<keystroke>`, `type:<text>`, `wait:<ms>`, `shot:<path.png>`. `type:` only inserts in Insert mode. |
 | `HIRC_SCREENSHOT=<out.png>` | After the script, capture the window and quit. |
 | `HIRC_SIZE=WxH` | Window size in logical pixels (default `1200x800`). |
+
+Fixture runs never read or write the layout file. Theme and font still come
+from the normal config dir.
 
 ## macOS app
 
