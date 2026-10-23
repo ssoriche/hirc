@@ -23,6 +23,8 @@ use tokio_rustls::TlsConnector;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
+const MIN_BACKOFF: Duration = Duration::from_secs(1);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Send a PING after this long without hearing from the server...
 const IDLE_PING: Duration = Duration::from_secs(120);
@@ -67,44 +69,51 @@ pub fn spawn(config: Config) -> (UnboundedSender<Command>, UnboundedReceiver<Eve
 enum End {
     /// Don't reconnect until /reconnect.
     Stopped(String),
-    Closed {
-        registered: bool,
-    },
+    Closed,
+}
+
+/// The delay before the next attempt and the backoff to carry forward. A
+/// session that got as far as registering resets the backoff, however it
+/// ended (clean close, reset, TLS error, idle timeout).
+fn retry_delay(backoff: Duration, registered: bool) -> (Duration, Duration) {
+    let delay = if registered { MIN_BACKOFF } else { backoff };
+    (delay, (delay * 2).min(MAX_BACKOFF))
 }
 
 async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Command>, events: UnboundedSender<Event>) {
     let status = |status| {
         let _ = events.send(Event::Status { network: name.clone(), status });
     };
-    let mut backoff = Duration::from_secs(1);
+    let mut backoff = MIN_BACKOFF;
+    // Resolved secrets live for the process so reconnects don't re-run
+    // `password_command` (each run can prompt). A Stop clears them.
+    let mut cached: Option<SessionConfig> = None;
     loop {
         status(ConnStatus::Connecting);
-        match connect_once(&name, &server, &mut cmds, &events).await {
+        let mut registered = false;
+        match connect_once(&name, &server, &mut cached, &mut registered, &mut cmds, &events).await {
             Ok(End::Stopped(reason)) => {
+                cached = None;
                 status(ConnStatus::Failed { reason });
                 if wait_reconnect(&mut cmds).await.is_none() {
                     return;
                 }
-                backoff = Duration::from_secs(1);
+                backoff = MIN_BACKOFF;
                 continue;
             }
-            Ok(End::Closed { registered }) => {
-                if registered {
-                    backoff = Duration::from_secs(1);
-                }
-                status(ConnStatus::Disconnected { reason: "connection closed".into() });
-            }
+            Ok(End::Closed) => status(ConnStatus::Disconnected { reason: "connection closed".into() }),
             Err(e) => status(ConnStatus::Disconnected { reason: e.to_string() }),
         }
+        let (delay, next) = retry_delay(backoff, registered);
+        backoff = next;
         tokio::select! {
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(delay) => {}
             r = wait_reconnect(&mut cmds) => {
                 if r.is_none() {
                     return;
                 }
             }
         }
-        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
@@ -138,14 +147,18 @@ fn session_config(s: &Server) -> Result<SessionConfig, ConfigError> {
     })
 }
 
+/// A configured `root_cert_path` adds roots on top of the platform's (Halloy
+/// semantics). A missing, empty or invalid PEM is an error, not a fallback.
 fn tls_config(root_cert: Option<&Path>) -> Result<Arc<ClientConfig>, Error> {
     let config = match root_cert {
         Some(path) => {
-            let mut roots = rustls::RootCertStore::empty();
-            for cert in CertificateDer::pem_file_iter(path)? {
-                roots.add(cert?)?;
+            let certs = CertificateDer::pem_file_iter(path)?.collect::<Result<Vec<_>, _>>()?;
+            if certs.is_empty() {
+                return Err(format!("no certificates in {}", path.display()).into());
             }
-            ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()
+            let builder = ClientConfig::builder();
+            let verifier = rustls_platform_verifier::Verifier::new_with_extra_roots(certs, builder.crypto_provider().clone())?;
+            builder.dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_no_client_auth()
         }
         None => ClientConfig::with_platform_verifier()?,
     };
@@ -156,29 +169,55 @@ fn is_loopback(host: &str) -> bool {
     host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-async fn connect_once(name: &str, server: &Server, cmds: &mut UnboundedReceiver<Command>, events: &UnboundedSender<Event>) -> Result<End, Error> {
+async fn connect_once(
+    name: &str,
+    server: &Server,
+    cached: &mut Option<SessionConfig>,
+    registered: &mut bool,
+    cmds: &mut UnboundedReceiver<Command>,
+    events: &UnboundedSender<Event>,
+) -> Result<End, Error> {
     if matches!(server.sasl, Some(Sasl::External { .. })) {
         return Ok(End::Stopped("SASL EXTERNAL isn't supported yet".into()));
     }
-    let s = server.clone();
-    let cfg = match tokio::task::spawn_blocking(move || session_config(&s)).await? {
-        Ok(cfg) => cfg,
-        Err(e) => return Ok(End::Stopped(e.to_string())),
-    };
     let host = server.server.clone();
-    let tcp = tokio::time::timeout(Duration::from_secs(30), TcpStream::connect((host.as_str(), server.port()))).await??;
-    let stream: Box<dyn Stream> = if server.use_tls {
-        let connector = TlsConnector::from(tls_config(server.root_cert_path.as_deref())?);
-        Box::new(connector.connect(ServerName::try_from(host)?, tcp).await?)
-    } else if is_loopback(&host) {
-        Box::new(tcp)
-    } else {
+    // Refuse before touching any secret.
+    if !server.use_tls && !is_loopback(&host) {
         return Ok(End::Stopped("plaintext is only allowed to localhost; set use_tls = true".into()));
+    }
+    let connector = if server.use_tls {
+        match tls_config(server.root_cert_path.as_deref()) {
+            Ok(c) => Some(TlsConnector::from(c)),
+            Err(e) => return Ok(End::Stopped(format!("TLS setup failed: {e}"))),
+        }
+    } else {
+        None
     };
+    let cfg = match cached {
+        Some(cfg) => cfg.clone(),
+        None => {
+            let s = server.clone();
+            match tokio::task::spawn_blocking(move || session_config(&s)).await? {
+                Ok(cfg) => cached.insert(cfg).clone(),
+                Err(e) => return Ok(End::Stopped(e.to_string())),
+            }
+        }
+    };
+    let server_name = ServerName::try_from(host.clone())?;
+    let port = server.port();
+    // One budget for TCP connect plus TLS handshake.
+    let stream: Box<dyn Stream> = tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let tcp = TcpStream::connect((host.as_str(), port)).await?;
+        Ok::<_, Error>(match connector {
+            Some(c) => Box::new(c.connect(server_name, tcp).await?) as Box<dyn Stream>,
+            None => Box::new(tcp),
+        })
+    })
+    .await
+    .map_err(|_| Error::from("connect timed out"))??;
     let (r, mut w) = tokio::io::split(stream);
     let mut reader = LineReader::new(BufReader::new(r));
     let mut session = Session::new(name, cfg);
-    let mut registered = false;
     let mut outs = session.start();
     let mut last_rx = Instant::now();
     let mut pinged = false;
@@ -192,7 +231,7 @@ async fn connect_once(name: &str, server: &Server, cmds: &mut UnboundedReceiver<
                 }
                 Output::Event(e) => {
                     if matches!(e, Event::Status { status: ConnStatus::Connected { .. }, .. }) {
-                        registered = true;
+                        *registered = true;
                     }
                     let _ = events.send(e);
                 }
@@ -205,7 +244,7 @@ async fn connect_once(name: &str, server: &Server, cmds: &mut UnboundedReceiver<
         w.flush().await?;
         tokio::select! {
             line = reader.next_line() => {
-                let Some(line) = line? else { return Ok(End::Closed { registered }) };
+                let Some(line) = line? else { return Ok(End::Closed) };
                 last_rx = Instant::now();
                 pinged = false;
                 match Message::parse(&line) {
@@ -217,7 +256,8 @@ async fn connect_once(name: &str, server: &Server, cmds: &mut UnboundedReceiver<
                 None => return Ok(End::Stopped("shutting down".into())),
                 Some(Command::Reconnect { .. }) => {
                     let _ = w.write_all(b"QUIT :Reconnecting\r\n").await;
-                    return Ok(End::Closed { registered: true });
+                    let _ = w.flush().await;
+                    return Ok(End::Closed);
                 }
                 Some(c) => outs = session.command(c, Utc::now()),
             },
@@ -232,5 +272,31 @@ async fn connect_once(name: &str, server: &Server, cmds: &mut UnboundedReceiver<
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_until_registered_then_resets() {
+        let (d, b) = retry_delay(MIN_BACKOFF, false);
+        assert_eq!((d, b), (Duration::from_secs(1), Duration::from_secs(2)));
+        let (d, b) = retry_delay(Duration::from_secs(32), false);
+        assert_eq!((d, b), (Duration::from_secs(32), MAX_BACKOFF));
+        let (d, b) = retry_delay(MAX_BACKOFF, true);
+        assert_eq!((d, b), (MIN_BACKOFF, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn bad_root_cert_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(tls_config(Some(&dir.path().join("missing.pem"))).is_err());
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "").unwrap();
+        assert!(tls_config(Some(&empty)).is_err());
+        std::fs::write(&empty, "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n").unwrap();
+        assert!(tls_config(Some(&empty)).is_err());
     }
 }

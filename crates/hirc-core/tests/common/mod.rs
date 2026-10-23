@@ -49,8 +49,12 @@ impl Ergo {
             .unwrap();
         // Owned by the guard from here on, so Drop kills it on any panic too.
         let ergo = Ergo { child, _dir: dir, plain_port, tls_port, ca: state.join("ca.pem") };
+        let mut ergo = ergo;
         for _ in 0..100 {
-            if std::net::TcpStream::connect(("127.0.0.1", tls_port)).is_ok() {
+            if let Some(status) = ergo.child.try_wait().unwrap() {
+                panic!("ergo exited during startup: {status}");
+            }
+            if std::net::TcpStream::connect(("127.0.0.1", tls_port)).is_ok() && std::net::TcpStream::connect(("127.0.0.1", plain_port)).is_ok() {
                 return ergo;
             }
             std::thread::sleep(Duration::from_millis(50));

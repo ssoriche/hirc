@@ -30,7 +30,8 @@ setup() {
     fi
     if [ ! -f "$DIR/ca.pem" ]; then
         # rustls won't accept Ergo's own self-signed cert (no SAN), so sign a
-        # localhost cert with a throwaway CA and trust the CA in tests.
+        # localhost cert with a throwaway CA and trust the CA in tests. The leaf
+        # lives <825 days: the macOS platform verifier rejects longer ones.
         openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
             -subj "/CN=hirc test CA" -keyout "$DIR/ca.key" -out "$DIR/ca.pem" \
             -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" 2>/dev/null
@@ -38,7 +39,7 @@ setup() {
             -keyout "$DIR/privkey.pem" -out "$DIR/leaf.csr" 2>/dev/null
         printf "subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n" >"$DIR/leaf.ext"
         openssl x509 -req -in "$DIR/leaf.csr" -CA "$DIR/ca.pem" -CAkey "$DIR/ca.key" -CAcreateserial \
-            -days 3650 -out "$DIR/fullchain.pem" -extfile "$DIR/leaf.ext" 2>/dev/null
+            -days 800 -out "$DIR/fullchain.pem" -extfile "$DIR/leaf.ext" 2>/dev/null
     fi
     "$DIR/ergo" --version
 }

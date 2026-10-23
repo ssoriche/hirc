@@ -68,10 +68,17 @@ async fn sasl_join_send_and_receive() {
     assert!(own.msgid.is_some());
 
     bob.send("PRIVMSG #test :hi alice").await;
-    let got = next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "hi alice")).await;
+    // Everything up to bob's line must not contain a second copy of ours.
+    let mut seen = Vec::new();
+    let got = next_matching(&mut rx, |e| {
+        seen.push(e.clone());
+        line_in(e, "#test").filter(|l| l.text == "hi alice")
+    })
+    .await;
     assert_eq!(got.nick.as_deref(), Some("bob"));
     assert!(got.msgid.is_some());
     assert!(!got.own);
+    assert!(seen.iter().all(|ev| line_in(ev, "#test").is_none_or(|l| l.text != "hello from hirc")), "duplicate own line");
 
     // No second echo of our own message showed up in the meantime.
     tokio::time::sleep(Duration::from_millis(300)).await;
