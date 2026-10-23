@@ -2108,6 +2108,7 @@ dependencies = [
  "dirs 7.0.0",
  "indexmap",
  "rustls",
+ "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
  "tempfile",

@@ -5,6 +5,7 @@
 pub mod caps;
 pub mod command;
 pub mod config;
+pub mod conn;
 pub mod event;
 pub mod isupport;
 pub mod proto;
@@ -13,3 +14,4 @@ pub mod session;
 pub mod split;
 pub mod store;
 pub mod theme;
+pub mod wire;
