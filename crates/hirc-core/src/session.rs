@@ -80,8 +80,8 @@ pub struct Session {
     reg: Reg,
     caps: Caps,
     isupport: Isupport,
-    /// Lowercased channel -> lowercased nicks, to route QUIT and NICK.
-    members: HashMap<String, HashSet<String>>,
+    /// Lowercased channel -> (channel as the server spelled it, lowercased nicks), to route QUIT and NICK.
+    members: HashMap<String, (String, HashSet<String>)>,
     seq: u64,
 }
 
@@ -341,13 +341,13 @@ impl Session {
     }
 
     fn members_of(&mut self, chan: &str) -> &mut HashSet<String> {
-        self.members.entry(chan.to_ascii_lowercase()).or_default()
+        &mut self.members.entry(chan.to_ascii_lowercase()).or_insert_with(|| (chan.to_owned(), HashSet::new())).1
     }
 
     fn on_join(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
         let (Some(nick), Some(chan)) = (msg.nick().map(str::to_owned), msg.params.first().cloned()) else { return };
         if self.is_me(&nick) {
-            self.members.insert(chan.to_ascii_lowercase(), HashSet::new());
+            self.members.insert(chan.to_ascii_lowercase(), (chan.clone(), HashSet::new()));
             out.push(Output::Event(Event::Joined { network: self.network.clone(), channel: chan.clone() }));
         }
         self.members_of(&chan).insert(nick.to_ascii_lowercase());
@@ -388,10 +388,10 @@ impl Session {
         self.left(&chan, &victim, out);
     }
 
-    /// Channels `nick` is in, as they're spelled in our member map.
+    /// Channels `nick` is in, spelled as the server first gave them.
     fn channels_with(&self, nick: &str) -> Vec<String> {
         let key = nick.to_ascii_lowercase();
-        let mut chans: Vec<String> = self.members.iter().filter(|(_, m)| m.contains(&key)).map(|(c, _)| c.clone()).collect();
+        let mut chans: Vec<String> = self.members.values().filter(|(_, m)| m.contains(&key)).map(|(c, _)| c.clone()).collect();
         chans.sort();
         chans
     }
@@ -808,5 +808,16 @@ mod tests {
         let out = s.command(Command::Disconnect { network: n(), reason: Some("bye".into()) }, now());
         assert_eq!(sent(&out), ["QUIT bye"]);
         assert!(out.iter().any(|o| matches!(o, Output::Stop(_))));
+    }
+
+    #[test]
+    fn quit_and_nick_lines_keep_channel_spelling() {
+        let mut s = registered(ECHO);
+        feed(&mut s, ":alice!a@h JOIN #Test");
+        feed(&mut s, ":srv 353 alice = #Test :alice @bob +carol");
+        let (t, _) = lines(&feed(&mut s, ":bob!b@h QUIT :bye")).remove(0);
+        assert_eq!(t, Target::Channel("#Test".into()));
+        let (t, _) = lines(&feed(&mut s, ":carol!c@h NICK carla")).remove(0);
+        assert_eq!(t, Target::Channel("#Test".into()));
     }
 }
