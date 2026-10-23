@@ -83,6 +83,8 @@ pub struct Session {
     /// Lowercased channel -> (channel as the server spelled it, lowercased nicks), to route QUIT and NICK.
     members: HashMap<String, (String, HashSet<String>)>,
     seq: u64,
+    /// SASL finished (903/907) on this connection.
+    authed: bool,
 }
 
 fn send<I, S>(command: &str, params: I) -> Output
@@ -109,6 +111,7 @@ impl Session {
             isupport: Isupport::default(),
             members: HashMap::new(),
             seq: 0,
+            authed: false,
         }
     }
 
@@ -129,6 +132,7 @@ impl Session {
         self.members.clear();
         self.nick = self.cfg.nickname.clone();
         self.alt = 0;
+        self.authed = false;
         let mut out = Vec::new();
         if let Some(p) = &self.cfg.password {
             out.push(send("PASS", [p.as_str()]));
@@ -145,7 +149,10 @@ impl Session {
             "PING" => out.push(send("PONG", msg.params.clone())),
             "CAP" => self.on_cap(&msg, &mut out),
             "AUTHENTICATE" => self.on_authenticate(&msg, &mut out),
-            "903" | "907" if self.reg == Reg::Sasl => self.end_cap(&mut out),
+            "903" | "907" if self.reg == Reg::Sasl => {
+                self.authed = true;
+                self.end_cap(&mut out);
+            }
             "902" | "904" | "905" | "906" => out.push(Output::Stop(format!("SASL authentication failed: {}", last(&msg)))),
             "432" | "433" if self.reg != Reg::Done => match self.next_nick(msg.command == "433") {
                 Some(n) => {
@@ -280,6 +287,12 @@ impl Session {
     }
 
     fn on_welcome(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        // A server that ignores CAP registers us without SASL; don't go on
+        // unauthenticated when the user asked for authentication.
+        if self.cfg.sasl.is_some() && !self.authed {
+            out.push(Output::Stop("server registered us before SASL finished".into()));
+            return;
+        }
         self.reg = Reg::Done;
         if let Some(n) = msg.params.first() {
             self.nick = n.clone();
@@ -552,6 +565,16 @@ mod tests {
         assert_eq!(sent(&out), ["JOIN #test"]);
         assert!(out.contains(&Output::Event(Event::Status { network: "net".into(), status: ConnStatus::Connected { nick: "alice".into() } })));
         assert!(s.caps().is_enabled("echo-message"));
+    }
+
+    #[test]
+    fn welcome_before_sasl_stops() {
+        let mut s = Session::new("net", SessionConfig { sasl: Some(SaslPlain { username: "alice".into(), password: "pw".into() }), ..cfg() });
+        s.start();
+        let out = feed(&mut s, ":srv 001 alice :Welcome");
+        assert!(out.contains(&Output::Stop("server registered us before SASL finished".into())), "{out:?}");
+        assert!(sent(&out).is_empty(), "{out:?}");
+        assert!(!out.iter().any(|o| matches!(o, Output::Event(_))), "{out:?}");
     }
 
     #[test]
