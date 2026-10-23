@@ -22,14 +22,14 @@ pub enum Output {
     Stop(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SaslPlain {
     pub username: String,
     pub password: String,
 }
 
 /// A server's settings with every password already looked up.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SessionConfig {
     pub nickname: String,
     pub alt_nicks: Vec<String>,
@@ -39,6 +39,27 @@ pub struct SessionConfig {
     pub sasl: Option<SaslPlain>,
     /// `"#chan"` or `"#chan key"`.
     pub channels: Vec<String>,
+}
+
+impl std::fmt::Debug for SaslPlain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaslPlain").field("username", &self.username).field("password", &"<redacted>").finish()
+    }
+}
+
+impl std::fmt::Debug for SessionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let password = self.password.as_ref().map(|_| "<redacted>");
+        f.debug_struct("SessionConfig")
+            .field("nickname", &self.nickname)
+            .field("alt_nicks", &self.alt_nicks)
+            .field("username", &self.username)
+            .field("realname", &self.realname)
+            .field("password", &password)
+            .field("sasl", &self.sasl)
+            .field("channels", &self.channels)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,12 +147,15 @@ impl Session {
             "PING" => out.push(send("PONG", msg.params.clone())),
             "CAP" => self.on_cap(&msg, &mut out),
             "AUTHENTICATE" => self.on_authenticate(&msg, &mut out),
-            "903" | "907" => self.end_cap(&mut out),
+            "903" | "907" if self.reg == Reg::Sasl => self.end_cap(&mut out),
             "902" | "904" | "905" | "906" => out.push(Output::Stop(format!("SASL authentication failed: {}", last(&msg)))),
-            "432" | "433" if self.reg != Reg::Done => {
-                self.nick = self.next_nick();
-                out.push(send("NICK", [self.nick.as_str()]));
-            }
+            "432" | "433" if self.reg != Reg::Done => match self.next_nick(msg.command == "433") {
+                Some(n) => {
+                    self.nick = n;
+                    out.push(send("NICK", [self.nick.as_str()]));
+                }
+                None => out.push(Output::Stop("no usable nickname".into())),
+            },
             "001" => self.on_welcome(&msg, now, &mut out),
             "005" => self.isupport.apply(&msg.params),
             // Task 12 adds PRIVMSG, NOTICE, JOIN, PART, KICK, QUIT, NICK,
@@ -141,10 +165,17 @@ impl Session {
         out
     }
 
-    fn next_nick(&mut self) -> String {
-        let next = self.cfg.alt_nicks.get(self.alt).cloned().unwrap_or_else(|| format!("{}_", self.nick));
+    /// Next nickname to try: alt_nicks in order, then (only when the nick
+    /// is in use) up to 3 underscores. `None` when exhausted.
+    fn next_nick(&mut self, in_use: bool) -> Option<String> {
+        let alts = self.cfg.alt_nicks.len();
+        let next = match self.cfg.alt_nicks.get(self.alt) {
+            Some(n) => n.clone(),
+            None if in_use && self.alt - alts < 3 => format!("{}_", self.nick),
+            None => return None,
+        };
         self.alt += 1;
-        next
+        Some(next)
     }
 
     fn on_cap(&mut self, msg: &Message, out: &mut Vec<Output>) {
@@ -376,5 +407,43 @@ mod tests {
         assert!(s.caps().is_enabled("batch"));
         feed(&mut s, ":srv CAP alice DEL :batch");
         assert!(!s.caps().is_enabled("batch"));
+    }
+
+    #[test]
+    fn debug_redacts_passwords() {
+        let c = SessionConfig { password: Some("srvsecret".into()), sasl: Some(SaslPlain { username: "a".into(), password: "saslsecret".into() }), ..cfg() };
+        let d = format!("{c:?}");
+        assert!(!d.contains("srvsecret") && !d.contains("saslsecret"), "{d}");
+        assert!(d.contains("<redacted>"));
+    }
+
+    #[test]
+    fn nick_in_use_is_bounded() {
+        let mut s = Session::new("net", cfg());
+        s.start();
+        let mut nicks = Vec::new();
+        for _ in 0..4 {
+            nicks.extend(sent(&feed(&mut s, ":srv 433 * x :in use")));
+        }
+        assert_eq!(nicks, ["NICK alice2", "NICK alice2_", "NICK alice2__", "NICK alice2___"]);
+        let out = feed(&mut s, ":srv 433 * x :in use");
+        assert!(sent(&out).is_empty());
+        assert!(out.contains(&Output::Stop("no usable nickname".into())));
+    }
+
+    #[test]
+    fn erroneous_nick_without_alts_stops() {
+        let mut s = Session::new("net", SessionConfig { alt_nicks: vec![], ..cfg() });
+        s.start();
+        let out = feed(&mut s, ":srv 432 * bad :Erroneous nickname");
+        assert!(sent(&out).is_empty());
+        assert!(out.contains(&Output::Stop("no usable nickname".into())));
+    }
+
+    #[test]
+    fn sasl_success_ignored_outside_sasl() {
+        let mut s = Session::new("net", cfg());
+        s.start();
+        assert!(sent(&feed(&mut s, ":srv 903 alice :ok")).is_empty());
     }
 }
