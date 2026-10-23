@@ -4,8 +4,10 @@
 
 pub mod caps;
 pub mod config;
+pub mod event;
 pub mod isupport;
 pub mod proto;
 pub mod sasl;
 pub mod split;
+pub mod store;
 pub mod theme;
