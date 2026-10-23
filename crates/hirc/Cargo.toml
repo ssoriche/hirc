@@ -18,7 +18,9 @@ unicode-segmentation.workspace = true
 [features]
 # Developer-only: scripted, network-free UI runs with window screenshots.
 # See src/snapshot.rs. Nothing here is built without the feature.
-snapshot = ["dep:toml", "dep:serde", "dep:raw-window-handle", "dep:objc"]
+# `gpui/test-support` gives the headless context and `Window::render_to_image`
+# for HIRC_OFFSCREEN; it is never enabled in the default build.
+snapshot = ["dep:toml", "dep:serde", "dep:raw-window-handle", "dep:objc", "dep:image", "gpui/test-support", "gpui_platform/test-support"]
 
 [dependencies.toml]
 workspace = true
@@ -26,6 +28,12 @@ optional = true
 
 [dependencies.serde]
 workspace = true
+optional = true
+
+[dependencies.image]
+version = "0.25"
+default-features = false
+features = ["png"]
 optional = true
 
 [dependencies.raw-window-handle]

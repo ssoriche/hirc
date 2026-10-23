@@ -23,7 +23,8 @@ fn main() {
             config::Config::default()
         }
     };
-    let theme = match config.theme.as_deref().map(|name| hirc_core::theme::load(&dir, name)) {
+    #[cfg_attr(not(feature = "snapshot"), allow(unused_mut))]
+    let mut theme = match config.theme.as_deref().map(|name| hirc_core::theme::load(&dir, name)) {
         Some(Ok(t)) => t,
         Some(Err(e)) => {
             banner.get_or_insert(e.to_string());
@@ -36,6 +37,9 @@ fn main() {
     #[cfg(feature = "snapshot")]
     if let Some(plan) = &snap {
         plan.apply(&mut config);
+        if let Some(name) = &plan.theme {
+            theme = hirc_core::theme::load(&dir, name).unwrap_or_else(|e| snapshot::fail(&format!("cannot load theme {name}: {e}")));
+        }
     }
     let networks: Vec<String> = config.servers.keys().cloned().collect();
     let servers: Vec<(String, Vec<String>)> = config.servers.iter().map(|(name, s)| (name.clone(), s.channels.clone())).collect();
@@ -60,6 +64,12 @@ fn main() {
     #[cfg(not(feature = "snapshot"))]
     let (width, height) = (1200., 800.);
 
+    let init = Init { networks, servers, theme, font_family, font_size, banner, commands, events, no_layout_file };
+    #[cfg(feature = "snapshot")]
+    if let Some(plan) = snap.take_if(|p| p.offscreen) {
+        snapshot::run_offscreen(plan, init);
+    }
+
     gpui_platform::application().run(move |cx: &mut App| {
         input::bind_keys(cx);
         app::bind_keys(cx);
@@ -72,7 +82,6 @@ fn main() {
         })
         .detach();
         let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-        let init = Init { networks, servers, theme, font_family, font_size, banner, commands, events, no_layout_file };
         let _window = cx
             .open_window(
                 WindowOptions {

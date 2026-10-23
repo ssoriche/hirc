@@ -6,10 +6,35 @@ use crate::app::HircApp;
 use gpui::{Context, IntoElement, SharedString, div, prelude::*, px};
 use hirc_core::event::{ConnStatus, Target};
 
+/// Sidebar geometry in logical px, shared with snapshot click targeting.
+pub const WIDTH: f32 = 220.;
+const PAD_Y: f32 = 8.;
+const ROW_PAD_Y: f32 = 2.;
+/// gpui's default relative line height (`phi`).
+#[cfg(feature = "snapshot")]
+const LINE_HEIGHT: f32 = 1.618_034;
+
+/// Centre of the `index`th visible row, for a root text size of `font_size`.
+#[cfg(feature = "snapshot")]
+pub fn row_centre(index: usize, font_size: f32) -> (f32, f32) {
+    let row = 2. * ROW_PAD_Y + font_size * LINE_HEIGHT;
+    (WIDTH / 2., PAD_Y + row * (index as f32 + 0.5))
+}
+
 pub fn render(app: &HircApp, cx: &mut Context<HircApp>) -> impl IntoElement {
     let p = &app.palette;
-    let mut col =
-        div().id("sidebar").flex().flex_col().w(px(220.)).flex_none().h_full().bg(p.background).border_r_1().border_color(p.border).py_2().overflow_y_scroll();
+    let mut col = div()
+        .id("sidebar")
+        .flex()
+        .flex_col()
+        .w(px(WIDTH))
+        .flex_none()
+        .h_full()
+        .bg(p.background)
+        .border_r_1()
+        .border_color(p.border)
+        .py(px(PAD_Y))
+        .overflow_y_scroll();
     for pos in 0..app.layout.windows.len() {
         if let Some((n, b)) = app.layout.resolve(&app.store, pos) {
             col = col.child(row(app, pos, n, b, cx));
@@ -39,7 +64,7 @@ fn row(app: &HircApp, pos: usize, n: usize, b: usize, cx: &mut Context<HircApp>)
         .flex()
         .gap_2()
         .px_3()
-        .py(px(2.))
+        .py(px(ROW_PAD_Y))
         .cursor_pointer()
         .text_color(color)
         .when(selected, |d| d.bg(p.selected))

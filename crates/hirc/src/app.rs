@@ -164,6 +164,19 @@ impl HircApp {
         self.input.update(cx, |input, cx| input.type_text(text, window, cx));
     }
 
+    /// Logical centre of the first sidebar row whose label contains `label`
+    /// (case-insensitive), as the sidebar lays rows out.
+    #[cfg(feature = "snapshot")]
+    pub fn sidebar_point(&self, label: &str) -> Option<(f32, f32)> {
+        let want = label.to_lowercase();
+        let rows = (0..self.layout.windows.len()).filter_map(|pos| self.layout.resolve(&self.store, pos));
+        rows.enumerate().find_map(|(row, (n, b))| {
+            let net = &self.store.networks[n];
+            let name = net.buffers[b].target.name().unwrap_or(&net.name);
+            name.to_lowercase().contains(&want).then(|| sidebar::row_centre(row, self.font_size))
+        })
+    }
+
     /// Number of numbered windows.
     fn window_count(&self) -> usize {
         (0..self.layout.windows.len()).filter_map(|pos| self.layout.resolve(&self.store, pos)).count()

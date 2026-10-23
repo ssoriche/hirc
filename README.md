@@ -77,27 +77,58 @@ If the Ergo tests fail with certificate errors after an Ergo upgrade, delete
 
 ## Snapshot mode
 
-For reviewing the UI without a server. It opens the real window with canned
-data, drives it with a script, saves a screenshot and quits. The screen must
-be unlocked, and nothing touches the network.
+For reviewing the UI without a server. It runs the real app with canned data,
+drives it with a script and saves screenshots. Nothing touches the network.
+Two renderers share one fixture and script format:
+
+- Window mode (default): opens the real window and captures it with
+  `screencapture`. The screen must be unlocked.
+- Offscreen mode (`HIRC_OFFSCREEN=1`): no window and no AppKit app. gpui's
+  headless test context draws with Metal into a texture, so it works with no
+  window server or unlocked screen (a Metal device is still needed).
 
 ```sh
 cargo build -p hirc --features snapshot
+HIRC_OFFSCREEN=1 \
 HIRC_FIXTURE=crates/hirc/fixtures/demo.toml \
-HIRC_SCRIPT="window:2;key:escape;shot:out.png" \
-HIRC_SIZE=1200x800 \
+HIRC_SCRIPT="window:2;click:rust;key:i;type:hello;shot:typing.png;key:enter" \
+HIRC_SCREENSHOT=out.png \
     target/debug/hirc
 ```
 
 | Variable | Effect |
 |---|---|
 | `HIRC_FIXTURE=<file.toml>` | Canned servers and lines; enables snapshot mode. One `[[server]]` table per network (`name`, `nick`, optional `echo_message`, `lines` as raw IRC lines, optionally with an `@time=` tag), plus an optional top-level `base_time`. See `crates/hirc/fixtures/demo.toml`. |
-| `HIRC_SCRIPT="step;step"` | Steps: `window:N`, `key:<keystroke>`, `type:<text>`, `wait:<ms>`, `shot:<path.png>`. `type:` only inserts in Insert mode. |
-| `HIRC_SCREENSHOT=<out.png>` | After the script, capture the window and quit. |
-| `HIRC_SIZE=WxH` | Window size in logical pixels (default `1200x800`). |
+| `HIRC_SCRIPT="step;step"` | Steps, below. |
+| `HIRC_SCREENSHOT=<out.png>` | Final image, taken after the script. |
+| `HIRC_OFFSCREEN=1` | Offscreen mode. Exits 0 when done; on failure prints `snapshot: <reason>` and exits 1. |
+| `HIRC_SIZE=WxH` | Logical size (default `1200x800`). |
+| `HIRC_SCALE=<f>` | Device scale for offscreen output (default `2`). gpui's headless window is fixed at 2x; `1` downsamples that, other values are an error. |
+| `HIRC_THEME=<name>` | Overrides the config's `theme` for this run; a missing theme exits 1. |
+
+Steps are separated by `;`. Each is followed by a few frames. Offscreen runs
+use a simulated clock, so `wait` costs no real time.
+
+| Step | Effect |
+|---|---|
+| `window:N` | Go to window N. |
+| `key:<ks>` | A keystroke through the normal key path, so vim modes apply: `key:escape`, `key:ctrl-d`, `key:alt-2`, `key:enter`. `cmd+k` is accepted for `cmd-k`. |
+| `type:<text>` | Insert text (may contain `:`). Only inserts in Insert mode, so use `key:i` first when needed. |
+| `wait:<ms>` | Advance the simulated clock (offscreen) or sleep (window). |
+| `shot:<png>` | Save an image now. |
+| `click:<Label>` | Click the first sidebar row whose label contains `<Label>`, ignoring case. No match prints `snapshot: no click target <Label>` and continues. |
+| `at:x,y` | Primary mouse down and up at logical (x, y). |
+| `hover:x,y` | Mouse move to (x, y). |
+| `scroll:<px>` | Scroll wheel over the buffer view; negative scrolls down. |
+
+An unknown step prints `snapshot: unknown step <s>` and continues.
 
 Fixture runs never read or write the layout file. Theme and font still come
 from the normal config dir.
+
+The offscreen smoke test needs a Metal device and runs the real binary (AppKit
+wants the process main thread), so it is ignored by default:
+`cargo test -p hirc --features snapshot --test offscreen -- --ignored`
 
 ## macOS app
 

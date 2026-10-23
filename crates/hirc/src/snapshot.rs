@@ -1,35 +1,71 @@
-//! Developer snapshot mode: a scripted, network-free run of the real window
-//! that saves a screenshot, so the UI can be reviewed (and iterated on)
-//! without a person at the keyboard. Only built with `--features snapshot`.
+//! Developer snapshot mode: a scripted, network-free run of the real UI that
+//! saves screenshots, so the UI can be reviewed (and iterated on) without a
+//! person at the keyboard. Only built with `--features snapshot`.
 //!
-//! gpui 0.2.2 cannot render offscreen to an image, so this opens the real
-//! window with canned data, drives it with a script, captures the window
-//! with macOS `screencapture -l <window id>` and quits. The screen must be
-//! unlocked for the capture to work.
+//! Two renderers, both driven by the same fixture and script:
 //!
-//! Switches (all ignored unless `HIRC_FIXTURE` is set):
+//! - Window mode (default): opens the real window, drives it with a script,
+//!   captures it with macOS `screencapture -l <window id>` and quits. The
+//!   screen must be unlocked.
+//! - Offscreen mode (`HIRC_OFFSCREEN=1`): no window and no AppKit app. A
+//!   `HeadlessAppContext` (gpui `test-support`) with the macOS text system and
+//!   the Metal headless renderer draws into a texture, and
+//!   `capture_screenshot` reads it back. Needs no window server or unlocked
+//!   screen; the simulated clock replaces real sleeps. Run it on the main
+//!   thread (the binary does).
+//!
+//! Variables (all ignored unless `HIRC_FIXTURE` is set):
 //!
 //! | Variable | Effect |
 //! |---|---|
 //! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` is dropped, so nothing leaves the process. |
-//! | `HIRC_SCRIPT="step;step"` | Steps run once the fixture is fed: `window:N`, `key:<keystroke>`, `type:<text>`, `wait:<ms>`, `shot:<path.png>`. |
-//! | `HIRC_SCREENSHOT=<out.png>` | After the script, wait 300 ms for layout, capture, quit. |
-//! | `HIRC_SIZE=WxH` | Window size in logical px (default `1200x800`). |
+//! | `HIRC_SCREENSHOT=<out.png>` | Final image, taken after the script. Window mode waits 300 ms for layout, captures, quits. |
+//! | `HIRC_OFFSCREEN=1` | Offscreen mode (above). Exits 0 when done; on failure prints `snapshot: <reason>` and exits 1. |
+//! | `HIRC_SIZE=WxH` | Logical size (default `1200x800`). |
+//! | `HIRC_SCALE=<f>` | Device scale for offscreen output (default `2`). See `SCALE` below. |
+//! | `HIRC_THEME=<name>` | Overrides the config's `theme` for this run; a missing theme exits 1. |
+//! | `HIRC_SCRIPT="step;step"` | Steps, run once the fixture is fed (below). |
+//!
+//! Script steps, separated by `;` and trimmed. Each is followed by a few
+//! frames (`run_until_parked` plus a simulated advance, offscreen):
+//!
+//! | Step | Effect |
+//! |---|---|
+//! | `window:N` | Go to window N. |
+//! | `key:<ks>` | A keystroke through the normal key path, so vim modes apply: `key:escape`, `key:ctrl-d`, `key:alt-2`, `key:enter`. `+` is accepted for `-` (`cmd+k`). |
+//! | `type:<text>` | Insert text (may contain `:`). Only inserts in Insert mode, so use `key:i` first when needed. |
+//! | `wait:<ms>` | Advance the simulated clock (offscreen) or sleep (window). |
+//! | `shot:<png>` | Save an image now. |
+//! | `click:<Label>` | Click the centre of the first sidebar row whose label contains `<Label>`, ignoring case. No match prints `snapshot: no click target <Label>` and the script goes on. |
+//! | `at:x,y` | Primary mouse down and up at logical (x, y). |
+//! | `hover:x,y` | Mouse move to (x, y). |
+//! | `scroll:<px>` | Scroll wheel over the buffer view; negative scrolls down. |
+//!
+//! An unknown step prints `snapshot: unknown step <s>` and the script goes on.
+//!
+//! SCALE: gpui's headless test window is fixed at 2x and exposes no public way
+//! to change its platform scale (`Window::set_scale_factor` only changes the
+//! layout side, which would mismatch the texture). Offscreen output is 2x;
+//! `HIRC_SCALE=1` downsamples the 2x capture by averaging 2x2 blocks, and any
+//! other value is an error.
 //!
 //! Fixture runs never read or write the window layout file, and `config.servers`
 //! is replaced by the fixture's networks. Theme and font still come from the
-//! normal config dir (`XDG_CONFIG_HOME`). `type:` only inserts in Insert mode,
-//! like real typing, so use `key:i` first when needed.
+//! normal config dir (`XDG_CONFIG_HOME`).
 //!
-//! Window id: the `AppKit` raw-window-handle gives the `NSView`; `[[view window]
-//! windowNumber]` (via the `objc` crate gpui already uses) is the
-//! `CGWindowID` that `screencapture -l` wants.
+//! Window id (window mode): the `AppKit` raw-window-handle gives the `NSView`;
+//! `[[view window] windowNumber]` (via the `objc` crate gpui already uses) is
+//! the `CGWindowID` that `screencapture -l` wants.
 //!
 //! Any failure prints `snapshot: <reason>` to stderr and exits non-zero.
 
-use crate::app::HircApp;
+use crate::app::{self, HircApp, Init};
+use crate::views::sidebar;
 use chrono::{DateTime, Duration as Delta, Utc};
-use gpui::{AsyncApp, Keystroke, WindowHandle};
+use gpui::{
+    AppContext, AsyncApp, HeadlessAppContext, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta,
+    ScrollWheelEvent, TouchPhase, WindowHandle, point, px, size,
+};
 use hirc_core::config::{Config, Server};
 use hirc_core::event::{Command, Event};
 use hirc_core::proto::Message;
@@ -40,6 +76,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+/// What `Plan::channels` leaves for the offscreen runner to serve on the
+/// foreground executor (no thread, so frames stay deterministic).
+type Serve = (HashMap<String, Session>, UnboundedReceiver<Command>, UnboundedSender<Event>);
 
 const DEFAULT_BASE: &str = "2026-01-01T12:00:00Z";
 /// Time between steps, so each one renders before the next.
@@ -64,14 +104,25 @@ pub struct FixtureServer {
     pub lines: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Step {
     Window(usize),
     Key(String),
     Type(String),
     Wait(u64),
     Shot(String),
+    Click(String),
+    At(f32, f32),
+    Hover(f32, f32),
+    Scroll(f32),
     Unknown(String),
+}
+
+/// `x,y` in logical px.
+fn parse_point(s: &str) -> Option<(f32, f32)> {
+    let (x, y) = s.split_once(',')?;
+    let (x, y): (f32, f32) = (x.trim().parse().ok()?, y.trim().parse().ok()?);
+    (x.is_finite() && y.is_finite()).then_some((x, y))
 }
 
 pub fn parse_fixture(text: &str) -> Result<Fixture, String> {
@@ -87,10 +138,15 @@ pub fn parse_script(script: &str) -> Vec<Step> {
             let unknown = || Step::Unknown(s.to_owned());
             match s.split_once(':') {
                 Some(("window", n)) => n.trim().parse().map_or_else(|_| unknown(), Step::Window),
-                Some(("key", k)) => Step::Key(k.trim().to_owned()),
+                // github-rs writes `cmd+k`; gpui writes `cmd-k`.
+                Some(("key", k)) => Step::Key(k.trim().replace('+', "-")),
                 Some(("type", t)) => Step::Type(t.to_owned()),
                 Some(("wait", ms)) => ms.trim().parse().map_or_else(|_| unknown(), Step::Wait),
                 Some(("shot", p)) => Step::Shot(p.trim().to_owned()),
+                Some(("click", l)) if !l.trim().is_empty() => Step::Click(l.trim().to_owned()),
+                Some(("at", p)) => parse_point(p).map_or_else(unknown, |(x, y)| Step::At(x, y)),
+                Some(("hover", p)) => parse_point(p).map_or_else(unknown, |(x, y)| Step::Hover(x, y)),
+                Some(("scroll", d)) => d.trim().parse().ok().filter(|d: &f32| d.is_finite()).map_or_else(unknown, Step::Scroll),
                 _ => unknown(),
             }
         })
@@ -102,6 +158,16 @@ pub fn parse_size(s: &str) -> Option<(f32, f32)> {
     let (w, h) = s.split_once(['x', 'X'])?;
     let (w, h): (f32, f32) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
     (w >= 100. && h >= 100.).then_some((w, h))
+}
+
+/// Device scale for offscreen output: a positive factor up to 8.
+pub fn parse_scale(s: &str) -> Option<f32> {
+    s.trim().parse().ok().filter(|f: &f32| *f > 0. && *f <= 8.)
+}
+
+/// `1` or `true`.
+pub fn parse_flag(s: &str) -> bool {
+    matches!(s.trim(), "1" | "true")
 }
 
 fn session_config(s: &FixtureServer) -> SessionConfig {
@@ -148,6 +214,10 @@ pub struct Plan {
     canned: Option<(Vec<Event>, HashMap<String, Session>)>,
     /// Set once the feeder has sent every canned event.
     fed: Arc<AtomicBool>,
+    pub offscreen: bool,
+    scale: f32,
+    pub theme: Option<String>,
+    serve: Option<Serve>,
 }
 
 pub fn fail(reason: &str) -> ! {
@@ -166,8 +236,24 @@ impl Plan {
             Ok(s) => parse_size(&s).ok_or_else(|| format!("bad HIRC_SIZE {s:?}, want WxH"))?,
             Err(_) => (1200., 800.),
         };
+        let scale = match std::env::var("HIRC_SCALE") {
+            Ok(s) => parse_scale(&s).ok_or_else(|| format!("bad HIRC_SCALE {s:?}, want a number above 0"))?,
+            Err(_) => 2.,
+        };
         let script = std::env::var("HIRC_SCRIPT").map(|s| parse_script(&s)).unwrap_or_default();
-        Ok(Some(Plan { size, fixture, script, shot: std::env::var("HIRC_SCREENSHOT").ok(), canned, fed: Arc::default() }))
+        let offscreen = std::env::var("HIRC_OFFSCREEN").is_ok_and(|v| parse_flag(&v));
+        Ok(Some(Plan {
+            size,
+            fixture,
+            script,
+            shot: std::env::var("HIRC_SCREENSHOT").ok(),
+            canned,
+            fed: Arc::default(),
+            offscreen,
+            scale,
+            theme: std::env::var("HIRC_THEME").ok().filter(|t| !t.is_empty()),
+            serve: None,
+        }))
     }
 
     /// The fixture decides the networks.
@@ -186,6 +272,14 @@ impl Plan {
         let (cmd_tx, mut cmd_rx) = unbounded_channel::<Command>();
         let (ev_tx, ev_rx) = unbounded_channel::<Event>();
         let (events, mut sessions) = self.canned.take().unwrap_or_default();
+        if self.offscreen {
+            for ev in events {
+                let _ = ev_tx.send(ev);
+            }
+            self.fed.store(true, Ordering::SeqCst);
+            self.serve = Some((sessions, cmd_rx, ev_tx));
+            return (cmd_tx, ev_rx);
+        }
         let fed = self.fed.clone();
         std::thread::spawn(move || {
             for ev in events {
@@ -230,29 +324,154 @@ impl Plan {
     }
 }
 
-async fn apply(step: &Step, cx: &mut AsyncApp, handle: WindowHandle<HircApp>) -> Result<(), String> {
+/// Inject one input step into the window; shared by both modes. `Wait` and
+/// `Shot` are the runner's business. Events go through `update_window`, not
+/// the root entity's update: handlers (clicks, actions) update `HircApp`
+/// themselves and gpui forbids a nested lease.
+fn inject<C: AppContext>(step: &Step, cx: &mut C, handle: WindowHandle<HircApp>) -> Result<(), String> {
     let gone = |_| "window closed".to_owned();
+    let send = |cx: &mut C, e: PlatformInput| {
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.dispatch_event(e, cx);
+        })
+        .map_err(gone)
+    };
+    let at = |x: f32, y: f32| point(px(x), px(y));
+    let modifiers = Modifiers::default();
+    let click = |cx: &mut C, position| -> Result<(), String> {
+        send(cx, PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers }))?;
+        send(cx, PlatformInput::MouseDown(MouseDownEvent { position, modifiers, button: MouseButton::Left, click_count: 1, first_mouse: false }))?;
+        send(cx, PlatformInput::MouseUp(MouseUpEvent { position, modifiers, button: MouseButton::Left, click_count: 1 }))
+    };
     match step {
         Step::Window(n) => handle.update(cx, |app, _, cx| app.goto_window(*n, cx)).map_err(gone),
         Step::Key(k) => {
             let ks = Keystroke::parse(k).map_err(|e| format!("bad key {k:?}: {e}"))?;
-            handle
-                .update(cx, |_, window, cx| {
-                    window.dispatch_keystroke(ks, cx);
-                })
-                .map_err(gone)
+            cx.update_window(handle.into(), |_, window, cx| window.dispatch_keystroke(ks, cx)).map_err(gone).map(|_| ())
         }
         Step::Type(t) => handle.update(cx, |app, window, cx| app.type_text(t, window, cx)).map_err(gone),
+        Step::Click(label) => match handle.update(cx, |app, _, _| app.sidebar_point(label)).map_err(gone)? {
+            Some((x, y)) => click(cx, at(x, y)),
+            None => {
+                eprintln!("snapshot: no click target {label}");
+                Ok(())
+            }
+        },
+        Step::At(x, y) => click(cx, at(*x, *y)),
+        Step::Hover(x, y) => send(cx, PlatformInput::MouseMove(MouseMoveEvent { position: at(*x, *y), pressed_button: None, modifiers })),
+        Step::Scroll(d) => {
+            // Over the buffer view: right of the sidebar, mid-height.
+            let s = cx.update_window(handle.into(), |_, window, _| window.bounds().size).map_err(gone)?;
+            let position = at(sidebar::WIDTH + (f32::from(s.width) - sidebar::WIDTH) / 2., f32::from(s.height) / 2.);
+            let delta = ScrollDelta::Pixels(point(px(0.), px(*d)));
+            send(cx, PlatformInput::ScrollWheel(ScrollWheelEvent { position, delta, modifiers, touch_phase: TouchPhase::Moved }))
+        }
+        Step::Unknown(s) => {
+            eprintln!("snapshot: unknown step {s}");
+            Ok(())
+        }
+        Step::Wait(_) | Step::Shot(_) => Ok(()),
+    }
+}
+
+async fn apply(step: &Step, cx: &mut AsyncApp, handle: WindowHandle<HircApp>) -> Result<(), String> {
+    match step {
         Step::Wait(ms) => {
             cx.background_executor().timer(Duration::from_millis(*ms)).await;
             Ok(())
         }
         Step::Shot(path) => capture(cx, handle, path).await,
-        Step::Unknown(s) => {
-            eprintln!("snapshot: unknown step {s}");
-            Ok(())
-        }
+        _ => inject(step, cx, handle),
     }
+}
+
+// ---- offscreen ----
+
+/// Frames after each step: let tasks run, advance the simulated clock, and
+/// force a redraw (an update ends by drawing dirty windows).
+fn frames(cx: &mut HeadlessAppContext, handle: WindowHandle<HircApp>) {
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.advance_clock(FRAME);
+        cx.run_until_parked();
+        let _ = cx.update_window(handle.into(), |_, window, _| window.refresh());
+    }
+}
+
+fn shot(cx: &mut HeadlessAppContext, handle: WindowHandle<HircApp>, scale: f32, path: &str) -> Result<(), String> {
+    frames(cx, handle);
+    let img = cx.capture_screenshot(handle.into()).map_err(|e| format!("cannot render offscreen: {e}"))?;
+    let img = if scale == 2. { img } else { downsample_2x(&img) };
+    if let Some(dir) = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    img.save(path).map_err(|e| format!("cannot write {path}: {e}"))
+}
+
+/// Halve each dimension by averaging 2x2 blocks (HIRC_SCALE=1).
+fn downsample_2x(img: &image::RgbaImage) -> image::RgbaImage {
+    let (w, h) = (img.width() / 2, img.height() / 2);
+    image::RgbaImage::from_fn(w, h, |x, y| {
+        let mut sum = [0u32; 4];
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            for (i, v) in img.get_pixel(x * 2 + dx, y * 2 + dy).0.iter().enumerate() {
+                sum[i] += u32::from(*v);
+            }
+        }
+        image::Rgba(sum.map(|v| (v / 4) as u8))
+    })
+}
+
+/// Never returns: exits 0 after the run, or 1 with `snapshot: <reason>`.
+pub fn run_offscreen(plan: Plan, init: Init) -> ! {
+    match offscreen(plan, init) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => fail(&e),
+    }
+}
+
+fn offscreen(mut plan: Plan, init: Init) -> Result<(), String> {
+    if plan.scale != 2. && plan.scale != 1. {
+        return Err(format!("HIRC_SCALE={} unsupported: offscreen output is 2 (default) or 1; see snapshot.rs", plan.scale));
+    }
+    let text_system = gpui_platform::current_platform(true).text_system();
+    let mut cx = HeadlessAppContext::with_platform(text_system, Arc::new(()), gpui_platform::current_headless_renderer);
+    cx.update(|cx| {
+        crate::input::bind_keys(cx);
+        app::bind_keys(cx);
+    });
+    let (w, h) = plan.size;
+    let handle = cx
+        .open_window(size(px(w), px(h)), |window, cx| cx.new(|cx| HircApp::new(init, window, cx)))
+        .map_err(|e| format!("cannot open headless window: {e}"))?;
+    if let Some((mut sessions, mut cmd_rx, ev_tx)) = plan.serve.take() {
+        cx.update(|cx| {
+            cx.spawn(async move |_| {
+                while let Some(cmd) = cmd_rx.recv().await {
+                    let Some(session) = sessions.get_mut(cmd.network()) else { continue };
+                    for out in session.command(cmd, Utc::now()) {
+                        if let Output::Event(e) = out {
+                            let _ = ev_tx.send(e);
+                        }
+                    }
+                }
+            })
+            .detach();
+        });
+    }
+    frames(&mut cx, handle);
+    for step in &plan.script {
+        match step {
+            Step::Wait(ms) => cx.advance_clock(Duration::from_millis(*ms)),
+            Step::Shot(path) => shot(&mut cx, handle, plan.scale, path)?,
+            _ => inject(step, &mut cx, handle)?,
+        }
+        frames(&mut cx, handle);
+    }
+    if let Some(path) = &plan.shot {
+        shot(&mut cx, handle, plan.scale, path)?;
+    }
+    Ok(())
 }
 
 async fn capture(cx: &mut AsyncApp, handle: WindowHandle<HircApp>, path: &str) -> Result<(), String> {
@@ -314,6 +533,56 @@ mod tests {
             [Step::Key("escape".into()), Step::Type("hi there".into()), Step::Wait(200), Step::Shot("a.png".into()), Step::Window(2)]
         );
         assert_eq!(parse_script("type:a:b; ;bogus;wait:x"), [Step::Type("a:b".into()), Step::Unknown("bogus".into()), Step::Unknown("wait:x".into())]);
+    }
+
+    #[test]
+    fn github_rs_steps_parse() {
+        assert_eq!(
+            parse_script("click:general;at:10,20;hover:5,6;scroll:-400;key:cmd+k;wait:50;shot:a.png"),
+            [
+                Step::Click("general".into()),
+                Step::At(10., 20.),
+                Step::Hover(5., 6.),
+                Step::Scroll(-400.),
+                Step::Key("cmd-k".into()),
+                Step::Wait(50),
+                Step::Shot("a.png".into())
+            ]
+        );
+        assert_eq!(parse_script("key:ctrl+shift+a"), [Step::Key("ctrl-shift-a".into())]);
+        assert_eq!(parse_script("click:  my chan "), [Step::Click("my chan".into())]);
+    }
+
+    #[test]
+    fn bad_numbers_are_unknown() {
+        assert_eq!(
+            parse_script("at:x,1;at:1;hover:1,y;scroll:far;click:"),
+            [
+                Step::Unknown("at:x,1".into()),
+                Step::Unknown("at:1".into()),
+                Step::Unknown("hover:1,y".into()),
+                Step::Unknown("scroll:far".into()),
+                Step::Unknown("click:".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn scale_parses() {
+        assert_eq!(parse_scale("2"), Some(2.));
+        assert_eq!(parse_scale(" 1.5 "), Some(1.5));
+        assert_eq!(parse_scale("0"), None);
+        assert_eq!(parse_scale("-1"), None);
+        assert_eq!(parse_scale("x"), None);
+        assert_eq!(parse_scale("99"), None);
+    }
+
+    #[test]
+    fn offscreen_flag_parses() {
+        assert!(parse_flag("1"));
+        assert!(parse_flag("true"));
+        assert!(!parse_flag("0"));
+        assert!(!parse_flag(""));
     }
 
     #[test]
