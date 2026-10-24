@@ -2,3 +2,4 @@
 
 pub mod buffer;
 pub mod sidebar;
+pub mod viewport;

@@ -6,6 +6,7 @@ pub mod caps;
 pub mod command;
 pub mod config;
 pub mod conn;
+pub mod display;
 pub mod event;
 pub mod isupport;
 pub mod layout;

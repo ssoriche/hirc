@@ -2,6 +2,7 @@
 mod app;
 mod input;
 mod metrics;
+mod scroll;
 #[cfg(feature = "snapshot")]
 mod snapshot;
 mod theme;

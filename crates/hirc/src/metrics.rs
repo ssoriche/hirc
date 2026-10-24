@@ -41,6 +41,13 @@ const SIDEBAR_MAX_SHARE: f32 = 0.3;
 pub const COUNT_CELLS: usize = 3;
 /// A network tag never takes more than this many (small) cells.
 const TAG_CELLS: f32 = 8.;
+/// Message lines: the timestamp (`HH:MM`) and the nick column, in cells.
+pub const TIME_CELLS: usize = 5;
+const NICK_MIN_CELLS: usize = 3;
+const NICK_MAX_CELLS: usize = 12;
+/// The nick column never takes more than this share of the message view.
+const NICK_MAX_SHARE: f32 = 0.2;
+
 /// A label always keeps at least this many cells before tags give way.
 const LABEL_MIN_CELLS: f32 = 6.;
 
@@ -127,6 +134,21 @@ impl Metrics {
         (self.cell * self.small / self.size * TAG_CELLS).ceil()
     }
 
+    /// Exact width of `n` cells (unrounded), for columns that must stay on
+    /// the monospace grid however many of them sit side by side.
+    pub fn grid(&self, n: usize) -> f32 {
+        self.cell * n as f32
+    }
+
+    /// Cells in the message view's nick column, given the longest prefix
+    /// (nick or marker) in the buffer and the view's width: wide enough for
+    /// the longest, within limits, and narrower in a narrow window so the
+    /// text keeps most of the line.
+    pub fn nick_cells(&self, longest: usize, view_width: f32) -> usize {
+        let share = ((view_width * NICK_MAX_SHARE) / self.cell).floor() as usize;
+        longest.clamp(NICK_MIN_CELLS, NICK_MAX_CELLS.min(share.max(NICK_MIN_CELLS)))
+    }
+
     /// The least a row label keeps when space runs out.
     pub fn label_min(&self) -> f32 {
         self.cells(LABEL_MIN_CELLS)
@@ -208,6 +230,25 @@ mod tests {
         assert_eq!(count_label(999), "999");
         assert_eq!(count_label(1000), "1k+");
         assert!(count_label(123_456).chars().count() <= COUNT_CELLS);
+    }
+
+    #[test]
+    fn nick_column_fits_within_limits() {
+        let m = menlo(14.);
+        assert_eq!(m.nick_cells(5, 1000.), 5);
+        assert_eq!(m.nick_cells(1, 1000.), NICK_MIN_CELLS);
+        assert_eq!(m.nick_cells(22, 1000.), NICK_MAX_CELLS);
+        // A narrow view gives the nick at most a fifth of its width.
+        assert_eq!(m.nick_cells(22, 400.), (400. * NICK_MAX_SHARE / m.cell) as usize);
+        assert_eq!(m.nick_cells(22, 10.), NICK_MIN_CELLS);
+    }
+
+    #[test]
+    fn message_columns_sit_on_the_grid() {
+        let m = menlo(14.);
+        // time, space, five-cell nick, space: text starts on cell 12.
+        let x = m.grid(TIME_CELLS + 1 + 5 + 1);
+        assert!((x / m.cell - 12.).abs() < 1e-4);
     }
 
     #[test]

@@ -3,18 +3,19 @@
 
 use crate::input::{Submit, TextInput, VimEvent};
 use crate::metrics::{Metrics, Shape};
+use crate::scroll::{self, Pos};
 use crate::theme::{Palette, palette};
-use crate::views::{buffer, sidebar};
+use crate::views::{buffer, sidebar, viewport};
 use crate::vim::{self, Effect, Ex, Nav, Scroll};
-use gpui::{
-    App, Context, Entity, Focusable, KeyBinding, ListAlignment, ListOffset, ListState, ScrollHandle, SharedString, Window, actions, div, list, prelude::*, px,
-};
+use gpui::{App, Context, Entity, Focusable, KeyBinding, ListAlignment, ListState, ScrollHandle, SharedString, Window, actions, div, list, prelude::*, px};
 use hirc_core::command::{self, Input, WindowAction};
 use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::layout::{self, Layout};
 use hirc_core::store::{Applied, Buffer, LineKind, Network, Store};
 use hirc_core::theme::Theme;
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 actions!(hirc, [Quit, Window1, Window2, Window3, Window4, Window5, Window6, Window7, Window8, Window9, Window10]);
@@ -67,6 +68,12 @@ pub struct HircApp {
     banner: Option<String>,
     input: Entity<TextInput>,
     lines: ListState,
+    /// The message view's nick column, in cells (sized to the buffer).
+    nick_cells: usize,
+    /// Wheel movement not yet a whole line.
+    wheel: Rc<Cell<f32>>,
+    /// Lines arrived below while the view was scrolled up.
+    fresh_below: bool,
     commands: UnboundedSender<Command>,
 }
 
@@ -128,7 +135,12 @@ impl HircApp {
             sidebar_width: metrics.sidebar_width(f32::from(window.viewport_size().width)),
             banner: init.banner,
             input,
-            lines: ListState::new(0, ListAlignment::Bottom, px(400.)),
+            // Measure every line, so scroll offsets and the count of lines
+            // below the view are exact (lines are cached once measured).
+            lines: ListState::new(0, ListAlignment::Bottom, px(400.)).measure_all(),
+            nick_cells: 0,
+            wheel: Rc::default(),
+            fresh_below: false,
             commands: init.commands,
         }
     }
@@ -144,6 +156,8 @@ impl HircApp {
         let buf = &mut self.store.networks[n].buffers[b];
         buf.unread = 0;
         self.lines.reset(buf.lines.len());
+        self.fresh_below = false;
+        self.wheel.set(0.);
         self.reveal_selected();
         cx.notify();
     }
@@ -252,26 +266,42 @@ impl HircApp {
         }
     }
 
-    /// Scroll in pixel space, as the scrollbar does. `scroll_by` is a no-op
-    /// while the list follows the tail (no logical scroll top yet).
-    fn scroll_px(&mut self, delta: gpui::Pixels) {
-        let cur = (-self.lines.scroll_px_offset_for_scrollbar().y).min(self.lines.max_offset_for_scrollbar().y);
-        self.lines.set_offset_from_scrollbar(gpui::point(px(0.), (cur + delta).max(px(0.))));
-    }
-
+    /// Scroll on the line grid (see `scroll`): `k` moves one line, `ctrl-u`
+    /// half the view's lines.
     fn scroll(&mut self, s: Scroll) {
-        let line = px(self.metrics.line);
+        let line = self.metrics.line;
         // The list reports its viewport once laid out; before that, guess.
-        let page = match self.lines.viewport_bounds().size.height {
-            h if h > px(0.) => h,
-            _ => px(400.),
+        let page = match f32::from(self.lines.viewport_bounds().size.height) {
+            h if h > 0. => scroll::whole_lines(h, line).0,
+            _ => 20,
         };
         match s {
-            Scroll::Lines(n) => self.scroll_px(line * n as f32),
-            Scroll::HalfPage(n) => self.scroll_px(page / 2. * n as f32),
-            Scroll::Top => self.lines.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) }),
-            Scroll::Bottom => self.lines.scroll_to(ListOffset { item_ix: self.lines.item_count(), offset_in_item: px(0.) }),
+            Scroll::Lines(n) => scroll::by_lines(&self.lines, n, line),
+            Scroll::HalfPage(n) => scroll::by_lines(&self.lines, (page / 2).max(1) as i32 * n, line),
+            Scroll::Top => scroll::set(&self.lines, if self.lines.item_count() == 0 { Pos::Tail } else { Pos::Offset(0.) }),
+            Scroll::Bottom => scroll::set(&self.lines, Pos::Tail),
         }
+    }
+
+    /// Lines wholly below the view, counting the one the `-- more --` line
+    /// covers.
+    fn lines_below(&self) -> usize {
+        let cut = self.lines.viewport_bounds().bottom() - px(self.metrics.line);
+        let n = self.lines.item_count();
+        let (mut lo, mut hi) = (0, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.lines.bounds_for_item(mid) {
+                Some(b) if b.top() >= cut => hi = mid,
+                _ => lo = mid + 1,
+            }
+        }
+        n - lo
+    }
+
+    /// The widest nick-column entry in the current buffer, in cells.
+    fn longest_prefix(&self) -> usize {
+        self.current().map_or(0, |(_, buf)| buf.lines.iter().map(buffer::prefix_cells).max().unwrap_or(0))
     }
 
     fn vim_effect(&mut self, effect: &Effect, cx: &mut Context<Self>) {
@@ -304,6 +334,7 @@ impl HircApp {
         if let Applied::Line { network, buffer, index } = self.store.apply(ev)
             && self.selected == Some((network, buffer))
         {
+            self.fresh_below |= !scroll::following(&self.lines);
             self.lines.splice(index..index, 1);
             self.store.networks[network].buffers[buffer].unread = 0;
         }
@@ -350,8 +381,8 @@ impl HircApp {
     }
 
     fn line_element(&mut self, ix: usize) -> gpui::AnyElement {
-        match self.current().and_then(|(_, buf)| buf.lines.get(ix)) {
-            Some(line) => buffer::line(self, line),
+        match self.current().and_then(|(net, buf)| Some((net, buf.lines.get(ix)?))) {
+            Some((net, line)) => buffer::line(self, line, &buffer::Context { me: net.nick.as_deref(), nick_cells: self.nick_cells }),
             None => div().into_any_element(),
         }
     }
@@ -361,7 +392,22 @@ impl Render for HircApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette.clone();
         let m = self.metrics;
-        self.sidebar_width = m.sidebar_width(f32::from(window.viewport_size().width));
+        let width = f32::from(window.viewport_size().width);
+        self.sidebar_width = m.sidebar_width(width);
+        // The nick column follows the buffer's longest nick; rows wrap
+        // against it, so a change means measuring them again.
+        let nick_cells = m.nick_cells(self.longest_prefix(), width - self.sidebar_width);
+        if nick_cells != self.nick_cells {
+            self.nick_cells = nick_cells;
+            self.lines.remeasure();
+        }
+        let following = scroll::following(&self.lines);
+        if following {
+            self.fresh_below = false;
+        }
+        let at_top = !following && f32::from(self.lines.scroll_px_offset_for_scrollbar().y) >= 0.;
+        let more = (!following).then(|| buffer::more(self, self.lines_below(), at_top, self.fresh_below));
+        let lines = list(self.lines.clone(), cx.processor(|this, ix: usize, _window, _cx| this.line_element(ix))).size_full();
         let mut root = div().size_full();
         macro_rules! window_keys {
             ($($action:ident => $n:expr),*) => {
@@ -386,7 +432,16 @@ impl Render for HircApp {
                     .bg(p.buffer_bg)
                     .when_some(self.banner.clone(), |d, b| d.child(div().px(px(m.gutter)).py(px(m.pad_y)).bg(p.error).text_color(p.background).child(b)))
                     .child(buffer::title(self))
-                    .child(list(self.lines.clone(), cx.processor(|this, ix: usize, _window, _cx| this.line_element(ix))).flex_1().w_full())
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(viewport::viewport(self.lines.clone(), lines.into_any_element(), m.line, m.edge, m.edge, self.wheel.clone()))
+                            .children(more),
+                    )
                     .child(div().px(px(m.gutter)).py(px(m.bar_pad())).bg(p.input_bg).border_t_1().border_color(p.border).child(self.input.clone())),
             )
     }
