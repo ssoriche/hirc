@@ -20,6 +20,18 @@ pub enum Input {
     Window(WindowAction),
 }
 
+/// Every command `parse` knows (case-insensitive), for the input line to
+/// show a recognised command as one.
+pub const COMMANDS: &[&str] =
+    &["window", "win", "me", "join", "j", "part", "leave", "msg", "privmsg", "query", "q", "nick", "raw", "quote", "topic", "quit", "disconnect", "reconnect"];
+
+/// The command a line starts with (`/me waves` is `me`), if it is one.
+pub fn leading(input: &str) -> Option<&str> {
+    let rest = input.strip_prefix('/').filter(|r| !r.starts_with('/'))?;
+    let cmd = rest.split(' ').next().unwrap_or(rest);
+    COMMANDS.iter().any(|c| c.eq_ignore_ascii_case(cmd)).then_some(cmd)
+}
+
 fn is_channel(s: &str) -> bool {
     s.starts_with(['#', '&'])
 }
@@ -77,6 +89,18 @@ mod tests {
 
     fn p(s: &str) -> Result<Input, String> {
         parse(s, "net", Some("#chan"))
+    }
+
+    #[test]
+    fn every_listed_command_is_parsed() {
+        for c in COMMANDS {
+            assert!(!matches!(p(&format!("/{c} x y")), Err(e) if e.starts_with("Unknown")), "{c}");
+        }
+        assert_eq!(leading("/me waves"), Some("me"));
+        assert_eq!(leading("/JOIN"), Some("JOIN"));
+        assert_eq!(leading("/mw waves"), None);
+        assert_eq!(leading("//me"), None);
+        assert_eq!(leading("me"), None);
     }
 
     #[test]

@@ -104,6 +104,28 @@ pub enum ConfigError {
     Command { command: String, message: String },
 }
 
+impl ConfigError {
+    /// The file is not there at all: on a first run that is normal, and
+    /// the defaults stand in.
+    pub fn is_missing(&self) -> bool {
+        matches!(self, ConfigError::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
+    }
+}
+
+/// `text` with every path under `home` written from `~`, so messages stay
+/// short and do not spell out the user's home directory.
+pub fn tilde(text: &str, home: Option<&Path>) -> String {
+    match home.and_then(Path::to_str).filter(|h| h.len() > 1) {
+        Some(h) => text.replace(&format!("{}/", h.trim_end_matches('/')), "~/"),
+        None => text.to_owned(),
+    }
+}
+
+/// `tilde` with the user's home directory.
+pub fn tilde_home(text: &str) -> String {
+    tilde(text, dirs::home_dir().as_deref())
+}
+
 /// Only the program name: the rest of the command line may hold a secret.
 fn program(command: &str) -> &str {
     command.split_whitespace().find(|w| !w.contains(['=', '"', '\''])).unwrap_or("command")
@@ -304,5 +326,22 @@ password_command = "printf hunter22"
     #[test]
     fn program_skips_quoted_env_values() {
         assert_eq!(program("FOO=\"a b\" op read x"), "op");
+    }
+
+    #[test]
+    fn home_paths_shorten_to_tilde() {
+        let home = Path::new("/Users/me");
+        assert_eq!(tilde("reading /Users/me/.config/hirc/config.toml: x", Some(home)), "reading ~/.config/hirc/config.toml: x");
+        assert_eq!(tilde("/Users/meg/x", Some(home)), "/Users/meg/x");
+        assert_eq!(tilde("/tmp/x", None), "/tmp/x");
+        assert_eq!(tilde("/x", Some(Path::new("/"))), "/x");
+    }
+
+    #[test]
+    fn a_missing_file_is_told_apart() {
+        let missing = load(Path::new("/nonexistent/hirc/config.toml")).unwrap_err();
+        assert!(missing.is_missing());
+        let parse = ConfigError::Parse { path: "x".into(), message: String::new(), line: 1, col: 1 };
+        assert!(!parse.is_missing());
     }
 }

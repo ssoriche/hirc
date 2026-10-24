@@ -129,6 +129,19 @@ impl Vim {
         self.pending = Pending::None;
     }
 
+    /// The input is about to show another window's line. Anything tied to
+    /// the old line goes; an open ex line is abandoned, and the draft it was
+    /// opened over is returned (that, not the ex line, is the old window's).
+    pub fn switch_line(&mut self) -> Option<String> {
+        self.pending = Pending::None;
+        self.undo = None;
+        if self.mode != Mode::Ex {
+            return None;
+        }
+        self.mode = Mode::Normal;
+        Some(self.saved.take().map(|(text, _)| text).unwrap_or_default())
+    }
+
     pub fn key(&mut self, key: &Key, text: &str, cursor: usize) -> Vec<Effect> {
         match self.mode {
             Mode::Insert => self.insert(key, text, cursor),
@@ -797,5 +810,15 @@ mod tests {
                 let _ = (next_word_start(t, i), prev_word_start(t, i), word_end(t, i), word_run(t, i), clamp_normal(t, i));
             }
         }
+    }
+
+    #[test]
+    fn switching_lines_abandons_the_ex_line_for_its_draft() {
+        let mut s = Sim::new("my draft", 8);
+        s.feed(esc()).feed(k(':'));
+        assert_eq!(s.vim.switch_line(), Some("my draft".into()));
+        assert_eq!(s.vim.mode, Mode::Normal);
+        // Outside ex there is nothing to hand back.
+        assert_eq!(s.vim.switch_line(), None);
     }
 }

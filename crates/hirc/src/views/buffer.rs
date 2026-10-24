@@ -1,4 +1,5 @@
-//! The selected buffer: a title bar (name and topic) and its lines.
+//! The selected buffer: a title bar (name, network or state, topic) and
+//! its lines.
 //!
 //! A message line is four columns on the monospace grid: the time, a nick
 //! column (nicks right-aligned against the text, irssi/weechat style), and
@@ -11,27 +12,119 @@
 use crate::app::HircApp;
 use crate::metrics::{Metrics, TIME_CELLS};
 use crate::theme::Palette;
-use gpui::{AnyElement, FontWeight, HighlightStyle, Hsla, IntoElement, StyledText, div, prelude::*, px};
+use gpui::{AnyElement, FontWeight, HighlightStyle, Hsla, IntoElement, StyledText, TextRun, Window, div, prelude::*, px};
 use hirc_core::display::{self, Part};
+use hirc_core::event::{ConnStatus, Target};
 use hirc_core::store::{Line, LineKind};
 
-pub fn title(app: &HircApp) -> impl IntoElement {
+/// The title bar: the window's name, its network (as the window list tags
+/// it) or, for a server, its connection state, then the topic. Each part
+/// is cut to fit with an ellipsis that ends on the bar's padding, and the
+/// name never takes more than `NAME_SHARE` while there is a topic to show.
+/// `pane` is the width of the buffer pane.
+pub fn title(app: &HircApp, window: &Window, pane: f32) -> impl IntoElement {
     let p = &app.palette;
     let m = &app.metrics;
-    let (name, topic) = match app.current() {
-        Some((net, buf)) => (buf.target.name().unwrap_or(&net.name).to_owned(), buf.topic.clone().unwrap_or_default()),
-        None => ("No servers configured".to_owned(), String::new()),
+    let (name, tag, topic): (String, Option<Piece>, Option<Piece>) = match app.current() {
+        Some((net, buf)) => {
+            let offline = matches!(net.status, ConnStatus::Disconnected { .. } | ConnStatus::Failed { .. });
+            match &buf.target {
+                Target::Server => {
+                    let (state, color, why) = match &net.status {
+                        ConnStatus::Connected { nick } => (format!("● connected as {nick}"), p.success, None),
+                        ConnStatus::Connecting | ConnStatus::Idle => ("● connecting".to_owned(), p.text_dim, None),
+                        ConnStatus::Disconnected { reason } => ("● disconnected".to_owned(), p.error, Some(reason.clone())),
+                        ConnStatus::Failed { reason } => ("● failed".to_owned(), p.error, Some(reason.clone())),
+                    };
+                    (net.name.clone(), Some((state, color)), why.filter(|r| !r.is_empty()).map(|r| (r, p.topic)))
+                }
+                target => {
+                    let tag = (net.name.clone(), if offline { p.error } else { p.text_dim });
+                    let topic = match (target, &buf.topic) {
+                        (Target::Channel(_), Some(t)) if !t.is_empty() => Some((t.clone(), p.topic)),
+                        (Target::Channel(_), _) if !buf.joined => Some(("(not joined)".to_owned(), p.topic)),
+                        (Target::Channel(_), _) => Some(("(no topic)".to_owned(), p.topic)),
+                        _ => None,
+                    };
+                    (target.name().unwrap_or_default().to_owned(), Some(tag), topic)
+                }
+            }
+        }
+        None => ("No servers configured".to_owned(), None, app.hint().map(|h| (h.to_owned(), p.topic))),
     };
+    let measure = |s: &str, size: f32| {
+        let run = TextRun { len: s.len(), font: app.font.clone(), color: p.text, background_color: None, underline: None, strikethrough: None };
+        let line = window.text_system().shape_line(s.to_owned().into(), px(size), &[run], None);
+        move |i: usize| f32::from(line.x_for_index(i))
+    };
+    let fit = |s: &str, size: f32, max: f32| -> (String, f32) {
+        let x = measure(s, size);
+        match cut(s, &x, max, measure("…", size)(3)) {
+            None => (s.to_owned(), x(s.len())),
+            Some(i) => {
+                let head = s[..i].trim_end();
+                (format!("{head}…"), x(head.len()) + measure("…", size)(3))
+            }
+        }
+    };
+    let inner = (pane - 2. * m.gutter).max(0.);
+    let gap = m.cell;
+    let (tag, tag_w) = match tag {
+        Some((t, c)) => {
+            let (t, w) = fit(&t, m.small, (inner * TAG_SHARE).max(m.tag_max()));
+            (Some((t, c)), w + gap)
+        }
+        None => (None, 0.),
+    };
+    let name_max = if topic.is_some() { inner * NAME_SHARE } else { inner - tag_w };
+    let (name, name_w) = fit(&name, m.size, name_max.max(0.));
+    let topic = topic.map(|(t, c)| (fit(&t, m.size, (inner - name_w - tag_w - gap).max(0.)).0, c));
+    let part = || div().flex_none().whitespace_nowrap().overflow_hidden();
     div()
         .flex()
-        .gap(px(m.gutter))
         .px(px(m.gutter))
         .py(px(m.bar_pad()))
         .bg(p.title_bg)
         .border_b_1()
         .border_color(p.border)
-        .child(div().flex_none().text_color(p.text).child(name))
-        .child(div().flex_1().truncate().text_color(p.topic).child(topic))
+        .child(part().text_color(p.text).child(name))
+        .children(tag.map(|(t, c)| part().ml(px(gap)).text_size(px(m.small)).relative().top(px(m.small_drop)).text_color(c).child(t)))
+        .children(topic.map(|(t, c)| part().flex_shrink(1.).min_w(px(0.)).ml(px(gap)).text_color(c).child(t)))
+}
+
+/// A piece of the title bar: its text and colour.
+type Piece = (String, Hsla);
+
+/// The most of the title bar the name takes while a topic is shown.
+const NAME_SHARE: f32 = 0.4;
+/// The most of the title bar the network tag takes.
+const TAG_SHARE: f32 = 0.2;
+
+/// Where to cut `s` so it and an `ellipsis` wide ellipsis fit in `max`,
+/// given `x(i)`, the advance up to byte `i`: the last char boundary that
+/// leaves room, or `None` when the whole of `s` fits.
+fn cut(s: &str, x: impl Fn(usize) -> f32, max: f32, ellipsis: f32) -> Option<usize> {
+    if x(s.len()) <= max {
+        return None;
+    }
+    Some(s.char_indices().map(|(i, _)| i).take_while(|&i| x(i) + ellipsis <= max).last().unwrap_or(0))
+}
+
+/// A config that could not be used: a bar like the title bar, with the
+/// error marker message lines use (`=!=`), all in the error role.
+pub fn banner(app: &HircApp, message: String) -> impl IntoElement {
+    let p = &app.palette;
+    let m = &app.metrics;
+    div()
+        .flex()
+        .px(px(m.gutter))
+        .py(px(m.bar_pad()))
+        .bg(p.title_bg)
+        .border_b_1()
+        .border_color(p.border)
+        .text_color(p.error)
+        .child(div().flex_none().child(display::marker(LineKind::Error)))
+        .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).child(message))
 }
 
 /// Cells the nick column needs for `line` (its nick, or its marker).
@@ -201,6 +294,20 @@ mod tests {
         assert_eq!(fit("a_really_long_nickname", 12).chars().count(), 12);
         assert_eq!(fit("abc", 3), "abc");
         assert_eq!(fit("abcd", 1), "…");
+    }
+
+    #[test]
+    fn cuts_leave_room_for_the_ellipsis() {
+        // A monospace face: 10px a char.
+        let x = |i: usize| i as f32 * 10.;
+        assert_eq!(cut("abcdef", x, 60., 10.), None);
+        assert_eq!(cut("abcdef", x, 59., 10.), Some(4));
+        assert_eq!(cut("abcdef", x, 50., 10.), Some(4));
+        assert_eq!(cut("abcdef", x, 5., 10.), Some(0));
+        // Never inside a multibyte char.
+        let s = "aé€b";
+        let i = cut(s, |i| s[..i].chars().count() as f32 * 10., 25., 10.).unwrap();
+        assert!(s.is_char_boundary(i) && i == 1);
     }
 
     #[test]

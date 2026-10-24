@@ -4,6 +4,7 @@
 
 use std::ops::Range;
 
+use crate::metrics::{Metrics, Shape};
 use crate::theme::Palette;
 use crate::vim::{self, Effect, Key, Mode, Named, Vim};
 use gpui::{
@@ -11,6 +12,7 @@ use gpui::{
     Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
+use hirc_core::command;
 use unicode_segmentation::*;
 
 actions!(text_input, [Backspace, Delete, Left, Right, SelectLeft, SelectRight, SelectAll, Home, End, ShowCharacterPalette, Paste, Cut, Copy, Enter,]);
@@ -18,7 +20,8 @@ actions!(text_input, [Backspace, Delete, Left, Right, SelectLeft, SelectRight, S
 pub struct TextInput {
     focus_handle: FocusHandle,
     content: SharedString,
-    placeholder: SharedString,
+    /// Shown while the line is empty; the app names the target in it.
+    pub placeholder: SharedString,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -30,6 +33,12 @@ pub struct TextInput {
     vim: Vim,
     /// For the mode label; set by the app.
     pub palette: Option<Palette>,
+    /// Spacing, from the configured font; set by the app.
+    pub metrics: Option<Metrics>,
+    /// Where the text starts, from the input's left edge: the message
+    /// view's text column, so a line is typed where it will be shown. The
+    /// mode label sits right-aligned before it, where nicks sit.
+    pub column: f32,
 }
 
 impl TextInput {
@@ -136,8 +145,13 @@ impl TextInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        // In Normal mode the cursor sits on a char, never at `len`.
-        let offset = if self.vim.mode == Mode::Normal { vim::clamp_normal(&self.content, offset) } else { offset };
+        // In Normal mode the cursor sits on a char, never at `len`; in ex
+        // it never goes before the `:`.
+        let offset = match self.vim.mode {
+            Mode::Normal => vim::clamp_normal(&self.content, offset),
+            Mode::Ex => offset.max(self.hidden()),
+            Mode::Insert => offset,
+        };
         self.selected_range = offset..offset;
         cx.notify()
     }
@@ -160,7 +174,13 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x)
+        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x) + self.hidden()
+    }
+
+    /// Bytes at the start of the line that are not drawn as text: the ex
+    /// line's `:`, which the mode label shows instead (one colon, vim's).
+    fn hidden(&self) -> usize {
+        usize::from(self.vim.mode == Mode::Ex && self.content.starts_with(':'))
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -285,21 +305,19 @@ impl EntityInputHandler for TextInput {
     fn bounds_for_range(&mut self, range_utf16: Range<usize>, bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
-        Some(Bounds::from_corners(
-            point(bounds.left() - self.scroll_x + last_layout.x_for_index(range.start), bounds.top()),
-            point(bounds.left() - self.scroll_x + last_layout.x_for_index(range.end), bounds.bottom()),
-        ))
+        let x = |i: usize| bounds.left() - self.scroll_x + last_layout.x_for_index(i.saturating_sub(self.hidden()));
+        Some(Bounds::from_corners(point(x(range.start), bounds.top()), point(x(range.end), bounds.bottom())))
     }
 
     fn character_index_for_point(&mut self, point: gpui::Point<Pixels>, _window: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
 
-        if last_layout.text != self.content {
+        if last_layout.text != self.content[self.hidden()..] {
             return None;
         }
         let utf8_index = last_layout.index_for_x(point.x - line_point.x + self.scroll_x)?;
-        Some(self.offset_to_utf16(utf8_index))
+        Some(self.offset_to_utf16(utf8_index + self.hidden()))
     }
 }
 
@@ -309,9 +327,17 @@ struct TextElement {
 
 struct PrepaintState {
     line: Option<ShapedLine>,
-    cursor: Option<PaintQuad>,
+    /// The placeholder, drawn clear of the cursor so it never covers it.
+    placeholder: Option<ShapedLine>,
+    /// The Normal-mode block, drawn under the text (its glyph is inverted).
+    block: Option<PaintQuad>,
+    /// The Insert/ex bar, drawn over the text.
+    caret: Option<PaintQuad>,
     scroll_x: Pixels,
     selection: Option<PaintQuad>,
+    /// `…` at an edge with text scrolled out of view past it, over a
+    /// background-coloured cell.
+    marks: Vec<(PaintQuad, Pixels, ShapedLine)>,
 }
 
 impl IntoElement for TextElement {
@@ -357,63 +383,93 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
-        let content = input.content.clone();
-        let selected_range = input.selected_range.clone();
-        let cursor = input.cursor_offset();
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let m = input.metrics.unwrap_or_else(|| Metrics::new(f32::from(font_size), Shape::FALLBACK));
+        let text = style.color;
+        let (bg, dim, hint, selection_bg) = match &input.palette {
+            Some(p) => (p.input_bg, p.text_dim, p.timestamp, p.selection),
+            None => (gpui::transparent_black(), text.opacity(0.6), text.opacity(0.4), text.opacity(0.25)),
+        };
+        let hidden = input.hidden();
+        let shown: SharedString = input.content[hidden..].to_owned().into();
+        let shift = |i: usize| i.saturating_sub(hidden).min(shown.len());
+        let selected_range = shift(input.selected_range.start)..shift(input.selected_range.end);
+        let cursor = shift(input.cursor_offset());
         let normal = input.vim.mode == Mode::Normal;
         let prev_scroll = input.scroll_x;
-        let style = window.text_style();
 
-        let (display_text, text_color) = if content.is_empty() { (input.placeholder.clone(), style.color.opacity(0.4)) } else { (content, style.color) };
-
-        let run = TextRun { len: display_text.len(), font: style.font(), color: text_color, background_color: None, underline: None, strikethrough: None };
-        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
-            vec![
-                TextRun { len: marked_range.start, ..run.clone() },
-                TextRun {
-                    len: marked_range.end - marked_range.start,
-                    underline: Some(UnderlineStyle { color: Some(run.color), thickness: px(1.0), wavy: false }),
-                    ..run.clone()
-                },
-                TextRun { len: display_text.len() - marked_range.end, ..run },
-            ]
+        // Colours over the line: a recognised `/command` recedes, marked
+        // (IME) text is underlined, and the Normal block's glyph is drawn
+        // in the background colour, as a terminal's reverse video.
+        let mut over = Vec::new();
+        if input.vim.mode != Mode::Ex
+            && let Some(cmd) = command::leading(&shown)
+        {
+            over.push((0..cmd.len() + 1, (dim, false)));
+        }
+        if let Some(marked) = &input.marked_range {
+            over.push((shift(marked.start)..shift(marked.end), (text, true)));
+        }
+        if normal && selected_range.is_empty() {
+            over.push((cursor..next_char_boundary(&shown, cursor), (bg, false)));
+        }
+        let runs: Vec<TextRun> = spans(shown.len(), (text, false), &over)
             .into_iter()
-            .filter(|run| run.len > 0)
-            .collect()
-        } else {
-            vec![run]
+            .map(|(range, (color, underline))| TextRun {
+                len: range.len(),
+                font: style.font(),
+                color,
+                background_color: None,
+                underline: underline.then_some(UnderlineStyle { color: Some(color), thickness: px(1.0), wavy: false }),
+                strikethrough: None,
+            })
+            .collect();
+        let shape = |s: SharedString, color| {
+            let run = TextRun { len: s.len(), font: style.font(), color, background_color: None, underline: None, strikethrough: None };
+            window.text_system().shape_line(s, font_size, &[run], None)
         };
+        let placeholder = (input.content.is_empty() && !input.placeholder.is_empty()).then(|| shape(input.placeholder.clone(), hint));
+        let line = window.text_system().shape_line(shown.clone(), font_size, &runs, None);
 
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let line = window.text_system().shape_line(display_text, font_size, &runs, None);
-
+        // Keep the cursor two cells clear of each edge, so the `…` marks
+        // never cover it; at the end, leave room for the bar.
         let view = f32::from(bounds.size.width);
-        let scroll_x = px(scroll_for_cursor(f32::from(prev_scroll), f32::from(line.x_for_index(cursor)), f32::from(line.width), view, f32::from(font_size)));
+        let margin = 2. * m.cell + 2. * m.caret;
+        let scroll_x = px(scroll_for_cursor(f32::from(prev_scroll), f32::from(line.x_for_index(cursor)), f32::from(line.width), view, margin, 2. * m.caret));
         let origin_x = bounds.left() - scroll_x;
         let cursor_pos = line.x_for_index(cursor);
-        let (selection, cursor) = if selected_range.is_empty() {
-            // Normal mode draws a translucent block over the char under the cursor.
-            let (width, color) = if normal {
-                let end = line.x_for_index(next_char_boundary(&line.text, cursor));
-                (if end > cursor_pos { end - cursor_pos } else { font_size * 0.6 }, style.color.opacity(0.5))
-            } else {
-                (px(2.), style.color)
-            };
-            (None, Some(fill(Bounds::new(point(origin_x + cursor_pos, bounds.top()), size(width, bounds.bottom() - bounds.top())), color)))
+        let glyph_top = bounds.top() + px(m.glyph_top());
+        let (mut block, mut caret, mut selection) = (None, None, None);
+        if !selected_range.is_empty() {
+            selection = Some(fill(
+                Bounds::from_corners(
+                    point(origin_x + line.x_for_index(selected_range.start), bounds.top()),
+                    point(origin_x + line.x_for_index(selected_range.end), bounds.bottom()),
+                ),
+                selection_bg,
+            ));
+        } else if normal {
+            let end = line.x_for_index(next_char_boundary(&shown, cursor));
+            let width = if end > cursor_pos { end - cursor_pos } else { px(m.cell) };
+            block = Some(fill(Bounds::new(point(origin_x + cursor_pos, glyph_top), size(width, px(m.glyph))), text));
         } else {
-            (
-                Some(fill(
-                    Bounds::from_corners(
-                        point(origin_x + line.x_for_index(selected_range.start), bounds.top()),
-                        point(origin_x + line.x_for_index(selected_range.end), bounds.bottom()),
-                    ),
-                    style.color.opacity(0.25),
-                )),
-                None,
-            )
-        };
+            // Half a bar clear of the glyph before it.
+            let x = origin_x + cursor_pos + px((m.caret / 2.).ceil());
+            caret = Some(fill(Bounds::new(point(x, glyph_top), size(px(m.caret), px(m.glyph))), text));
+        }
+
+        let mut marks = Vec::new();
+        let cell = px(m.cell);
+        if scroll_x > px(0.5) {
+            marks.push((bounds.left(), shape("…".into(), dim)));
+        }
+        if line.width - scroll_x > bounds.size.width + px(0.5) {
+            marks.push((bounds.right() - cell, shape("…".into(), dim)));
+        }
+        let marks = marks.into_iter().map(|(x, l)| (fill(Bounds::new(point(x, bounds.top()), size(cell, bounds.size.height)), bg), x, l)).collect();
         self.input.update(cx, |input, _cx| input.scroll_x = scroll_x);
-        PrepaintState { line: Some(line), cursor, selection, scroll_x }
+        PrepaintState { line: Some(line), placeholder, block, caret, scroll_x, selection, marks }
     }
 
     fn paint(
@@ -431,19 +487,35 @@ impl Element for TextElement {
         let Some(line) = prepaint.line.take() else {
             return;
         };
-        let selection = prepaint.selection.take();
-        let cursor = prepaint.cursor.take().filter(|_| focus_handle.is_focused(window));
+        let focused = focus_handle.is_focused(window);
+        let block = prepaint.block.take().filter(|_| focused);
+        let caret = prepaint.caret.take().filter(|_| focused);
         let origin = point(bounds.origin.x - prepaint.scroll_x, bounds.origin.y);
+        let line_height = window.line_height();
+        // The placeholder starts a cell and a bar clear of the cursor, so
+        // neither the bar nor the block ever sits on it.
+        let hint_x = self.input.read(cx).metrics.map_or(px(0.), |m| px(m.cell + 2. * m.caret));
         // The line is scrolled, so keep everything inside the input's bounds.
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            if let Some(selection) = selection {
-                window.paint_quad(selection)
+            for quad in [prepaint.selection.take(), block].into_iter().flatten() {
+                window.paint_quad(quad);
             }
-            if let Err(e) = line.paint(origin, window.line_height(), gpui::TextAlign::Left, None, window, cx) {
+            if let Err(e) = line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx) {
                 tracing::debug!("input paint failed: {e}");
             }
-            if let Some(cursor) = cursor {
-                window.paint_quad(cursor);
+            if let Some(placeholder) = prepaint.placeholder.take()
+                && let Err(e) = placeholder.paint(point(bounds.origin.x + hint_x, bounds.origin.y), line_height, gpui::TextAlign::Left, None, window, cx)
+            {
+                tracing::debug!("input paint failed: {e}");
+            }
+            for (quad, x, mark) in prepaint.marks.drain(..) {
+                window.paint_quad(quad);
+                if let Err(e) = mark.paint(point(x, bounds.origin.y), line_height, gpui::TextAlign::Left, None, window, cx) {
+                    tracing::debug!("input paint failed: {e}");
+                }
+            }
+            if let Some(caret) = caret {
+                window.paint_quad(caret);
             }
         });
 
@@ -456,12 +528,17 @@ impl Element for TextElement {
 
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let label = match self.vim.mode {
-            Mode::Insert => "INSERT",
-            Mode::Normal => "NORMAL",
-            Mode::Ex => ":",
+        // One label per mode, each in its own role at the text's own size
+        // and baseline: INSERT is the quiet default, NORMAL the theme's
+        // accent (keys there edit, not type), and the ex line's `:` reads as
+        // part of the command, flush against it, as vim's prompt does.
+        let p = self.palette.as_ref();
+        let (label, color, gap) = match self.vim.mode {
+            Mode::Insert => ("INSERT", p.map(|p| p.text_dim), true),
+            Mode::Normal => ("NORMAL", p.map(|p| p.tertiary), true),
+            Mode::Ex => (":", p.map(|p| p.text), false),
         };
-        let dim = self.palette.as_ref().map(|p| p.text_dim);
+        let cell = self.metrics.map_or(px(8.), |m| px(m.cell));
         div()
             .flex()
             .key_context("TextInput")
@@ -486,8 +563,16 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .child(div().flex_none().mr_2().text_xs().when_some(dim, |d, c| d.text_color(c)).child(label))
-            .child(div().flex_1().child(TextElement { input: cx.entity() }))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .justify_end()
+                    .whitespace_nowrap()
+                    .w(px(self.column))
+                    .child(div().when_some(color, |d, c| d.text_color(c)).when(gap, |d| d.mr(cell)).child(label)),
+            )
+            .child(div().flex_1().min_w(px(0.)).child(TextElement { input: cx.entity() }))
     }
 }
 
@@ -517,7 +602,20 @@ impl TextInput {
             is_selecting: false,
             vim: Vim::default(),
             palette: None,
+            metrics: None,
+            column: 0.,
         }
+    }
+
+    /// Show `next` (another window's draft) and hand back this window's.
+    pub fn swap_draft(&mut self, next: String, cx: &mut Context<Self>) -> String {
+        let draft = self.vim.switch_line().unwrap_or_else(|| self.content.to_string());
+        self.reset();
+        let end = if self.vim.mode == Mode::Normal { vim::clamp_normal(&next, next.len()) } else { next.len() };
+        self.content = next.into();
+        self.selected_range = end..end;
+        cx.notify();
+        draft
     }
 
     fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
@@ -675,15 +773,30 @@ fn clamp_range(s: &str, r: &Range<usize>) -> Range<usize> {
     start..fix(r.end).max(start)
 }
 
-/// Room past the last glyph for the insert-mode cursor quad.
-const CURSOR_ALLOWANCE: f32 = 2.;
+/// Colour spans over `len` bytes: `base` everywhere, with each of `over`
+/// laid on top in order (later wins). Adjacent equal spans merge, so the
+/// line is shaped in as few runs as possible.
+fn spans<C: std::marker::Copy + PartialEq>(len: usize, base: C, over: &[(Range<usize>, C)]) -> Vec<(Range<usize>, C)> {
+    let mut cuts: Vec<usize> = over.iter().flat_map(|(r, _)| [r.start.min(len), r.end.min(len)]).chain([0, len]).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut out: Vec<(Range<usize>, C)> = Vec::new();
+    for w in cuts.windows(2) {
+        let c = over.iter().rev().find(|(r, _)| r.start <= w[0] && w[1] <= r.end).map_or(base, |(_, c)| *c);
+        match out.last_mut() {
+            Some((r, last)) if *last == c => r.end = w[1],
+            _ => out.push((w[0]..w[1], c)),
+        }
+    }
+    out
+}
 
 /// Horizontal scroll offset that keeps the cursor inside a `view`-wide window
 /// onto a `line_width`-wide line. Moves `prev` only when the cursor would leave
 /// the visible span, leaving `margin` of context, and never scrolls past the
-/// end of the line (plus room for the cursor itself).
-fn scroll_for_cursor(prev: f32, cursor_x: f32, line_width: f32, view: f32, margin: f32) -> f32 {
-    let max = (line_width + CURSOR_ALLOWANCE - view).max(0.);
+/// end of the line (plus `allowance` for the cursor itself).
+fn scroll_for_cursor(prev: f32, cursor_x: f32, line_width: f32, view: f32, margin: f32, allowance: f32) -> f32 {
+    let max = (line_width + allowance - view).max(0.);
     let wanted = if cursor_x < prev {
         (cursor_x - margin).max(0.)
     } else if cursor_x > prev + view - margin {
@@ -700,17 +813,18 @@ mod tests {
 
     const VIEW: f32 = 100.;
     const MARGIN: f32 = 20.;
+    const CURSOR_ALLOWANCE: f32 = 2.;
 
     #[test]
     fn scroll_is_zero_when_line_fits() {
-        assert_eq!(scroll_for_cursor(0., 50., 60., VIEW, MARGIN), 0.);
+        assert_eq!(scroll_for_cursor(0., 50., 60., VIEW, MARGIN, CURSOR_ALLOWANCE), 0.);
         // a stale offset is pulled back once everything fits
-        assert_eq!(scroll_for_cursor(30., 50., 60., VIEW, MARGIN), 0.);
+        assert_eq!(scroll_for_cursor(30., 50., 60., VIEW, MARGIN, CURSOR_ALLOWANCE), 0.);
     }
 
     #[test]
     fn scroll_follows_typing_past_right_edge() {
-        let s = scroll_for_cursor(0., 150., 300., VIEW, MARGIN);
+        let s = scroll_for_cursor(0., 150., 300., VIEW, MARGIN, CURSOR_ALLOWANCE);
         assert_eq!(s, 150. - (VIEW - MARGIN));
         // cursor stays visible with margin to spare
         assert!(150. - s <= VIEW - MARGIN);
@@ -718,35 +832,47 @@ mod tests {
 
     #[test]
     fn scroll_returns_to_zero_on_home() {
-        assert_eq!(scroll_for_cursor(70., 0., 200., VIEW, MARGIN), 0.);
+        assert_eq!(scroll_for_cursor(70., 0., 200., VIEW, MARGIN, CURSOR_ALLOWANCE), 0.);
     }
 
     #[test]
     fn scroll_moves_left_into_hidden_text() {
         // cursor at 60 while the view starts at 80: show it with margin context
-        assert_eq!(scroll_for_cursor(80., 60., 200., VIEW, MARGIN), 40.);
+        assert_eq!(scroll_for_cursor(80., 60., 200., VIEW, MARGIN, CURSOR_ALLOWANCE), 40.);
         // never below zero
-        assert_eq!(scroll_for_cursor(80., 10., 200., VIEW, MARGIN), 0.);
+        assert_eq!(scroll_for_cursor(80., 10., 200., VIEW, MARGIN, CURSOR_ALLOWANCE), 0.);
     }
 
     #[test]
     fn scroll_keeps_prev_while_cursor_visible() {
-        assert_eq!(scroll_for_cursor(50., 100., 300., VIEW, MARGIN), 50.);
+        assert_eq!(scroll_for_cursor(50., 100., 300., VIEW, MARGIN, CURSOR_ALLOWANCE), 50.);
     }
 
     #[test]
     fn scroll_clamps_after_deleting_text() {
         // line shrank from 300 to 130; no empty space may remain on the right
-        let s = scroll_for_cursor(200., 130., 130., VIEW, MARGIN);
+        let s = scroll_for_cursor(200., 130., 130., VIEW, MARGIN, CURSOR_ALLOWANCE);
         assert_eq!(s, 130. + CURSOR_ALLOWANCE - VIEW);
     }
 
     #[test]
     fn scroll_with_zero_width_view_does_not_panic() {
-        let s = scroll_for_cursor(5., 40., 80., 0., MARGIN);
+        let s = scroll_for_cursor(5., 40., 80., 0., MARGIN, CURSOR_ALLOWANCE);
         assert!(s.is_finite() && s >= 0.);
-        let s = scroll_for_cursor(0., 0., 0., 0., 0.);
+        let s = scroll_for_cursor(0., 0., 0., 0., 0., 0.);
         assert_eq!(s, 0.);
+    }
+
+    #[test]
+    fn spans_layer_colours_over_the_line() {
+        assert_eq!(spans(5, 'a', &[]), vec![(0..5, 'a')]);
+        assert_eq!(spans(0, 'a', &[]), vec![]);
+        // A command token, then the block cursor on byte 6.
+        assert_eq!(spans(10, 'a', &[(0..3, 'd'), (6..7, 'b')]), vec![(0..3, 'd'), (3..6, 'a'), (6..7, 'b'), (7..10, 'a')]);
+        // Later layers win; equal neighbours merge; ranges past the end clip.
+        assert_eq!(spans(4, 'a', &[(0..4, 'd'), (1..2, 'b')]), vec![(0..1, 'd'), (1..2, 'b'), (2..4, 'd')]);
+        assert_eq!(spans(4, 'a', &[(2..9, 'a')]), vec![(0..4, 'a')]);
+        assert_eq!(spans(3, 'a', &[(3..4, 'b')]), vec![(0..3, 'a')]);
     }
 
     #[test]

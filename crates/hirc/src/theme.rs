@@ -10,6 +10,8 @@ pub struct Palette {
     pub unread: Hsla,
     pub text: Hsla,
     pub text_dim: Hsla,
+    /// `text.tertiary`: the theme's accent text (the NORMAL mode label).
+    pub tertiary: Hsla,
     pub success: Hsla,
     pub error: Hsla,
     pub buffer_bg: Hsla,
@@ -25,6 +27,8 @@ pub struct Palette {
     pub nicks: Vec<Hsla>,
     /// Background of a line that mentions us (`buffer.highlight`).
     pub highlight: Hsla,
+    /// Selected text in the input (`buffer.selection`, by contrast).
+    pub selection: Hsla,
     pub timestamp: Hsla,
     pub action: Hsla,
     pub server: Hsla,
@@ -171,6 +175,7 @@ pub fn palette(t: &Theme) -> Palette {
         unread: c(t.general.unread_indicator),
         text: c(t.text.primary),
         text_dim: c(t.text.secondary),
+        tertiary: c(t.text.tertiary),
         success: c(t.text.success),
         error: c(t.text.error),
         buffer_bg: c(t.buffer.background),
@@ -184,6 +189,7 @@ pub fn palette(t: &Theme) -> Palette {
             .map(c)
             .collect(),
         highlight: c(fill(t.buffer.background, &[t.buffer.highlight, t.buffer.selection, t.buffer.border_selected])),
+        selection: c(fill(t.buffer.background_text_input, &[t.buffer.selection, t.buffer.border_selected, t.buffer.highlight])),
         timestamp: c(t.buffer.timestamp),
         action: c(t.buffer.action),
         server: c(t.buffer.server_messages.default),

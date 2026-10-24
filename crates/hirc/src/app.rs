@@ -14,6 +14,7 @@ use hirc_core::layout::{self, Layout};
 use hirc_core::store::{Applied, Buffer, LineKind, Network, Store};
 use hirc_core::theme::Theme;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -45,6 +46,8 @@ pub struct Init {
     pub font_family: Option<String>,
     pub font_size: f32,
     pub banner: Option<String>,
+    /// A quiet note for the first server buffer (no config file yet).
+    pub hint: Option<String>,
     pub commands: UnboundedSender<Command>,
     pub events: UnboundedReceiver<Event>,
     /// Snapshot runs neither read nor write the window layout.
@@ -59,6 +62,8 @@ pub struct HircApp {
     no_layout_file: bool,
     pub palette: Palette,
     font_family: Option<SharedString>,
+    /// The configured font, for measuring text that must fit (the header).
+    pub font: gpui::Font,
     /// Every spacing value, from the configured font.
     pub metrics: Metrics,
     /// The window list's scroll position; selection scrolls it into view.
@@ -66,7 +71,11 @@ pub struct HircApp {
     /// The window list's width at the last render (it follows the window).
     sidebar_width: f32,
     banner: Option<String>,
+    /// Shown in the header when there is no buffer to put it in.
+    hint: Option<String>,
     input: Entity<TextInput>,
+    /// Each window's unsent line, kept while another window is shown.
+    drafts: HashMap<(usize, usize), String>,
     lines: ListState,
     /// The message view's nick column, in cells (sized to the buffer).
     nick_cells: usize,
@@ -101,12 +110,19 @@ impl HircApp {
             tracing::warn!("could not save window layout: {e}");
         }
         let font_family: Option<SharedString> = init.font_family.map(Into::into);
-        let metrics = Metrics::new(init.font_size, measure(window, font_family.clone(), init.font_size));
+        let font = font_for(window, font_family.clone());
+        let metrics = Metrics::new(init.font_size, measure(window, &font, init.font_size));
+        // No config yet: say so once, quietly, where server notices go.
+        let mut hint = init.hint;
+        if let Some(note) = hint.take_if(|_| store.networks.first().is_some_and(|net| matches!(net.buffers.first(), Some(b) if b.target == Target::Server))) {
+            store.push_local(0, 0, LineKind::Server, note);
+        }
         let selected = layout.resolve(&store, 0).or_else(|| (!store.networks.is_empty()).then_some((0, 0)));
         let palette = palette(&init.theme);
         let input = cx.new(|cx| {
-            let mut input = TextInput::new("Message", cx);
+            let mut input = TextInput::new("", cx);
             input.palette = Some(palette.clone());
+            input.metrics = Some(metrics);
             input
         });
         cx.subscribe(&input, |this, _, ev: &Submit, cx| this.submit(ev.0.clone(), cx)).detach();
@@ -130,11 +146,14 @@ impl HircApp {
             no_layout_file: init.no_layout_file,
             palette,
             font_family,
+            font,
             metrics,
             sidebar_scroll: ScrollHandle::new(),
             sidebar_width: metrics.sidebar_width(f32::from(window.viewport_size().width)),
             banner: init.banner,
+            hint,
             input,
+            drafts: HashMap::new(),
             // Measure every line, so scroll offsets and the count of lines
             // below the view are exact (lines are cached once measured).
             lines: ListState::new(0, ListAlignment::Bottom, px(400.)).measure_all(),
@@ -152,6 +171,15 @@ impl HircApp {
     }
 
     pub fn select(&mut self, n: usize, b: usize, cx: &mut Context<Self>) {
+        // The input line belongs to its window: keep this one's draft and
+        // bring back the new one's, so a line is never sent somewhere else.
+        if self.selected != Some((n, b)) {
+            let next = self.drafts.remove(&(n, b)).unwrap_or_default();
+            let draft = self.input.update(cx, |input, cx| input.swap_draft(next, cx));
+            if let Some(old) = self.selected.filter(|_| !draft.is_empty()) {
+                self.drafts.insert(old, draft);
+            }
+        }
         self.selected = Some((n, b));
         let buf = &mut self.store.networks[n].buffers[b];
         buf.unread = 0;
@@ -190,11 +218,26 @@ impl HircApp {
         }
     }
 
-    /// `number` is 1-based, as typed; out of range does nothing.
+    /// `number` is 1-based, as typed; out of range does nothing (alt-N
+    /// past the last window).
     pub fn goto_window(&mut self, number: usize, cx: &mut Context<Self>) {
         if let Some((n, b)) = number.checked_sub(1).and_then(|pos| self.layout.resolve(&self.store, pos)) {
             self.select(n, b, cx);
         }
+    }
+
+    /// A typed `/window N` or `:N`: out of range says so.
+    fn goto_typed(&mut self, number: usize, cx: &mut Context<Self>) {
+        let count = self.window_count();
+        match self.selected {
+            Some((n, b)) if number > count => self.local_error(n, b, no_window(number, count)),
+            _ => self.goto_window(number, cx),
+        }
+    }
+
+    /// The selected window's name, as the list shows it.
+    fn current_label(&self) -> String {
+        self.current().map(|(net, buf)| buf.target.name().unwrap_or(&net.name).to_owned()).unwrap_or_default()
     }
 
     /// Snapshot scripts: type into the input as a person would.
@@ -311,7 +354,7 @@ impl HircApp {
             Effect::Ex(line) => match vim::ex(line) {
                 Ex::None => {}
                 Ex::Quit => cx.quit(),
-                Ex::Window(n) => self.goto_window(n, cx),
+                Ex::Window(n) => self.goto_typed(n, cx),
                 Ex::Buffer(name) => self.goto_buffer(&name, cx),
                 Ex::Slash(s) => self.submit(s, cx),
             },
@@ -320,14 +363,20 @@ impl HircApp {
         cx.notify();
     }
 
+    /// Move the selected window to `number`, and say so where the user is
+    /// looking (the list changes far from the input line).
     fn move_window(&mut self, number: usize, cx: &mut Context<Self>) {
         let Some((n, b)) = self.selected else { return };
-        if let Some(from) = self.layout.position_of(&self.store, n, b) {
+        let count = self.window_count();
+        if number > count {
+            self.local_error(n, b, no_window(number, count));
+        } else if let Some(from) = self.layout.position_of(&self.store, n, b) {
             self.layout.move_to(from, number - 1);
             self.save_layout();
             self.reveal_selected();
-            cx.notify();
+            self.local_note(n, b, format!("{} is now window {number}", self.current_label()));
         }
+        cx.notify();
     }
 
     fn on_event(&mut self, ev: Event, cx: &mut Context<Self>) {
@@ -348,6 +397,12 @@ impl HircApp {
         self.lines.splice(index..index, 1);
     }
 
+    /// Show a local status line (`--`) in the current buffer.
+    fn local_note(&mut self, n: usize, b: usize, msg: String) {
+        let index = self.store.push_local(n, b, LineKind::Server, msg);
+        self.lines.splice(index..index, 1);
+    }
+
     fn submit(&mut self, text: String, cx: &mut Context<Self>) {
         if text.trim().is_empty() {
             return;
@@ -357,6 +412,18 @@ impl HircApp {
         let target = net.buffers[b].target.name().map(str::to_owned);
         let name = net.name.clone();
         let connected = matches!(net.status, ConnStatus::Connected { .. });
+        // A bare /topic shows the whole topic (the header may cut it short).
+        if text.trim().eq_ignore_ascii_case("/topic")
+            && let Some(chan) = target.as_deref().filter(|t| t.starts_with(['#', '&']))
+        {
+            let note = match &net.buffers[b].topic {
+                Some(topic) if !topic.is_empty() => format!("Topic for {chan}: {topic}"),
+                _ => format!("No topic is set for {chan}"),
+            };
+            self.local_note(n, b, note);
+            cx.notify();
+            return;
+        }
         match command::parse(&text, &name, target.as_deref()) {
             // Chat sent while offline would vanish without a trace.
             Ok(Input::Send(Command::Say { .. } | Command::Action { .. })) if !connected => {
@@ -373,11 +440,27 @@ impl HircApp {
                     let _ = self.commands.send(Command::Say { network: name, target: nick, text });
                 }
             }
-            Ok(Input::Window(WindowAction::Goto(number))) => self.goto_window(number, cx),
+            Ok(Input::Window(WindowAction::Goto(number))) => self.goto_typed(number, cx),
             Ok(Input::Window(WindowAction::Move(number))) => self.move_window(number, cx),
             Err(msg) => self.local_error(n, b, msg),
         }
         cx.notify();
+    }
+
+    /// The empty input's hint: where a line typed now will go.
+    fn placeholder(&self) -> String {
+        match self.current() {
+            Some((net, buf)) => match buf.target.name() {
+                Some(name) => format!("Message {name}"),
+                None => format!("Command for {}", net.name),
+            },
+            None => String::new(),
+        }
+    }
+
+    /// The note for the header when no server is configured.
+    pub fn hint(&self) -> Option<&str> {
+        self.hint.as_deref()
     }
 
     fn line_element(&mut self, ix: usize) -> gpui::AnyElement {
@@ -405,6 +488,13 @@ impl Render for HircApp {
         if following {
             self.fresh_below = false;
         }
+        // The input types on the message text column, and names its target.
+        let column = m.text_column(nick_cells);
+        let placeholder = self.placeholder();
+        self.input.update(cx, |input, _| {
+            input.column = column;
+            input.placeholder = placeholder.into();
+        });
         let at_top = !following && f32::from(self.lines.scroll_px_offset_for_scrollbar().y) >= 0.;
         let more = (!following).then(|| buffer::more(self, self.lines_below(), at_top, self.fresh_below));
         let lines = list(self.lines.clone(), cx.processor(|this, ix: usize, _window, _cx| this.line_element(ix))).size_full();
@@ -430,8 +520,8 @@ impl Render for HircApp {
                     .min_w(px(0.))
                     .h_full()
                     .bg(p.buffer_bg)
-                    .when_some(self.banner.clone(), |d, b| d.child(div().px(px(m.gutter)).py(px(m.pad_y)).bg(p.error).text_color(p.background).child(b)))
-                    .child(buffer::title(self))
+                    .when_some(self.banner.clone(), |d, b| d.child(buffer::banner(self, b)))
+                    .child(buffer::title(self, window, width - self.sidebar_width))
                     .child(
                         div()
                             .relative()
@@ -447,15 +537,25 @@ impl Render for HircApp {
     }
 }
 
-/// The configured font's shape, for `Metrics`. The family falls back as
-/// rendering does (the window's default text style).
-fn measure(window: &Window, family: Option<SharedString>, size: f32) -> Shape {
+/// The configured font; the family falls back as rendering does (the
+/// window's default text style).
+fn font_for(window: &Window, family: Option<SharedString>) -> gpui::Font {
     let mut style = window.text_style();
     if let Some(family) = family {
         style.font_family = family;
     }
+    style.font()
+}
+
+/// "No window 30 (there are 6)."
+fn no_window(number: usize, count: usize) -> String {
+    format!("No window {number} (there are {count})")
+}
+
+/// The configured font's shape, for `Metrics`.
+fn measure(window: &Window, font: &gpui::Font, size: f32) -> Shape {
     let ts = window.text_system();
-    let id = ts.resolve_font(&style.font());
+    let id = ts.resolve_font(font);
     let size = px(size);
     let per_px = |v: gpui::Pixels| f32::from(v) / f32::from(size);
     match ts.ch_advance(id, size) {

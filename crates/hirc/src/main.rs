@@ -13,15 +13,28 @@ use app::{HircApp, Init, Quit};
 use gpui::{App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size};
 use hirc_core::config;
 
+/// The system monospace face, for when the config names no font.
+#[cfg(target_os = "macos")]
+const DEFAULT_FAMILY: &str = "Menlo";
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_FAMILY: &str = "monospace";
+
 fn main() {
     tracing_subscriber::fmt::init();
     let dir = config::dir();
     let mut banner = None;
+    let mut hint = None;
+    let path = dir.join("config.toml");
     #[cfg_attr(not(feature = "snapshot"), allow(unused_mut))]
-    let mut config = match config::load(&dir.join("config.toml")) {
+    let mut config = match config::load(&path) {
         Ok(c) => c,
+        // No config is a first run, not an error: a quiet note, not a banner.
+        Err(e) if e.is_missing() => {
+            hint = Some(config::tilde_home(&format!("No config at {}; using the defaults.", path.display())));
+            config::Config::default()
+        }
         Err(e) => {
-            banner = Some(e.to_string());
+            banner = Some(config::tilde_home(&e.to_string()));
             config::Config::default()
         }
     };
@@ -29,7 +42,7 @@ fn main() {
     let mut theme = match config.theme.as_deref().map(|name| hirc_core::theme::load(&dir, name)) {
         Some(Ok(t)) => t,
         Some(Err(e)) => {
-            banner.get_or_insert(e.to_string());
+            banner.get_or_insert(config::tilde_home(&e.to_string()));
             Default::default()
         }
         None => Default::default(),
@@ -45,7 +58,9 @@ fn main() {
     }
     let networks: Vec<String> = config.servers.keys().cloned().collect();
     let servers: Vec<(String, Vec<String>)> = config.servers.iter().map(|(name, s)| (name.clone(), s.channels.clone())).collect();
-    let font_family = config.font.family.clone();
+    // The design is a monospace grid; without a configured family, use the
+    // system's monospace face rather than gpui's proportional default.
+    let font_family = config.font.family.clone().or_else(|| Some(DEFAULT_FAMILY.to_owned()));
     let font_size = config.font.size.unwrap_or(14.);
     #[cfg(not(feature = "snapshot"))]
     let (commands, events) = hirc_core::conn::spawn(config);
@@ -66,7 +81,7 @@ fn main() {
     #[cfg(not(feature = "snapshot"))]
     let (width, height) = (1200., 800.);
 
-    let init = Init { networks, servers, theme, font_family, font_size, banner, commands, events, no_layout_file };
+    let init = Init { networks, servers, theme, font_family, font_size, banner, hint, commands, events, no_layout_file };
     #[cfg(feature = "snapshot")]
     if let Some(plan) = snap.take_if(|p| p.offscreen) {
         snapshot::run_offscreen(plan, init);

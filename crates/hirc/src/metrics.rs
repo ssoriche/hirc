@@ -73,6 +73,12 @@ pub struct Metrics {
     pub edge: f32,
     /// How far small text moves down so its baseline meets the row's.
     pub small_drop: f32,
+    /// Height of the font's glyph band (ascent + descent), which sits
+    /// centred in the line box: the cursor's height.
+    pub glyph: f32,
+    /// Width of the insert cursor (a bar), and its clearance from the
+    /// glyph before it.
+    pub caret: f32,
 }
 
 impl Metrics {
@@ -96,7 +102,21 @@ impl Metrics {
             gap: (size * 0.5).round(),
             edge: (size * 0.5).round(),
             small_drop,
+            glyph: (size * (shape.ascent + shape.descent)).round().min(line),
+            caret: (size / 7.).round().max(1.),
         }
+    }
+
+    /// Top of the glyph band inside a line box, in whole px.
+    pub fn glyph_top(&self) -> f32 {
+        ((self.line - self.glyph) / 2.).floor()
+    }
+
+    /// Where a message's text starts, from the pane's gutter: the time,
+    /// a space, a nick column `nick_cells` wide, a space. The input line's
+    /// text starts here too, so what is typed lines up with what is said.
+    pub fn text_column(&self, nick_cells: usize) -> f32 {
+        self.grid(TIME_CELLS + 1 + nick_cells + 1)
     }
 
     /// Width of `n` digit cells, rounded up to a whole px.
@@ -249,6 +269,25 @@ mod tests {
         // time, space, five-cell nick, space: text starts on cell 12.
         let x = m.grid(TIME_CELLS + 1 + 5 + 1);
         assert!((x / m.cell - 12.).abs() < 1e-4);
+    }
+
+    #[test]
+    fn cursor_fits_the_glyph_band() {
+        for size in [9., 13., 14., 20.] {
+            let m = menlo(size);
+            assert!(m.glyph > m.size && m.glyph <= m.line, "{size}");
+            assert!(m.glyph_top() >= 0. && m.glyph_top() + m.glyph <= m.line);
+            assert!(m.caret >= 1. && m.caret == m.caret.round());
+        }
+        assert_eq!((menlo(14.).glyph, menlo(14.).caret), (16., 2.));
+        assert!(menlo(28.).caret > menlo(14.).caret);
+    }
+
+    #[test]
+    fn input_text_starts_on_the_message_text_column() {
+        let m = menlo(14.);
+        let buffer = m.grid(TIME_CELLS) + m.cell + m.grid(7) + m.cell;
+        assert!((m.text_column(7) - buffer).abs() < 1e-3);
     }
 
     #[test]
