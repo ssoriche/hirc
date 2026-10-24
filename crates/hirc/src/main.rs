@@ -1,6 +1,7 @@
 //! The UI never waits on the network: see app.rs.
 mod app;
 mod input;
+mod metrics;
 #[cfg(feature = "snapshot")]
 mod snapshot;
 mod theme;

@@ -60,7 +60,6 @@
 //! Any failure prints `snapshot: <reason>` to stderr and exits non-zero.
 
 use crate::app::{self, HircApp, Init};
-use crate::views::sidebar;
 use chrono::{DateTime, Duration as Delta, SecondsFormat, Utc};
 use gpui::{
     AppContext, AsyncApp, HeadlessAppContext, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta,
@@ -460,7 +459,11 @@ fn inject<C: AppContext>(step: &Step, cx: &mut C, handle: WindowHandle<HircApp>)
         }
         Step::Type(t) => handle.update(cx, |app, window, cx| app.type_text(t, window, cx)).map_err(gone),
         Step::Click(label) => match handle.update(cx, |app, _, _| app.sidebar_point(label)).map_err(gone)? {
-            Some((x, y)) => click(cx, at(x, y)),
+            Some(Ok((x, y))) => click(cx, at(x, y)),
+            Some(Err(why)) => {
+                eprintln!("snapshot: click target {label}: {why}");
+                Ok(())
+            }
             None => {
                 eprintln!("snapshot: no click target {label}");
                 Ok(())
@@ -471,7 +474,8 @@ fn inject<C: AppContext>(step: &Step, cx: &mut C, handle: WindowHandle<HircApp>)
         Step::Scroll(d) => {
             // Over the buffer view: right of the sidebar, mid-height.
             let s = cx.update_window(handle.into(), |_, window, _| window.bounds().size).map_err(gone)?;
-            let position = at(sidebar::WIDTH + (f32::from(s.width) - sidebar::WIDTH) / 2., f32::from(s.height) / 2.);
+            let side = handle.update(cx, |app, _, _| app.sidebar_width()).map_err(gone)?;
+            let position = at(side + (f32::from(s.width) - side) / 2., f32::from(s.height) / 2.);
             let delta = ScrollDelta::Pixels(point(px(0.), px(*d)));
             send(cx, PlatformInput::ScrollWheel(ScrollWheelEvent { position, delta, modifiers, touch_phase: TouchPhase::Moved }))
         }

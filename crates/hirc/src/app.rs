@@ -2,10 +2,13 @@
 //! apply them to the `Store` and redraw. Input goes back as `Command`s.
 
 use crate::input::{Submit, TextInput, VimEvent};
+use crate::metrics::{Metrics, Shape};
 use crate::theme::{Palette, palette};
 use crate::views::{buffer, sidebar};
 use crate::vim::{self, Effect, Ex, Nav, Scroll};
-use gpui::{App, Context, Entity, Focusable, KeyBinding, ListAlignment, ListOffset, ListState, SharedString, Window, actions, div, list, prelude::*, px};
+use gpui::{
+    App, Context, Entity, Focusable, KeyBinding, ListAlignment, ListOffset, ListState, ScrollHandle, SharedString, Window, actions, div, list, prelude::*, px,
+};
 use hirc_core::command::{self, Input, WindowAction};
 use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::layout::{self, Layout};
@@ -55,7 +58,12 @@ pub struct HircApp {
     no_layout_file: bool,
     pub palette: Palette,
     font_family: Option<SharedString>,
-    font_size: f32,
+    /// Every spacing value, from the configured font.
+    pub metrics: Metrics,
+    /// The window list's scroll position; selection scrolls it into view.
+    pub sidebar_scroll: ScrollHandle,
+    /// The window list's width at the last render (it follows the window).
+    sidebar_width: f32,
     banner: Option<String>,
     input: Entity<TextInput>,
     lines: ListState,
@@ -85,6 +93,8 @@ impl HircApp {
         {
             tracing::warn!("could not save window layout: {e}");
         }
+        let font_family: Option<SharedString> = init.font_family.map(Into::into);
+        let metrics = Metrics::new(init.font_size, measure(window, font_family.clone(), init.font_size));
         let selected = layout.resolve(&store, 0).or_else(|| (!store.networks.is_empty()).then_some((0, 0)));
         let palette = palette(&init.theme);
         let input = cx.new(|cx| {
@@ -112,8 +122,10 @@ impl HircApp {
             layout_path,
             no_layout_file: init.no_layout_file,
             palette,
-            font_family: init.font_family.map(Into::into),
-            font_size: init.font_size,
+            font_family,
+            metrics,
+            sidebar_scroll: ScrollHandle::new(),
+            sidebar_width: metrics.sidebar_width(f32::from(window.viewport_size().width)),
             banner: init.banner,
             input,
             lines: ListState::new(0, ListAlignment::Bottom, px(400.)),
@@ -132,7 +144,20 @@ impl HircApp {
         let buf = &mut self.store.networks[n].buffers[b];
         buf.unread = 0;
         self.lines.reset(buf.lines.len());
+        self.reveal_selected();
         cx.notify();
+    }
+
+    /// Index of window `(n, b)` among the sidebar's rows.
+    fn sidebar_row(&self, n: usize, b: usize) -> Option<usize> {
+        (0..self.layout.windows.len()).filter_map(|pos| self.layout.resolve(&self.store, pos)).position(|w| w == (n, b))
+    }
+
+    /// Scroll the window list so the selected row is in view.
+    fn reveal_selected(&self) {
+        if let Some(row) = self.selected.and_then(|(n, b)| self.sidebar_row(n, b)) {
+            self.sidebar_scroll.scroll_to_item(row);
+        }
     }
 
     /// Give any new buffer a window number and persist the list.
@@ -165,16 +190,27 @@ impl HircApp {
     }
 
     /// Logical centre of the first sidebar row whose label contains `label`
-    /// (case-insensitive), as the sidebar lays rows out.
+    /// (case-insensitive), as the sidebar lays rows out at its current
+    /// scroll position. `Err` names a match that is scrolled out of view.
     #[cfg(feature = "snapshot")]
-    pub fn sidebar_point(&self, label: &str) -> Option<(f32, f32)> {
+    pub fn sidebar_point(&self, label: &str) -> Option<Result<(f32, f32), String>> {
         let want = label.to_lowercase();
         let rows = (0..self.layout.windows.len()).filter_map(|pos| self.layout.resolve(&self.store, pos));
-        rows.enumerate().find_map(|(row, (n, b))| {
+        let row = rows.enumerate().find_map(|(row, (n, b))| {
             let net = &self.store.networks[n];
             let name = net.buffers[b].target.name().unwrap_or(&net.name);
-            name.to_lowercase().contains(&want).then(|| sidebar::row_centre(row, self.font_size))
-        })
+            name.to_lowercase().contains(&want).then_some(row)
+        })?;
+        let (x, y) = sidebar::row_centre(&self.metrics, self.sidebar_width, f32::from(self.sidebar_scroll.offset().y), row);
+        let view = self.sidebar_scroll.bounds();
+        let visible = view.size.height <= px(0.) || (px(y - self.metrics.row / 2.) >= view.top() && px(y + self.metrics.row / 2.) <= view.bottom());
+        Some(if visible { Ok((x, y)) } else { Err(format!("row {} is scrolled out of view", row + 1)) })
+    }
+
+    /// The window list's width at the last render.
+    #[cfg(feature = "snapshot")]
+    pub fn sidebar_width(&self) -> f32 {
+        self.sidebar_width
     }
 
     /// Number of numbered windows.
@@ -224,7 +260,7 @@ impl HircApp {
     }
 
     fn scroll(&mut self, s: Scroll) {
-        let line = px(self.font_size * 1.4);
+        let line = px(self.metrics.line);
         // The list reports its viewport once laid out; before that, guess.
         let page = match self.lines.viewport_bounds().size.height {
             h if h > px(0.) => h,
@@ -259,6 +295,7 @@ impl HircApp {
         if let Some(from) = self.layout.position_of(&self.store, n, b) {
             self.layout.move_to(from, number - 1);
             self.save_layout();
+            self.reveal_selected();
             cx.notify();
         }
     }
@@ -321,8 +358,10 @@ impl HircApp {
 }
 
 impl Render for HircApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette.clone();
+        let m = self.metrics;
+        self.sidebar_width = m.sidebar_width(f32::from(window.viewport_size().width));
         let mut root = div().size_full();
         macro_rules! window_keys {
             ($($action:ident => $n:expr),*) => {
@@ -333,9 +372,10 @@ impl Render for HircApp {
         root.flex()
             .bg(p.background)
             .text_color(p.text)
-            .text_size(px(self.font_size))
+            .text_size(px(m.size))
+            .line_height(px(m.line))
             .when_some(self.font_family.clone(), |d, f| d.font_family(f))
-            .child(sidebar::render(self, cx))
+            .child(sidebar::render(self, self.sidebar_width, cx))
             .child(
                 div()
                     .flex()
@@ -344,10 +384,27 @@ impl Render for HircApp {
                     .min_w(px(0.))
                     .h_full()
                     .bg(p.buffer_bg)
-                    .when_some(self.banner.clone(), |d, b| d.child(div().px_3().py_1().bg(p.error).text_color(p.background).child(b)))
+                    .when_some(self.banner.clone(), |d, b| d.child(div().px(px(m.gutter)).py(px(m.pad_y)).bg(p.error).text_color(p.background).child(b)))
                     .child(buffer::title(self))
                     .child(list(self.lines.clone(), cx.processor(|this, ix: usize, _window, _cx| this.line_element(ix))).flex_1().w_full())
-                    .child(div().px_3().py_2().bg(p.input_bg).border_t_1().border_color(p.border).child(self.input.clone())),
+                    .child(div().px(px(m.gutter)).py(px(m.bar_pad())).bg(p.input_bg).border_t_1().border_color(p.border).child(self.input.clone())),
             )
+    }
+}
+
+/// The configured font's shape, for `Metrics`. The family falls back as
+/// rendering does (the window's default text style).
+fn measure(window: &Window, family: Option<SharedString>, size: f32) -> Shape {
+    let mut style = window.text_style();
+    if let Some(family) = family {
+        style.font_family = family;
+    }
+    let ts = window.text_system();
+    let id = ts.resolve_font(&style.font());
+    let size = px(size);
+    let per_px = |v: gpui::Pixels| f32::from(v) / f32::from(size);
+    match ts.ch_advance(id, size) {
+        Ok(cell) => Shape { cell: per_px(cell), ascent: per_px(ts.ascent(id, size)).abs(), descent: per_px(ts.descent(id, size)).abs() },
+        Err(_) => Shape::FALLBACK,
     }
 }

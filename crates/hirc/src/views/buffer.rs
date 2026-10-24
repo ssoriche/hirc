@@ -6,15 +6,16 @@ use hirc_core::store::{Line, LineKind};
 
 pub fn title(app: &HircApp) -> impl IntoElement {
     let p = &app.palette;
+    let m = &app.metrics;
     let (name, topic) = match app.current() {
         Some((net, buf)) => (buf.target.name().unwrap_or(&net.name).to_owned(), buf.topic.clone().unwrap_or_default()),
         None => ("No servers configured".to_owned(), String::new()),
     };
     div()
         .flex()
-        .gap_3()
-        .px_3()
-        .py_2()
+        .gap(px(m.gutter))
+        .px(px(m.gutter))
+        .py(px(m.bar_pad()))
         .bg(p.title_bg)
         .border_b_1()
         .border_color(p.border)
@@ -29,7 +30,7 @@ pub fn line(app: &HircApp, line: &Line) -> AnyElement {
     let body = match line.kind {
         LineKind::Privmsg => div()
             .flex()
-            .gap_2()
+            .gap(px(app.metrics.gap))
             .flex_1()
             .min_w(px(0.))
             .child(div().flex_none().text_color(p.nickname).child(nick))
@@ -41,5 +42,15 @@ pub fn line(app: &HircApp, line: &Line) -> AnyElement {
     };
     // `w_full`: gpui's list measures each row as a root with a definite width,
     // and an auto-width flex root would size to its content and never wrap.
-    div().flex().w_full().min_w(px(0.)).gap_2().px_3().py(px(1.)).child(div().flex_none().text_color(p.timestamp).child(time)).child(body).into_any_element()
+    let m = &app.metrics;
+    div()
+        .flex()
+        .w_full()
+        .min_w(px(0.))
+        .gap(px(m.gap))
+        .px(px(m.gutter))
+        .py(px(1.))
+        .child(div().flex_none().text_color(p.timestamp).child(time))
+        .child(body)
+        .into_any_element()
 }
