@@ -18,7 +18,7 @@
 //!
 //! | Variable | Effect |
 //! |---|---|
-//! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` is dropped (so nothing leaves the process), except that on an `echo_message` server a sent PRIVMSG/NOTICE comes back as a faked server echo. |
+//! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` never leaves the process; a faked server answers some sends through the session: a JOIN comes back as our JOIN plus a NAMES of just us (no topic), a PART as our PART, and on an `echo_message` server a PRIVMSG/NOTICE as its echo. Everything else is dropped. Connection status follows conn.rs: an `Output::Stop` (e.g. `/quit`) is `Failed { reason }`, and a server `ERROR` line is `Disconnected { "connection closed" }`. Either way that network reads no more fixture lines and later commands to it go nowhere (no reconnect). |
 //! | `HIRC_SCREENSHOT=<out.png>` | Final image, taken after the script. Window mode waits 300 ms for layout, captures, quits. |
 //! | `HIRC_OFFSCREEN=1` | Offscreen mode (above). Exits 0 when done; on failure prints `snapshot: <reason>` and exits 1. |
 //! | `HIRC_SIZE=WxH` | Logical size (default `1200x800`). |
@@ -67,7 +67,7 @@ use gpui::{
     ScrollWheelEvent, TouchPhase, WindowHandle, point, px, size,
 };
 use hirc_core::config::{Config, Server};
-use hirc_core::event::{Command, Event};
+use hirc_core::event::{Command, ConnStatus, Event};
 use hirc_core::proto::Message;
 use hirc_core::session::{Output, Session, SessionConfig};
 use serde::Deserialize;
@@ -174,67 +174,145 @@ fn session_config(s: &FixtureServer) -> SessionConfig {
     SessionConfig { nickname: s.nick.clone(), username: s.nick.clone(), realname: s.nick.clone(), ..Default::default() }
 }
 
-fn feed_line(session: &mut Session, line: &str, now: DateTime<Utc>, events: &mut Vec<Event>) -> Result<(), String> {
+/// Hand one server line to the session, as conn.rs's read loop does, and
+/// collect the `Event`s it passes on. Returns whether the connection is over:
+/// a `Stop` ends it there (later outputs are dropped, as live) with the
+/// status conn.rs reports, and after an `ERROR` the server closes the
+/// socket. `Send`s go nowhere.
+fn take(session: &mut Session, network: &str, msg: Message, now: DateTime<Utc>, events: &mut Vec<Event>) -> bool {
+    let error = msg.command == "ERROR";
+    for out in session.handle(msg, now) {
+        match out {
+            Output::Event(e) => events.push(e),
+            Output::Stop(reason) => {
+                events.push(stopped(network, reason));
+                return true;
+            }
+            Output::Send(_) => {}
+        }
+    }
+    if error {
+        events.push(closed(network));
+    }
+    error
+}
+
+/// conn.rs: a session's `Stop` won't retry until /reconnect.
+fn stopped(network: &str, reason: String) -> Event {
+    Event::Status { network: network.to_owned(), status: ConnStatus::Failed { reason } }
+}
+
+/// conn.rs: the server closed the connection (live retries after a backoff).
+fn closed(network: &str) -> Event {
+    Event::Status { network: network.to_owned(), status: ConnStatus::Disconnected { reason: "connection closed".into() } }
+}
+
+fn feed_line(session: &mut Session, network: &str, line: &str, now: DateTime<Utc>, events: &mut Vec<Event>) -> Result<bool, String> {
     let msg = Message::parse(line).map_err(|e| format!("bad fixture line {line:?}: {e}"))?;
-    events.extend(session.handle(msg, now).into_iter().filter_map(|o| if let Output::Event(e) = o { Some(e) } else { None }));
-    Ok(())
+    Ok(take(session, network, msg, now, events))
 }
 
 /// Run every server's lines through a real `Session`, as the network
 /// thread would. Returns the events for the UI and the sessions, which keep
-/// answering commands afterwards.
+/// answering commands afterwards. A server whose connection ended (`Stop`,
+/// `ERROR`) reads no further lines and has no session left.
 pub fn feed(fx: &Fixture) -> Result<(Vec<Event>, HashMap<String, Session>), String> {
     let base = DateTime::parse_from_rfc3339(fx.base_time.as_deref().unwrap_or(DEFAULT_BASE)).map_err(|e| format!("bad base_time: {e}"))?.with_timezone(&Utc);
     let mut events = Vec::new();
     let mut sessions = HashMap::new();
-    for srv in &fx.server {
+    'servers: for srv in &fx.server {
         let mut session = Session::new(&srv.name, session_config(srv));
         session.start(); // its sends go nowhere
         if srv.echo_message {
             // Through `handle`, so no private API is needed.
             for line in ["CAP * LS :echo-message", "CAP * ACK :echo-message"] {
-                feed_line(&mut session, &format!(":irc.example {line}"), base, &mut events)?;
+                feed_line(&mut session, &srv.name, &format!(":irc.example {line}"), base, &mut events)?;
             }
         }
         for (i, line) in srv.lines.iter().enumerate() {
             let at = Message::parse(line).ok().and_then(|m| m.tag("time").and_then(|t| DateTime::parse_from_rfc3339(t).ok())).map(|t| t.with_timezone(&Utc));
             let now = at.unwrap_or_else(|| base + Delta::seconds(i as i64));
-            feed_line(&mut session, line, now, &mut events)?;
+            if feed_line(&mut session, &srv.name, line, now, &mut events)? {
+                continue 'servers;
+            }
         }
         sessions.insert(srv.name.clone(), session);
     }
     Ok((events, sessions))
 }
 
-/// What an `echo-message` server would send back for `sent`: our own
-/// PRIVMSG/NOTICE with a server time and msgid. Anything else gets no echo.
-fn fake_echo(sent: &Message, nick: &str, now: DateTime<Utc>, n: u64) -> Option<Message> {
-    if !matches!(sent.command.as_str(), "PRIVMSG" | "NOTICE") {
-        return None;
+/// What a server sends back for `sent`. It always confirms our JOIN (with a
+/// minimal NAMES, just us, and no topic) and PART; on an `echo-message`
+/// server our PRIVMSG/NOTICE also comes back, with a server time and msgid.
+/// Anything else gets no reply.
+fn fake_replies(sent: &Message, nick: &str, echo_message: bool, now: DateTime<Utc>, n: u64) -> Vec<Message> {
+    let from = |source: String, command: &str, params: Vec<String>| {
+        let mut m = Message::new(command, params);
+        m.source = Some(source);
+        m
+    };
+    let us = || format!("{nick}!u@fixture");
+    let server = || "irc.fixture".to_owned();
+    // `JOIN #a,#b keys` and `PART #a,#b :why` answer once per channel.
+    let channels = || sent.params.first().into_iter().flat_map(|c| c.split(',')).filter(|c| !c.is_empty()).map(str::to_owned);
+    match sent.command.as_str() {
+        "JOIN" => channels()
+            .flat_map(|chan| {
+                [
+                    from(us(), "JOIN", vec![chan.clone()]),
+                    from(server(), "353", vec![nick.into(), "=".into(), chan.clone(), nick.into()]),
+                    from(server(), "366", vec![nick.into(), chan, "End of /NAMES list.".into()]),
+                ]
+            })
+            .collect(),
+        "PART" => channels().map(|chan| from(us(), "PART", std::iter::once(chan).chain(sent.params.get(1).cloned()).collect())).collect(),
+        "PRIVMSG" | "NOTICE" if echo_message => {
+            let mut echo = sent.clone();
+            echo.tags = vec![("time".into(), Some(now.to_rfc3339_opts(SecondsFormat::Millis, true))), ("msgid".into(), Some(format!("echo-{n}")))];
+            echo.source = Some(us());
+            vec![echo]
+        }
+        _ => Vec::new(),
     }
-    let mut echo = sent.clone();
-    echo.tags = vec![("time".into(), Some(now.to_rfc3339_opts(SecondsFormat::Millis, true))), ("msgid".into(), Some(format!("echo-{n}")))];
-    echo.source = Some(format!("{nick}!u@fixture"));
-    Some(echo)
 }
 
 /// Answer one UI command through the session and return the events for the
-/// UI. Sends never leave the process; on an `echo-message` session the
-/// PRIVMSG/NOTICE ones come back as the server's echo, which is the copy
-/// the UI shows.
-fn answer(session: &mut Session, cmd: Command, now: DateTime<Utc>, echoes: &mut u64) -> Vec<Event> {
+/// UI, and whether the connection is over. Sends never leave the process;
+/// the server's replies to them (`fake_replies`) go back through the
+/// session, so on an `echo-message` session the PRIVMSG/NOTICE echo is the
+/// copy the UI shows.
+fn answer(session: &mut Session, cmd: Command, now: DateTime<Utc>, echoes: &mut u64) -> (Vec<Event>, bool) {
+    let network = cmd.network().to_owned();
     let mut events = Vec::new();
     for out in session.command(cmd, now) {
         match out {
             Output::Event(e) => events.push(e),
-            Output::Send(sent) if session.caps().is_enabled("echo-message") => {
+            Output::Send(sent) => {
                 *echoes += 1;
-                if let Some(echo) = fake_echo(&sent, session.nick(), now, *echoes) {
-                    events.extend(session.handle(echo, now).into_iter().filter_map(|o| if let Output::Event(e) = o { Some(e) } else { None }));
+                for reply in fake_replies(&sent, session.nick(), session.caps().is_enabled("echo-message"), now, *echoes) {
+                    if take(session, &network, reply, now, &mut events) {
+                        return (events, true);
+                    }
                 }
             }
-            _ => {}
+            Output::Stop(reason) => {
+                events.push(stopped(&network, reason));
+                return (events, true);
+            }
         }
+    }
+    (events, false)
+}
+
+/// One UI command, for both command loops (window thread, offscreen task).
+/// A network whose connection ended loses its session, so later commands to
+/// it go nowhere, as conn.rs drops them until /reconnect.
+fn serve(sessions: &mut HashMap<String, Session>, cmd: Command, now: DateTime<Utc>, echoes: &mut u64) -> Vec<Event> {
+    let network = cmd.network().to_owned();
+    let Some(session) = sessions.get_mut(&network) else { return Vec::new() };
+    let (events, over) = answer(session, cmd, now, echoes);
+    if over {
+        sessions.remove(&network);
     }
     events
 }
@@ -321,8 +399,7 @@ impl Plan {
             fed.store(true, Ordering::SeqCst);
             let mut echoes = 0;
             while let Some(cmd) = cmd_rx.blocking_recv() {
-                let Some(session) = sessions.get_mut(cmd.network()) else { continue };
-                for e in answer(session, cmd, Utc::now(), &mut echoes) {
+                for e in serve(&mut sessions, cmd, Utc::now(), &mut echoes) {
                     let _ = ev_tx.send(e);
                 }
             }
@@ -481,8 +558,7 @@ fn offscreen(mut plan: Plan, init: Init) -> Result<(), String> {
             cx.spawn(async move |_| {
                 let mut echoes = 0;
                 while let Some(cmd) = cmd_rx.recv().await {
-                    let Some(session) = sessions.get_mut(cmd.network()) else { continue };
-                    for e in answer(session, cmd, Utc::now(), &mut echoes) {
+                    for e in serve(&mut sessions, cmd, Utc::now(), &mut echoes) {
                         let _ = ev_tx.send(e);
                     }
                 }
@@ -676,23 +752,27 @@ mod tests {
     }
 
     #[test]
-    fn fake_echo_mirrors_privmsg_and_notice() {
+    fn fake_server_echoes_privmsg_and_notice() {
         let now: DateTime<Utc> = DEFAULT_BASE.parse().unwrap();
         let sent = Message::parse("PRIVMSG #general :hi there").unwrap();
-        let echo = fake_echo(&sent, "me", now, 3).unwrap();
+        let [echo] = fake_replies(&sent, "me", true, now, 3).try_into().unwrap();
         assert_eq!(echo.nick(), Some("me"));
         assert_eq!(echo.command, "PRIVMSG");
         assert_eq!(echo.params, ["#general", "hi there"]);
         assert_eq!(echo.tag("time"), Some("2026-01-01T12:00:00.000Z"));
         assert_eq!(echo.tag("msgid"), Some("echo-3"));
-        assert!(fake_echo(&Message::parse("NOTICE bob :yo").unwrap(), "me", now, 4).is_some());
+        assert_eq!(fake_replies(&Message::parse("NOTICE bob :yo").unwrap(), "me", true, now, 4).len(), 1);
+        // Without echo-message the server sends nothing back.
+        assert!(fake_replies(&sent, "me", false, now, 5).is_empty());
     }
 
     #[test]
-    fn fake_echo_ignores_everything_else() {
+    fn fake_server_ignores_everything_else() {
         let now: DateTime<Utc> = DEFAULT_BASE.parse().unwrap();
-        for line in ["JOIN #a", "PART #a :bye", "NICK x", "PING :x", "TAGMSG #a"] {
-            assert!(fake_echo(&Message::parse(line).unwrap(), "me", now, 0).is_none(), "{line}");
+        for line in ["NICK x", "PING :x", "TAGMSG #a", "QUIT :bye", "TOPIC #a :x"] {
+            for echo in [true, false] {
+                assert!(fake_replies(&Message::parse(line).unwrap(), "me", echo, now, 0).is_empty(), "{line}");
+            }
         }
     }
 
@@ -702,14 +782,109 @@ mod tests {
         let (_, mut sessions) = feed(&fx).unwrap();
         let s = sessions.get_mut("demo").unwrap();
         let mut n = 0;
-        let events = answer(s, Command::Say { network: "demo".into(), target: "#general".into(), text: "hello world".into() }, Utc::now(), &mut n);
+        let (events, _) = answer(s, Command::Say { network: "demo".into(), target: "#general".into(), text: "hello world".into() }, Utc::now(), &mut n);
         let lines: Vec<_> = events.iter().filter(|e| matches!(e, Event::Line { .. })).collect();
         assert_eq!(lines.len(), 1, "{events:?}");
         assert!(matches!(lines[0], Event::Line { line, .. } if line.text == "hello world"));
         // A session without echo-message shows the line locally, once.
         let s = sessions.get_mut("other").unwrap();
-        let events = answer(s, Command::Say { network: "other".into(), target: "#rust".into(), text: "yo".into() }, Utc::now(), &mut n);
+        let (events, _) = answer(s, Command::Say { network: "other".into(), target: "#rust".into(), text: "yo".into() }, Utc::now(), &mut n);
         assert_eq!(events.iter().filter(|e| matches!(e, Event::Line { .. })).count(), 1);
+    }
+
+    fn status_of<'a>(events: &'a [Event], net: &str) -> Option<&'a ConnStatus> {
+        events.iter().rev().find_map(|e| match e {
+            Event::Status { network, status } if network == net => Some(status),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn stop_is_the_status_conn_reports() {
+        let fx = parse_fixture(DEMO).unwrap();
+        let (_, mut sessions) = feed(&fx).unwrap();
+        let mut n = 0;
+        let s = sessions.get_mut("demo").unwrap();
+        let (events, over) = answer(s, Command::Disconnect { network: "demo".into(), reason: Some("bye".into()) }, Utc::now(), &mut n);
+        assert!(over);
+        assert_eq!(status_of(&events, "demo"), Some(&ConnStatus::Failed { reason: "disconnected".into() }), "{events:?}");
+    }
+
+    #[test]
+    fn a_stopped_network_answers_nothing() {
+        let fx = parse_fixture(DEMO).unwrap();
+        let (_, mut sessions) = feed(&fx).unwrap();
+        let mut n = 0;
+        let events = serve(&mut sessions, Command::Disconnect { network: "other".into(), reason: None }, Utc::now(), &mut n);
+        assert!(matches!(status_of(&events, "other"), Some(ConnStatus::Failed { .. })));
+        let join = Command::Join { network: "other".into(), channel: "#late".into(), key: None };
+        assert!(serve(&mut sessions, join, Utc::now(), &mut n).is_empty());
+        // The other network still answers.
+        let join = Command::Join { network: "demo".into(), channel: "#late".into(), key: None };
+        assert!(!serve(&mut sessions, join, Utc::now(), &mut n).is_empty());
+    }
+
+    #[test]
+    fn error_line_disconnects_the_network() {
+        let fx = parse_fixture(
+            "[[server]]\nname='a'\nnick='me'\nlines=[':irc.example 001 me :hi', 'ERROR :Closing Link: me (Quit)', ':irc.example NOTICE me :never read']\n\n[[server]]\nname='b'\nnick='me'\nlines=[':irc.example 001 me :hi']",
+        )
+        .unwrap();
+        let (events, sessions) = feed(&fx).unwrap();
+        assert_eq!(status_of(&events, "a"), Some(&ConnStatus::Disconnected { reason: "connection closed".into() }), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, Event::Line { network, line, .. } if network == "a" && line.kind == LineKind::Error)));
+        // The socket is gone: nothing after ERROR is read.
+        assert!(!events.iter().any(|e| matches!(e, Event::Line { line, .. } if line.text.contains("never read"))), "{events:?}");
+        assert!(!sessions.contains_key("a"));
+        assert!(matches!(status_of(&events, "b"), Some(ConnStatus::Connected { .. })));
+    }
+
+    #[test]
+    fn join_and_part_come_back_from_the_server() {
+        let fx = parse_fixture(DEMO).unwrap();
+        let (_, mut sessions) = feed(&fx).unwrap();
+        let mut n = 0;
+        // With and without echo-message: a server always confirms these.
+        for net in ["demo", "other"] {
+            let s = sessions.get_mut(net).unwrap();
+            let me = s.nick().to_owned();
+            let (events, over) = answer(s, Command::Join { network: net.into(), channel: "#fresh".into(), key: None }, Utc::now(), &mut n);
+            assert!(!over);
+            assert!(events.contains(&Event::Joined { network: net.into(), channel: "#fresh".into() }), "{net}: {events:?}");
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Event::Line { target: Target::Channel(c), line, .. } if c == "#fresh" && line.kind == LineKind::Join && line.own))
+            );
+            assert!(!events.iter().any(|e| matches!(e, Event::Topic { .. })), "no topic: {events:?}");
+            let part = Command::Part { network: net.into(), channel: "#fresh".into(), reason: Some("bye now".into()) };
+            let (events, _) = answer(s, part, Utc::now(), &mut n);
+            assert!(events.contains(&Event::Parted { network: net.into(), channel: "#fresh".into() }), "{net}: {events:?}");
+            assert!(events.iter().any(|e| matches!(e, Event::Line { line, .. } if line.kind == LineKind::Part && line.text == format!("{me} left (bye now)"))));
+        }
+    }
+
+    #[test]
+    fn fake_join_has_minimal_names_and_no_topic() {
+        let now: DateTime<Utc> = DEFAULT_BASE.parse().unwrap();
+        let wire: Vec<_> = fake_replies(&Message::parse("JOIN #fresh").unwrap(), "me", false, now, 0).iter().map(Message::to_wire).collect();
+        assert_eq!(wire, [":me!u@fixture JOIN #fresh", ":irc.fixture 353 me = #fresh me", ":irc.fixture 366 me #fresh :End of /NAMES list."]);
+        let wire: Vec<_> = fake_replies(&Message::parse("PART #fresh :see ya").unwrap(), "me", false, now, 0).iter().map(Message::to_wire).collect();
+        assert_eq!(wire, [":me!u@fixture PART #fresh :see ya"]);
+        let wire: Vec<_> = fake_replies(&Message::parse("PART #fresh").unwrap(), "me", false, now, 0).iter().map(Message::to_wire).collect();
+        assert_eq!(wire, [":me!u@fixture PART #fresh"]);
+    }
+
+    #[test]
+    fn nick_gets_no_reply() {
+        let fx = parse_fixture(DEMO).unwrap();
+        let (_, mut sessions) = feed(&fx).unwrap();
+        let mut n = 0;
+        for net in ["demo", "other"] {
+            let s = sessions.get_mut(net).unwrap();
+            let (events, over) = answer(s, Command::Nick { network: net.into(), nick: "someone".into() }, Utc::now(), &mut n);
+            assert!(events.is_empty() && !over, "{net}: {events:?}");
+        }
     }
 
     #[test]
