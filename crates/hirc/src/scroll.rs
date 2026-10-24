@@ -41,6 +41,11 @@ pub fn whole_lines(height: f32, line: f32) -> (usize, f32) {
     (n as usize, (height - n * line).max(0.))
 }
 
+/// Whole rows from offset `cur` down to `max` (the bottom).
+pub fn rows_between(cur: f32, max: f32, line: f32) -> usize {
+    if line <= 0. { 0 } else { lines_in((max - cur).max(0.), line).round() as usize }
+}
+
 /// Feed a wheel movement of `px` (positive moves the content down, so the
 /// view goes up) into `acc`, and take out the whole lines it adds up to
 /// (negative is up).
@@ -119,6 +124,14 @@ mod tests {
         assert_eq!(whole_lines(720.5, L), (34, 720.5 - 34. * L));
         assert_eq!(whole_lines(42., L), (2, 0.));
         assert_eq!(whole_lines(-3., L), (0, 0.));
+    }
+
+    #[test]
+    fn rows_below_count_grid_rows() {
+        assert_eq!(rows_between(27. * L, 30. * L, L), 3);
+        assert_eq!(rows_between(30. * L, 30. * L, L), 0);
+        assert_eq!(rows_between(27. * L + 0.01, 30. * L, L), 3);
+        assert_eq!(rows_between(31. * L, 30. * L, L), 0);
     }
 
     #[test]

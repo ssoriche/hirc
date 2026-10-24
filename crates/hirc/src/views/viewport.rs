@@ -1,7 +1,8 @@
 //! The message view's frame: it gives the line list a height of whole text
 //! lines (the remainder becomes space above it, so no row is ever cut by
 //! the title bar), keeps `bottom` clear above the input bar, and turns the
-//! wheel into whole-line steps on the same grid as the vim keys.
+//! wheel into whole-line steps on the same grid as the vim keys. An
+//! optional `sticky` row is drawn over the list's top row.
 
 use crate::scroll;
 use gpui::{
@@ -19,12 +20,14 @@ pub struct Viewport {
     bottom: f32,
     /// Wheel movement not yet a whole line.
     wheel: Rc<Cell<f32>>,
+    sticky: Option<AnyElement>,
 }
 
 /// `child` is the list drawn from `list`; it must fill its parent
 /// (`size_full`). At least `top` and `bottom` px stay clear above and below.
-pub fn viewport(list: ListState, child: AnyElement, line: f32, top: f32, bottom: f32, wheel: Rc<Cell<f32>>) -> Viewport {
-    Viewport { list, child, line, top, bottom, wheel }
+/// `sticky`, one line tall, is drawn over the list's first visible row.
+pub fn viewport(list: ListState, child: AnyElement, line: f32, top: f32, bottom: f32, wheel: Rc<Cell<f32>>, sticky: Option<AnyElement>) -> Viewport {
+    Viewport { list, child, line, top, bottom, wheel, sticky }
 }
 
 impl IntoElement for Viewport {
@@ -67,7 +70,12 @@ impl Element for Viewport {
         let height = px(lines as f32 * self.line);
         let available = size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::Definite(height));
         self.child.layout_as_root(available, window, cx);
-        self.child.prepaint_at(point(bounds.origin.x, bounds.origin.y + px(self.top + spare)), window, cx);
+        let origin = point(bounds.origin.x, bounds.origin.y + px(self.top + spare));
+        self.child.prepaint_at(origin, window, cx);
+        if let Some(sticky) = &mut self.sticky {
+            sticky.layout_as_root(size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::Definite(px(self.line))), window, cx);
+            sticky.prepaint_at(origin, window, cx);
+        }
         window.insert_hitbox(bounds, HitboxBehavior::Normal)
     }
 
@@ -82,6 +90,9 @@ impl Element for Viewport {
         cx: &mut App,
     ) {
         self.child.paint(window, cx);
+        if let Some(sticky) = &mut self.sticky {
+            sticky.paint(window, cx);
+        }
         let (list, line, wheel, hitbox, view) = (self.list.clone(), self.line, self.wheel.clone(), hitbox.clone(), window.current_view());
         // Capture phase, so the list's own pixel scrolling never runs.
         window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {

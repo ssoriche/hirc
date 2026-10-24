@@ -83,6 +83,9 @@ pub struct HircApp {
     wheel: Rc<Cell<f32>>,
     /// Lines arrived below while the view was scrolled up.
     fresh_below: bool,
+    /// The channel a /join asked for, by network name: its window is
+    /// focused when the server confirms the join.
+    pending_join: Option<(String, String)>,
     commands: UnboundedSender<Command>,
 }
 
@@ -160,6 +163,7 @@ impl HircApp {
             nick_cells: 0,
             wheel: Rc::default(),
             fresh_below: false,
+            pending_join: None,
             commands: init.commands,
         }
     }
@@ -302,7 +306,7 @@ impl HircApp {
         match (found, self.selected) {
             (Some((n, b)), _) => self.select(n, b, cx),
             (None, Some((n, b))) => {
-                self.local_error(n, b, format!("No buffer matching {name}"));
+                self.local_error(n, b, format!("No buffer matches \"{name}\""));
                 cx.notify();
             }
             (None, None) => {}
@@ -326,25 +330,18 @@ impl HircApp {
         }
     }
 
-    /// Lines wholly below the view, counting the one the `-- more --` line
-    /// covers.
-    fn lines_below(&self) -> usize {
-        let cut = self.lines.viewport_bounds().bottom() - px(self.metrics.line);
-        let n = self.lines.item_count();
-        let (mut lo, mut hi) = (0, n);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            match self.lines.bounds_for_item(mid) {
-                Some(b) if b.top() >= cut => hi = mid,
-                _ => lo = mid + 1,
-            }
-        }
-        n - lo
+    /// Rows below the view: the `j` presses back to the newest line.
+    fn rows_below(&self) -> usize {
+        let max = f32::from(self.lines.max_offset_for_scrollbar().y);
+        let cur = -f32::from(self.lines.scroll_px_offset_for_scrollbar().y);
+        scroll::rows_between(cur, max, self.metrics.line)
     }
 
-    /// The widest nick-column entry in the current buffer, in cells.
-    fn longest_prefix(&self) -> usize {
-        self.current().map_or(0, |(_, buf)| buf.lines.iter().map(buffer::prefix_cells).max().unwrap_or(0))
+    /// While scrolled, the message whose wrapped tail is the top row (its
+    /// head, with the time and nick, is above the view).
+    fn cut_head(&self) -> Option<usize> {
+        let top = self.lines.logical_scroll_top();
+        (f32::from(top.offset_in_item) >= self.metrics.line / 2.).then_some(top.item_ix)
     }
 
     fn vim_effect(&mut self, effect: &Effect, cx: &mut Context<Self>) {
@@ -380,15 +377,35 @@ impl HircApp {
     }
 
     fn on_event(&mut self, ev: Event, cx: &mut Context<Self>) {
-        if let Applied::Line { network, buffer, index } = self.store.apply(ev)
-            && self.selected == Some((network, buffer))
-        {
-            self.fresh_below |= !scroll::following(&self.lines);
-            self.lines.splice(index..index, 1);
-            self.store.networks[network].buffers[buffer].unread = 0;
+        // Our JOIN answering a /join: the user wants that window.
+        let focus = match &ev {
+            Event::Joined { network, channel } => {
+                self.pending_join.take_if(|(net, chan)| net == network && chan.eq_ignore_ascii_case(channel)).map(|_| (network.clone(), channel.clone()))
+            }
+            _ => None,
+        };
+        match self.store.apply(ev) {
+            Applied::Line { network, buffer, index } => self.arrived(network, buffer, index),
+            Applied::Lines { network, at } => at.into_iter().for_each(|(buffer, index)| self.arrived(network, buffer, index)),
+            Applied::Changed | Applied::Nothing => {}
         }
         self.sync_layout();
+        if let Some((network, channel)) = focus {
+            let n = self.store.network_ix(&network);
+            let b = self.store.buffer_ix(n, &Target::Channel(channel));
+            self.select(n, b, cx);
+        }
         cx.notify();
+    }
+
+    /// A line landed at `index` in buffer `(n, b)`: show it if that is the
+    /// window on screen.
+    fn arrived(&mut self, n: usize, b: usize, index: usize) {
+        if self.selected == Some((n, b)) {
+            self.fresh_below |= !scroll::following(&self.lines);
+            self.lines.splice(index..index, 1);
+            self.store.networks[n].buffers[b].unread = 0;
+        }
     }
 
     /// Show a local error line in the current buffer.
@@ -411,7 +428,8 @@ impl HircApp {
         let net = &self.store.networks[n];
         let target = net.buffers[b].target.name().map(str::to_owned);
         let name = net.name.clone();
-        let connected = matches!(net.status, ConnStatus::Connected { .. });
+        let status = net.status.clone();
+        let connected = matches!(status, ConnStatus::Connected { .. });
         // A bare /topic shows the whole topic (the header may cut it short).
         if text.trim().eq_ignore_ascii_case("/topic")
             && let Some(chan) = target.as_deref().filter(|t| t.starts_with(['#', '&']))
@@ -425,11 +443,28 @@ impl HircApp {
             return;
         }
         match command::parse(&text, &name, target.as_deref()) {
-            // Chat sent while offline would vanish without a trace.
+            Ok(Input::Send(cmd @ Command::Reconnect { .. })) => {
+                let _ = self.commands.send(cmd);
+            }
+            // Chat sent while offline would vanish without a trace; keep
+            // the line so it can be sent once connected.
             Ok(Input::Send(Command::Say { .. } | Command::Action { .. })) if !connected => {
-                self.local_error(n, b, format!("Not connected to {name}"));
+                self.local_error(n, b, not_connected(&name, &status));
+                self.input.update(cx, |input, cx| input.swap_draft(text.clone(), cx));
+            }
+            // A down network drops everything but /reconnect.
+            Ok(Input::Send(_)) if status.is_down() => self.local_error(n, b, not_connected(&name, &status)),
+            Ok(Input::Send(Command::Part { channel, .. })) if !self.in_channel(n, &channel) => self.local_error(n, b, format!("Not in {channel}")),
+            Ok(Input::Send(Command::Join { channel, .. })) if self.in_channel(n, &channel) => {
+                let j = self.store.buffer_ix(n, &Target::Channel(channel));
+                self.select(n, j, cx);
             }
             Ok(Input::Send(cmd)) => {
+                if let Command::Join { channel, .. } = &cmd
+                    && let Some(first) = channel.split(',').next()
+                {
+                    self.pending_join = Some((name, first.to_owned()));
+                }
                 let _ = self.commands.send(cmd);
             }
             Ok(Input::OpenQuery { nick, text }) => {
@@ -447,14 +482,22 @@ impl HircApp {
         cx.notify();
     }
 
-    /// The empty input's hint: where a line typed now will go.
+    /// Are we in `channel` on network `n`? A list (`#a,#b`) is left to
+    /// the server.
+    fn in_channel(&self, n: usize, channel: &str) -> bool {
+        channel.contains(',') || self.store.networks[n].buffers.iter().any(|b| b.joined && b.target.same(&Target::Channel(channel.to_owned())))
+    }
+
+    /// The empty input's hint: where a line typed now will go, or, when it
+    /// can't go anywhere, why and the way out.
     fn placeholder(&self) -> String {
-        match self.current() {
-            Some((net, buf)) => match buf.target.name() {
-                Some(name) => format!("Message {name}"),
-                None => format!("Command for {}", net.name),
-            },
-            None => String::new(),
+        let Some((net, buf)) = self.current() else { return String::new() };
+        let connected = matches!(net.status, ConnStatus::Connected { .. });
+        match &buf.target {
+            _ if net.status.is_down() => not_connected(&net.name, &net.status),
+            Target::Channel(name) if connected && !buf.joined => format!("Not in {name} — /join to rejoin"),
+            Target::Server => format!("Command for {}", net.name),
+            target => format!("Message {}", target.name().unwrap_or_default()),
         }
     }
 
@@ -464,8 +507,11 @@ impl HircApp {
     }
 
     fn line_element(&mut self, ix: usize) -> gpui::AnyElement {
-        match self.current().and_then(|(net, buf)| Some((net, buf.lines.get(ix)?))) {
-            Some((net, line)) => buffer::line(self, line, &buffer::Context { me: net.nick.as_deref(), nick_cells: self.nick_cells }),
+        match self.current().and_then(|(net, buf)| Some((net, buf, buf.lines.get(ix)?))) {
+            Some((net, buf, line)) => {
+                let channel = matches!(buf.target, Target::Channel(_)).then(|| buf.target.name()).flatten();
+                buffer::line(self, line, &buffer::Context { me: net.nick.as_deref(), nick_cells: self.nick_cells, channel })
+            }
             None => div().into_any_element(),
         }
     }
@@ -477,9 +523,9 @@ impl Render for HircApp {
         let m = self.metrics;
         let width = f32::from(window.viewport_size().width);
         self.sidebar_width = m.sidebar_width(width);
-        // The nick column follows the buffer's longest nick; rows wrap
-        // against it, so a change means measuring them again.
-        let nick_cells = m.nick_cells(self.longest_prefix(), width - self.sidebar_width);
+        // The nick column follows the view's width; rows wrap against it,
+        // so a change means measuring them again.
+        let nick_cells = m.nick_cells(width - self.sidebar_width);
         if nick_cells != self.nick_cells {
             self.nick_cells = nick_cells;
             self.lines.remeasure();
@@ -496,7 +542,15 @@ impl Render for HircApp {
             input.placeholder = placeholder.into();
         });
         let at_top = !following && f32::from(self.lines.scroll_px_offset_for_scrollbar().y) >= 0.;
-        let more = (!following).then(|| buffer::more(self, self.lines_below(), at_top, self.fresh_below));
+        // While scrolled, the `-- more --` line takes the bottom row of its
+        // own (it never covers a line), and a wrapped tail at the top shows
+        // whose message it is.
+        let more = (!following).then(|| buffer::more(self, self.rows_below(), at_top, self.fresh_below));
+        let sticky = (!following)
+            .then(|| self.cut_head())
+            .flatten()
+            .and_then(|ix| self.current().and_then(|(_, buf)| buf.lines.get(ix)).map(|line| buffer::sticky(self, line, nick_cells)));
+        let reserve = if following { 0. } else { m.line };
         let lines = list(self.lines.clone(), cx.processor(|this, ix: usize, _window, _cx| this.line_element(ix))).size_full();
         let mut root = div().size_full();
         macro_rules! window_keys {
@@ -529,7 +583,15 @@ impl Render for HircApp {
                             .min_h(px(0.))
                             .flex()
                             .flex_col()
-                            .child(viewport::viewport(self.lines.clone(), lines.into_any_element(), m.line, m.edge, m.edge, self.wheel.clone()))
+                            .child(viewport::viewport(
+                                self.lines.clone(),
+                                lines.into_any_element(),
+                                m.line,
+                                m.edge,
+                                m.edge + reserve,
+                                self.wheel.clone(),
+                                sticky,
+                            ))
                             .children(more),
                     )
                     .child(div().px(px(m.gutter)).py(px(m.bar_pad())).bg(p.input_bg).border_t_1().border_color(p.border).child(self.input.clone())),
@@ -545,6 +607,15 @@ fn font_for(window: &Window, family: Option<SharedString>) -> gpui::Font {
         style.font_family = family;
     }
     style.font()
+}
+
+/// Why a line can't be sent to network `name`, and the way out.
+fn not_connected(name: &str, status: &ConnStatus) -> String {
+    match status {
+        ConnStatus::Offline => format!("Not connected to {name} — /reconnect to connect again"),
+        ConnStatus::Disconnected { .. } => format!("Not connected to {name} — /reconnect to retry now"),
+        _ => format!("Not connected to {name} — /reconnect to try again"),
+    }
 }
 
 /// "No window 30 (there are 6)."

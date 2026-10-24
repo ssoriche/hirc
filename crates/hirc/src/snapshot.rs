@@ -18,7 +18,7 @@
 //!
 //! | Variable | Effect |
 //! |---|---|
-//! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` never leaves the process; a faked server answers some sends through the session: a JOIN comes back as our JOIN plus a NAMES of just us (no topic), a PART as our PART, and on an `echo_message` server a PRIVMSG/NOTICE as its echo. Everything else is dropped. Connection status follows conn.rs: an `Output::Stop` (e.g. `/quit`) is `Failed { reason }`, and a server `ERROR` line is `Disconnected { "connection closed" }`. Either way that network reads no more fixture lines and later commands to it go nowhere (no reconnect). |
+//! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` never leaves the process; a faked server answers some sends through the session: a JOIN comes back as our JOIN plus a NAMES of just us (no topic), a PART as our PART, and on an `echo_message` server a PRIVMSG/NOTICE as its echo. Everything else is dropped. Connection status follows conn.rs: an `Output::Quit` (`/quit`) is `Offline`, an `Output::Stop` (e.g. a SASL failure) is `Failed { reason }`, and a server `ERROR` line closes the connection as `Disconnected { reason: <the ERROR text>, retry }`, with conn.rs's first retry delay. Either way that network reads no more fixture lines and later commands to it go nowhere (no reconnect is faked). |
 //! | `HIRC_SCREENSHOT=<out.png>` | Final image, taken after the script. Window mode waits 300 ms for layout, captures, quits. |
 //! | `HIRC_OFFSCREEN=1` | Offscreen mode (above). Exits 0 when done; on failure prints `snapshot: <reason>` and exits 1. |
 //! | `HIRC_SIZE=WxH` | Logical size (default `1200x800`). |
@@ -66,6 +66,7 @@ use gpui::{
     ScrollWheelEvent, TouchPhase, WindowHandle, point, px, size,
 };
 use hirc_core::config::{Config, Server};
+use hirc_core::conn;
 use hirc_core::event::{Command, ConnStatus, Event};
 use hirc_core::proto::Message;
 use hirc_core::session::{Output, Session, SessionConfig};
@@ -183,27 +184,35 @@ fn take(session: &mut Session, network: &str, msg: Message, now: DateTime<Utc>, 
     for out in session.handle(msg, now) {
         match out {
             Output::Event(e) => events.push(e),
-            Output::Stop(reason) => {
-                events.push(stopped(network, reason));
+            Output::Stop(_) | Output::Quit => {
+                events.push(ended(network, out));
                 return true;
             }
             Output::Send(_) => {}
         }
     }
     if error {
-        events.push(closed(network));
+        events.push(closed(network, session));
     }
     error
 }
 
-/// conn.rs: a session's `Stop` won't retry until /reconnect.
-fn stopped(network: &str, reason: String) -> Event {
-    Event::Status { network: network.to_owned(), status: ConnStatus::Failed { reason } }
+/// conn.rs: a session's `Stop` won't retry until /reconnect, and a `Quit`
+/// is the user going offline.
+fn ended(network: &str, out: Output) -> Event {
+    let status = match out {
+        Output::Stop(reason) => ConnStatus::Failed { reason },
+        _ => ConnStatus::Offline,
+    };
+    Event::Status { network: network.to_owned(), status }
 }
 
-/// conn.rs: the server closed the connection (live retries after a backoff).
-fn closed(network: &str) -> Event {
-    Event::Status { network: network.to_owned(), status: ConnStatus::Disconnected { reason: "connection closed".into() } }
+/// conn.rs: the server closed the connection, giving its `ERROR` text as
+/// the reason; a registered session retries after the shortest backoff.
+fn closed(network: &str, session: &Session) -> Event {
+    let reason = session.closing().unwrap_or("connection closed").to_owned();
+    let retry = conn::retry_delay(Duration::ZERO, true).0;
+    Event::Status { network: network.to_owned(), status: ConnStatus::Disconnected { reason, retry } }
 }
 
 fn feed_line(session: &mut Session, network: &str, line: &str, now: DateTime<Utc>, events: &mut Vec<Event>) -> Result<bool, String> {
@@ -294,8 +303,8 @@ fn answer(session: &mut Session, cmd: Command, now: DateTime<Utc>, echoes: &mut 
                     }
                 }
             }
-            Output::Stop(reason) => {
-                events.push(stopped(&network, reason));
+            Output::Stop(_) | Output::Quit => {
+                events.push(ended(&network, out));
                 return (events, true);
             }
         }
@@ -811,7 +820,8 @@ mod tests {
         let s = sessions.get_mut("demo").unwrap();
         let (events, over) = answer(s, Command::Disconnect { network: "demo".into(), reason: Some("bye".into()) }, Utc::now(), &mut n);
         assert!(over);
-        assert_eq!(status_of(&events, "demo"), Some(&ConnStatus::Failed { reason: "disconnected".into() }), "{events:?}");
+        // A quit is the user going offline, not a failure.
+        assert_eq!(status_of(&events, "demo"), Some(&ConnStatus::Offline), "{events:?}");
     }
 
     #[test]
@@ -820,7 +830,7 @@ mod tests {
         let (_, mut sessions) = feed(&fx).unwrap();
         let mut n = 0;
         let events = serve(&mut sessions, Command::Disconnect { network: "other".into(), reason: None }, Utc::now(), &mut n);
-        assert!(matches!(status_of(&events, "other"), Some(ConnStatus::Failed { .. })));
+        assert_eq!(status_of(&events, "other"), Some(&ConnStatus::Offline));
         let join = Command::Join { network: "other".into(), channel: "#late".into(), key: None };
         assert!(serve(&mut sessions, join, Utc::now(), &mut n).is_empty());
         // The other network still answers.
@@ -835,8 +845,9 @@ mod tests {
         )
         .unwrap();
         let (events, sessions) = feed(&fx).unwrap();
-        assert_eq!(status_of(&events, "a"), Some(&ConnStatus::Disconnected { reason: "connection closed".into() }), "{events:?}");
-        assert!(events.iter().any(|e| matches!(e, Event::Line { network, line, .. } if network == "a" && line.kind == LineKind::Error)));
+        // The ERROR text is the reason, and the retry is conn.rs's first.
+        let retry = conn::retry_delay(std::time::Duration::ZERO, true).0;
+        assert_eq!(status_of(&events, "a"), Some(&ConnStatus::Disconnected { reason: "Closing Link: me (Quit)".into(), retry }), "{events:?}");
         // The socket is gone: nothing after ERROR is read.
         assert!(!events.iter().any(|e| matches!(e, Event::Line { line, .. } if line.text.contains("never read"))), "{events:?}");
         assert!(!sessions.contains_key("a"));

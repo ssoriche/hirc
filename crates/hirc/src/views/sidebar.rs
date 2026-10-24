@@ -8,8 +8,12 @@
 //! and keeps a minimum; the network column holds the network tag (or, on a
 //! server row, its connection dot) and gives way first; the unread column is
 //! reserved on every row so tags share one right edge. The selected row is a
-//! fill plus `text.primary`; hover is only a faint wash. A network that is
-//! down shows a red dot, red tags and dimmed rows.
+//! fill plus `text.primary`; hover is only a faint wash. A window that
+//! can't be used (network down, channel left) is dimmed as a whole row
+//! (number, label and count), except when selected, where the label stays
+//! readable and the tag or dot carries the state. Red marks a fault (a
+//! dropped or failed connection): a red dot and red tags. A network the
+//! user quit is offline, not failed: a hollow dot and quiet tags.
 
 use crate::app::HircApp;
 use crate::metrics::{Metrics, count_label};
@@ -62,6 +66,9 @@ fn hidden(scroll: &ScrollHandle) -> (bool, bool) {
     (offset > 0.5, offset < max - 0.5)
 }
 
+/// The opacity of a window that can't be used.
+const DIM: f32 = 0.5;
+
 fn row(app: &HircApp, number_width: f32, pos: usize, n: usize, b: usize, cx: &mut Context<HircApp>) -> impl IntoElement {
     let p = &app.palette;
     let m = &app.metrics;
@@ -78,18 +85,19 @@ fn row(app: &HircApp, number_width: f32, pos: usize, n: usize, b: usize, cx: &mu
         _ if buf.unread > 0 => p.unread,
         _ => p.text_dim,
     };
-    let offline = matches!(net.status, ConnStatus::Disconnected { .. } | ConnStatus::Failed { .. });
-    let dimmed = !is_server && (offline || matches!(buf.target, Target::Channel(_)) && !buf.joined);
+    let fault = net.status.is_fault();
+    let unusable = !is_server && (net.status.is_down() || matches!(buf.target, Target::Channel(_)) && !buf.joined);
+    let dimmed = unusable && !selected;
     // The network column: a server row's connection dot, else the network tag.
     let (network, network_color): (SharedString, _) = if is_server {
-        let dot = match net.status {
-            ConnStatus::Connected { .. } => p.success,
-            ConnStatus::Connecting | ConnStatus::Idle => p.text_dim,
-            ConnStatus::Disconnected { .. } | ConnStatus::Failed { .. } => p.error,
-        };
-        ("●".into(), dot)
+        match net.status {
+            ConnStatus::Connected { .. } => ("●".into(), p.success),
+            ConnStatus::Connecting | ConnStatus::Idle => ("●".into(), p.text_dim),
+            ConnStatus::Disconnected { .. } | ConnStatus::Failed { .. } => ("●".into(), p.error),
+            ConnStatus::Offline => ("○".into(), p.text_dim),
+        }
     } else {
-        (net.name.clone().into(), if offline { p.error } else { p.text_dim })
+        (net.name.clone().into(), if fault { p.error } else { p.text_dim })
     };
     let count = (buf.unread > 0 && !selected).then(|| count_label(buf.unread));
     div()
@@ -104,8 +112,16 @@ fn row(app: &HircApp, number_width: f32, pos: usize, n: usize, b: usize, cx: &mu
         .cursor_pointer()
         .when(selected, |d| d.bg(p.selected))
         .when(!selected, |d| d.hover(|s| s.bg(p.hover)))
-        .child(div().flex_none().w(px(number_width)).text_right().text_color(if selected { p.text } else { p.text_dim }).child((pos + 1).to_string()))
-        .child(div().flex_1().min_w(px(m.label_min())).truncate().text_color(label_color).when(dimmed, |d| d.opacity(0.5)).child(label))
+        .child(
+            div()
+                .flex_none()
+                .w(px(number_width))
+                .text_right()
+                .text_color(if selected { p.text } else { p.text_dim })
+                .when(dimmed, |d| d.opacity(DIM))
+                .child((pos + 1).to_string()),
+        )
+        .child(div().flex_1().min_w(px(m.label_min())).truncate().text_color(label_color).when(dimmed, |d| d.opacity(DIM)).child(label))
         .child(
             div()
                 .min_w(px(0.))
@@ -115,9 +131,11 @@ fn row(app: &HircApp, number_width: f32, pos: usize, n: usize, b: usize, cx: &mu
                 .relative()
                 .top(px(m.small_drop))
                 .text_color(network_color)
+                // A fault stays red; otherwise the tag dims with its row.
+                .when(dimmed && !fault, |d| d.opacity(DIM))
                 .child(network),
         )
-        .child(div().flex_none().w(px(m.count_width())).text_right().text_color(p.unread).children(count))
+        .child(div().flex_none().w(px(m.count_width())).text_right().text_color(p.unread).when(dimmed, |d| d.opacity(DIM)).children(count))
         .on_click(cx.listener(move |this, _, _, cx| this.select(n, b, cx)))
 }
 

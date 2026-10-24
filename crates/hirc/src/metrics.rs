@@ -160,13 +160,14 @@ impl Metrics {
         self.cell * n as f32
     }
 
-    /// Cells in the message view's nick column, given the longest prefix
-    /// (nick or marker) in the buffer and the view's width: wide enough for
-    /// the longest, within limits, and narrower in a narrow window so the
-    /// text keeps most of the line.
-    pub fn nick_cells(&self, longest: usize, view_width: f32) -> usize {
+    /// Cells in the message view's nick column for a view `view_width`
+    /// wide. The same in every buffer (longer nicks end in an ellipsis), so
+    /// the text column and the input line never move when you switch
+    /// windows; narrower in a narrow window so the text keeps most of the
+    /// line.
+    pub fn nick_cells(&self, view_width: f32) -> usize {
         let share = ((view_width * NICK_MAX_SHARE) / self.cell).floor() as usize;
-        longest.clamp(NICK_MIN_CELLS, NICK_MAX_CELLS.min(share.max(NICK_MIN_CELLS)))
+        NICK_MAX_CELLS.min(share.max(NICK_MIN_CELLS))
     }
 
     /// The least a row label keeps when space runs out.
@@ -255,12 +256,10 @@ mod tests {
     #[test]
     fn nick_column_fits_within_limits() {
         let m = menlo(14.);
-        assert_eq!(m.nick_cells(5, 1000.), 5);
-        assert_eq!(m.nick_cells(1, 1000.), NICK_MIN_CELLS);
-        assert_eq!(m.nick_cells(22, 1000.), NICK_MAX_CELLS);
+        assert_eq!(m.nick_cells(1000.), NICK_MAX_CELLS);
         // A narrow view gives the nick at most a fifth of its width.
-        assert_eq!(m.nick_cells(22, 400.), (400. * NICK_MAX_SHARE / m.cell) as usize);
-        assert_eq!(m.nick_cells(22, 10.), NICK_MIN_CELLS);
+        assert_eq!(m.nick_cells(400.), (400. * NICK_MAX_SHARE / m.cell) as usize);
+        assert_eq!(m.nick_cells(10.), NICK_MIN_CELLS);
     }
 
     #[test]
