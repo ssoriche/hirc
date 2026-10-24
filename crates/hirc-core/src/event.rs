@@ -2,6 +2,7 @@
 //! `Command`s down.
 
 use crate::store::Line;
+use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -37,14 +38,30 @@ pub enum ConnStatus {
     Connected {
         nick: String,
     },
-    /// Will retry by itself.
+    /// The connection dropped; hirc tries again after `retry`.
     Disconnected {
         reason: String,
+        retry: Duration,
     },
-    /// Won't retry until /reconnect (bad password, /disconnect).
+    /// Something went wrong that retrying won't fix (bad password, TLS
+    /// setup); waits for /reconnect.
     Failed {
         reason: String,
     },
+    /// The user left (/quit, /disconnect); waits for /reconnect.
+    Offline,
+}
+
+impl ConnStatus {
+    /// Not connected and not on the way: commands have nowhere to go.
+    pub fn is_down(&self) -> bool {
+        matches!(self, ConnStatus::Disconnected { .. } | ConnStatus::Failed { .. } | ConnStatus::Offline)
+    }
+
+    /// Down because something went wrong, not because the user chose it.
+    pub fn is_fault(&self) -> bool {
+        matches!(self, ConnStatus::Disconnected { .. } | ConnStatus::Failed { .. })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

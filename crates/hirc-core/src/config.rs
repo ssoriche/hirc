@@ -94,11 +94,11 @@ pub enum Sasl {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("reading {}: {source}", path.display())]
+    #[error("Can't read {}: {source}", path.display())]
     Read { path: PathBuf, source: std::io::Error },
     /// No source snippet: toml would print the offending line, which may
     /// be a password.
-    #[error("parsing {}: {message} (line {line}, column {col})", path.display())]
+    #[error("Error in {}: {message} (line {line}, column {col})", path.display())]
     Parse { path: PathBuf, message: String, line: usize, col: usize },
     #[error("password command `{}` failed: {}", program(.command), clip(.message))]
     Command { command: String, message: String },
@@ -132,9 +132,33 @@ fn program(command: &str) -> &str {
 }
 
 /// toml quotes the rejected value in type errors (``invalid type: integer
-/// `123` ``), and that value may be a password, so blank every quoted span.
+/// `123`, expected a string``), and that value may be a password, so blank
+/// every quoted span before `expected`. What follows `expected` is toml's
+/// grammar (`` `]` ``, `a string`), never the file's text, and it is what
+/// the user needs to fix the file, so it stays.
 fn redact(message: &str) -> String {
-    message.split(['`', '"', '\'']).enumerate().map(|(i, part)| if i % 2 == 1 { "…" } else { part }).collect::<Vec<_>>().join("`")
+    let mut out = String::new();
+    let mut quoted = false;
+    for (i, c) in message.char_indices() {
+        if matches!(c, '`' | '"' | '\'') {
+            if quoted {
+                out.push('…');
+            }
+            out.push('`');
+            quoted = !quoted;
+        } else if !quoted {
+            out.push(c);
+            // Only an unquoted `expected`: a quoted value may contain the word.
+            if out.ends_with("expected") {
+                out.push_str(&message[i + c.len_utf8()..]);
+                return out;
+            }
+        }
+    }
+    if quoted {
+        out.push('…');
+    }
+    out
 }
 
 /// A parse error with a line and column but never the source text.
@@ -326,6 +350,16 @@ password_command = "printf hunter22"
     #[test]
     fn program_skips_quoted_env_values() {
         assert_eq!(program("FOO=\"a b\" op read x"), "op");
+    }
+
+    #[test]
+    fn redaction_keeps_what_toml_expected() {
+        assert_eq!(redact("invalid type: string \"hunter2\", expected a boolean"), "invalid type: string `…`, expected a boolean");
+        assert_eq!(redact("unclosed table, expected `]`"), "unclosed table, expected `]`");
+        assert_eq!(redact("invalid type: integer `123`"), "invalid type: integer `…`");
+        // The word inside a quoted value does not end the redaction.
+        assert_eq!(redact("invalid type: string \"unexpected!\", expected a map"), "invalid type: string `…`, expected a map");
+        assert_eq!(redact("bad `secret"), "bad `…");
     }
 
     #[test]

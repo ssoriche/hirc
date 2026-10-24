@@ -69,13 +69,16 @@ pub fn spawn(config: Config) -> (UnboundedSender<Command>, UnboundedReceiver<Eve
 enum End {
     /// Don't reconnect until /reconnect.
     Stopped(String),
-    Closed,
+    /// The user quit; don't reconnect until /reconnect.
+    Quit,
+    /// The socket closed; the server's `ERROR` text, if it sent one, says why.
+    Closed(Option<String>),
 }
 
 /// The delay before the next attempt and the backoff to carry forward. A
 /// session that got as far as registering resets the backoff, however it
 /// ended (clean close, reset, TLS error, idle timeout).
-fn retry_delay(backoff: Duration, registered: bool) -> (Duration, Duration) {
+pub fn retry_delay(backoff: Duration, registered: bool) -> (Duration, Duration) {
     let delay = if registered { MIN_BACKOFF } else { backoff };
     (delay, (delay * 2).min(MAX_BACKOFF))
 }
@@ -93,21 +96,25 @@ async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Co
     loop {
         status(ConnStatus::Connecting);
         let mut registered = false;
-        match connect_once(&name, &server, &mut cached, &mut rejoin, &mut registered, &mut cmds, &events).await {
-            Ok(End::Stopped(reason)) => {
+        let reason = match connect_once(&name, &server, &mut cached, &mut rejoin, &mut registered, &mut cmds, &events).await {
+            Ok(end @ (End::Stopped(_) | End::Quit)) => {
                 cached = None;
-                status(ConnStatus::Failed { reason });
+                status(match end {
+                    End::Stopped(reason) => ConnStatus::Failed { reason },
+                    _ => ConnStatus::Offline,
+                });
                 if wait_reconnect(&mut cmds).await.is_none() {
                     return;
                 }
                 backoff = MIN_BACKOFF;
                 continue;
             }
-            Ok(End::Closed) => status(ConnStatus::Disconnected { reason: "connection closed".into() }),
-            Err(e) => status(ConnStatus::Disconnected { reason: e.to_string() }),
-        }
+            Ok(End::Closed(why)) => why.unwrap_or_else(|| "connection closed".into()),
+            Err(e) => e.to_string(),
+        };
         let (delay, next) = retry_delay(backoff, registered);
         backoff = next;
+        status(ConnStatus::Disconnected { reason, retry: delay });
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             r = wait_reconnect(&mut cmds) => {
@@ -262,12 +269,16 @@ async fn connect_once(
                     let _ = w.flush().await;
                     return Ok(End::Stopped(reason));
                 }
+                Output::Quit => {
+                    let _ = w.flush().await;
+                    return Ok(End::Quit);
+                }
             }
         }
         w.flush().await?;
         tokio::select! {
             line = reader.next_line() => {
-                let Some(line) = line? else { return Ok(End::Closed) };
+                let Some(line) = line? else { return Ok(End::Closed(session.closing().map(str::to_owned))) };
                 last_rx = Instant::now();
                 pinged = false;
                 match Message::parse(&line) {
@@ -280,7 +291,7 @@ async fn connect_once(
                 Some(Command::Reconnect { .. }) => {
                     let _ = w.write_all(b"QUIT :Reconnecting\r\n").await;
                     let _ = w.flush().await;
-                    return Ok(End::Closed);
+                    return Ok(End::Closed(None));
                 }
                 Some(c) => outs = session.command(c, Utc::now()),
             },

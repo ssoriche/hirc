@@ -8,12 +8,13 @@ use crate::store::LineKind;
 /// One piece of an event line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
-    /// Someone's nick.
+    /// Someone's nick, ours included: we are named by our nick everywhere,
+    /// as in our messages and actions (irssi, weechat).
     Nick,
-    /// Us, worded as "you".
-    You,
     /// The client's own wording ("joined", "kicked").
     Verb,
+    /// The channel joined or left.
+    Channel,
     /// Text someone typed: a reason, a topic, mode arguments.
     Free,
 }
@@ -36,14 +37,14 @@ pub fn is_noise(kind: LineKind) -> bool {
 }
 
 /// `text` as `session` worded it for an event of `kind` by `nick`, split
-/// into parts. Our own joins, parts, renames, kicks and topic changes read
-/// "you ...". `None` when the text is not in the expected shape (an older
-/// format, or a kind that is not an event); show it whole.
-pub fn event_parts(kind: LineKind, nick: Option<&str>, text: &str, own: bool) -> Option<Vec<(Part, String)>> {
+/// into parts. Joins and parts name `channel` (the buffer's), so a line
+/// says where it happened wherever it is read. `None` when the text is not
+/// in the expected shape (an older format, or a kind that is not an
+/// event); show it whole.
+pub fn event_parts(kind: LineKind, nick: Option<&str>, text: &str, channel: Option<&str>) -> Option<Vec<(Part, String)>> {
     let nick = nick.filter(|n| !n.is_empty())?;
     let rest = text.strip_prefix(nick)?;
-    let you = own && !matches!(kind, LineKind::Mode | LineKind::Quit);
-    let mut parts = vec![if you { (Part::You, "you".to_owned()) } else { (Part::Nick, nick.to_owned()) }];
+    let mut parts = vec![(Part::Nick, nick.to_owned())];
     let mut push = |part: Part, s: &str| {
         if !s.is_empty() {
             parts.push((part, s.to_owned()));
@@ -54,16 +55,27 @@ pub fn event_parts(kind: LineKind, nick: Option<&str>, text: &str, own: bool) ->
         let after = rest.strip_prefix(verb)?;
         (after.is_empty() || after.starts_with(" (") && after.ends_with(')')).then(|| (verb.to_owned(), after.to_owned()))
     };
+    let channel = channel.filter(|c| !c.is_empty());
     match kind {
-        LineKind::Join => push(Part::Verb, (rest == " joined").then_some(rest)?),
+        LineKind::Join => {
+            push(Part::Verb, (rest == " joined").then_some(rest)?);
+            if let Some(c) = channel {
+                push(Part::Verb, " ");
+                push(Part::Channel, c);
+            }
+        }
         LineKind::Part | LineKind::Quit => {
             let (verb, reason) = reasoned(rest, if kind == LineKind::Part { " left" } else { " quit" })?;
             push(Part::Verb, &verb);
+            if let Some(c) = channel.filter(|_| kind == LineKind::Part) {
+                push(Part::Verb, " ");
+                push(Part::Channel, c);
+            }
             push(Part::Free, &reason);
         }
         LineKind::Nick => {
             let new = rest.strip_prefix(" is now known as ")?;
-            push(Part::Verb, if you { " are now known as " } else { " is now known as " });
+            push(Part::Verb, " is now known as ");
             push(Part::Nick, new);
         }
         LineKind::Kick => {
@@ -113,43 +125,55 @@ mod tests {
     use super::*;
     use Part::*;
 
-    fn parts(kind: LineKind, nick: &str, text: &str, own: bool) -> Vec<(Part, &'static str)> {
+    fn parts(kind: LineKind, nick: &str, text: &str, channel: Option<&str>) -> Vec<(Part, &'static str)> {
         let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
-        event_parts(kind, Some(nick), text, own).expect("parses").into_iter().map(|(p, s)| (p, leak(s))).collect()
+        event_parts(kind, Some(nick), text, channel).expect("parses").into_iter().map(|(p, s)| (p, leak(s))).collect()
     }
 
     #[test]
     fn membership_events() {
-        assert_eq!(parts(LineKind::Join, "erin", "erin joined", false), [(Nick, "erin"), (Verb, " joined")]);
-        assert_eq!(parts(LineKind::Join, "me", "me joined", true), [(You, "you"), (Verb, " joined")]);
-        assert_eq!(parts(LineKind::Part, "carol", "carol left (going offline)", false), [(Nick, "carol"), (Verb, " left"), (Free, " (going offline)")]);
-        assert_eq!(parts(LineKind::Part, "carol", "carol left", false), [(Nick, "carol"), (Verb, " left")]);
-        assert_eq!(parts(LineKind::Quit, "frank", "frank quit (Ping timeout: 240 seconds)", false)[2], (Free, " (Ping timeout: 240 seconds)"));
-        assert_eq!(parts(LineKind::Nick, "dave", "dave is now known as dave_away", false), [(Nick, "dave"), (Verb, " is now known as "), (Nick, "dave_away")]);
-        assert_eq!(parts(LineKind::Nick, "me", "me is now known as me2", true)[..2], [(You, "you"), (Verb, " are now known as ")]);
+        assert_eq!(parts(LineKind::Join, "erin", "erin joined", None), [(Nick, "erin"), (Verb, " joined")]);
+        // Ours read the same way, by nick.
+        assert_eq!(parts(LineKind::Join, "me", "me joined", None), [(Nick, "me"), (Verb, " joined")]);
+        assert_eq!(parts(LineKind::Part, "carol", "carol left (going offline)", None), [(Nick, "carol"), (Verb, " left"), (Free, " (going offline)")]);
+        assert_eq!(parts(LineKind::Part, "carol", "carol left", None), [(Nick, "carol"), (Verb, " left")]);
+        assert_eq!(parts(LineKind::Quit, "frank", "frank quit (Ping timeout: 240 seconds)", None)[2], (Free, " (Ping timeout: 240 seconds)"));
+        assert_eq!(parts(LineKind::Nick, "dave", "dave is now known as dave_away", None), [(Nick, "dave"), (Verb, " is now known as "), (Nick, "dave_away")]);
+        assert_eq!(parts(LineKind::Nick, "me", "me is now known as me2", None)[..2], [(Nick, "me"), (Verb, " is now known as ")]);
+    }
+
+    #[test]
+    fn joins_and_parts_name_the_channel() {
+        assert_eq!(parts(LineKind::Join, "me", "me joined", Some("#fresh")), [(Nick, "me"), (Verb, " joined"), (Verb, " "), (Channel, "#fresh")]);
+        assert_eq!(
+            parts(LineKind::Part, "carol", "carol left (bye)", Some("#a")),
+            [(Nick, "carol"), (Verb, " left"), (Verb, " "), (Channel, "#a"), (Free, " (bye)")]
+        );
+        // A quit is network-wide: no channel.
+        assert_eq!(parts(LineKind::Quit, "frank", "frank quit", Some("#a")), [(Nick, "frank"), (Verb, " quit")]);
     }
 
     #[test]
     fn state_events() {
         assert_eq!(
-            parts(LineKind::Kick, "bob", "bob kicked dave_away (afk too long)", false),
+            parts(LineKind::Kick, "bob", "bob kicked dave_away (afk too long)", None),
             [(Nick, "bob"), (Verb, " kicked "), (Nick, "dave_away"), (Free, " (afk too long)")]
         );
-        assert_eq!(parts(LineKind::Kick, "bob", "bob kicked dave", false), [(Nick, "bob"), (Verb, " kicked "), (Nick, "dave")]);
+        assert_eq!(parts(LineKind::Kick, "bob", "bob kicked dave", None), [(Nick, "bob"), (Verb, " kicked "), (Nick, "dave")]);
         assert_eq!(
-            parts(LineKind::Topic, "bob", "bob changed the topic to: a (b) c", false),
+            parts(LineKind::Topic, "bob", "bob changed the topic to: a (b) c", None),
             [(Nick, "bob"), (Verb, " changed the topic to: "), (Free, "a (b) c")]
         );
         // Mode lines for user modes are `own` without being ours to word.
-        assert_eq!(parts(LineKind::Mode, "srv", "srv set mode +i", true), [(Nick, "srv"), (Verb, " set mode "), (Free, "+i")]);
+        assert_eq!(parts(LineKind::Mode, "srv", "srv set mode +i", None), [(Nick, "srv"), (Verb, " set mode "), (Free, "+i")]);
     }
 
     #[test]
     fn unexpected_text_is_shown_whole() {
-        assert_eq!(event_parts(LineKind::Join, Some("erin"), "someone joined", false), None);
-        assert_eq!(event_parts(LineKind::Part, Some("c"), "c left early", false), None);
-        assert_eq!(event_parts(LineKind::Privmsg, Some("a"), "a hi", false), None);
-        assert_eq!(event_parts(LineKind::Join, None, "joined", false), None);
+        assert_eq!(event_parts(LineKind::Join, Some("erin"), "someone joined", None), None);
+        assert_eq!(event_parts(LineKind::Part, Some("c"), "c left early", None), None);
+        assert_eq!(event_parts(LineKind::Privmsg, Some("a"), "a hi", None), None);
+        assert_eq!(event_parts(LineKind::Join, None, "joined", None), None);
     }
 
     #[test]

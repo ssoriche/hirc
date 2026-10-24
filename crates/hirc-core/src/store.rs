@@ -76,7 +76,7 @@ pub struct Network {
     pub buffers: Vec<Buffer>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Applied {
     Nothing,
     /// Something besides a line changed (status, topic, a new buffer).
@@ -85,6 +85,12 @@ pub enum Applied {
         network: usize,
         buffer: usize,
         index: usize,
+    },
+    /// The same line went into several buffers of one network: each
+    /// `(buffer, index)`.
+    Lines {
+        network: usize,
+        at: Vec<(usize, usize)>,
     },
 }
 
@@ -131,24 +137,28 @@ impl Store {
         match ev {
             Event::Status { network, status } => {
                 let n = self.network_ix(&network);
-                let reason = match &status {
-                    ConnStatus::Connected { nick } => {
-                        self.networks[n].nick = Some(nick.clone());
-                        None
+                if let ConnStatus::Connected { nick } = &status {
+                    self.networks[n].nick = Some(nick.clone());
+                }
+                let said = status_line(&network, &status);
+                // Said where the user may be looking: the server buffer, every
+                // channel we were in and every query (irssi does the same).
+                let to: Vec<usize> = match said {
+                    Some(_) => {
+                        let bufs = &self.networks[n].buffers;
+                        (0..bufs.len()).filter(|&b| b == 0 || bufs[b].joined || matches!(bufs[b].target, Target::Query(_))).collect()
                     }
-                    ConnStatus::Disconnected { reason } => Some(format!("Disconnected: {reason}")),
-                    ConnStatus::Failed { reason } => Some(format!("Stopped: {reason}. Use /reconnect to try again.")),
-                    _ => None,
+                    None => Vec::new(),
                 };
-                if matches!(status, ConnStatus::Connecting | ConnStatus::Disconnected { .. } | ConnStatus::Failed { .. }) {
+                if matches!(status, ConnStatus::Connecting) || status.is_down() {
                     // The server forgets our channels with the connection.
                     for b in &mut self.networks[n].buffers {
                         b.joined = false;
                     }
                 }
                 self.networks[n].status = status;
-                match reason {
-                    Some(text) => Applied::Line { network: n, buffer: 0, index: self.push_local(n, 0, LineKind::Error, text) },
+                match said {
+                    Some((kind, text)) => Applied::Lines { network: n, at: to.into_iter().map(|b| (b, self.push_local(n, b, kind, text.clone()))).collect() },
                     None => Applied::Changed,
                 }
             }
@@ -188,6 +198,20 @@ impl Store {
         let b = self.buffer_ix(n, &Target::Channel(channel));
         self.networks[n].buffers[b].joined = joined;
         Applied::Changed
+    }
+}
+
+/// What a change of connection state says, and how loud: a fault is an
+/// error, a quit the user chose is a plain status line. Each says what
+/// happens next and how to act on it.
+pub fn status_line(network: &str, status: &ConnStatus) -> Option<(LineKind, String)> {
+    match status {
+        ConnStatus::Disconnected { reason, retry } => {
+            Some((LineKind::Error, format!("Disconnected from {network}: {reason}. Reconnecting in {}s — /reconnect to retry now", retry.as_secs().max(1))))
+        }
+        ConnStatus::Failed { reason } => Some((LineKind::Error, format!("Disconnected from {network}: {reason}. Not retrying — /reconnect to try again"))),
+        ConnStatus::Offline => Some((LineKind::Server, format!("Disconnected from {network} — /reconnect to connect again"))),
+        _ => None,
     }
 }
 
@@ -253,7 +277,7 @@ mod tests {
     fn disconnect_reason_lands_in_server_buffer() {
         let mut s = Store::new(["net".to_string()]);
         let applied = s.apply(Event::Status { network: "net".into(), status: ConnStatus::Failed { reason: "SASL failed".into() } });
-        assert_eq!(applied, Applied::Line { network: 0, buffer: 0, index: 0 });
+        assert_eq!(applied, Applied::Lines { network: 0, at: vec![(0, 0)] });
         assert_eq!(s.networks[0].buffers[0].lines[0].kind, LineKind::Error);
         assert!(s.networks[0].buffers[0].lines[0].text.contains("SASL failed"));
     }
@@ -263,7 +287,30 @@ mod tests {
         let mut s = Store::new(["net".to_string()]);
         s.apply(Event::Joined { network: "net".into(), channel: "#a".into() });
         assert!(s.networks[0].buffers[1].joined);
-        s.apply(Event::Status { network: "net".into(), status: ConnStatus::Disconnected { reason: "x".into() } });
+        s.apply(Event::Status { network: "net".into(), status: ConnStatus::Disconnected { reason: "x".into(), retry: std::time::Duration::from_secs(2) } });
         assert!(!s.networks[0].buffers[1].joined);
+    }
+
+    #[test]
+    fn a_drop_is_said_in_every_buffer_we_were_using() {
+        let mut s = Store::new(["net".to_string()]);
+        s.apply(Event::Joined { network: "net".into(), channel: "#in".into() });
+        s.apply(Event::Joined { network: "net".into(), channel: "#out".into() });
+        s.apply(Event::Parted { network: "net".into(), channel: "#out".into() });
+        s.buffer_ix(0, &Target::Query("bob".into()));
+        let applied =
+            s.apply(Event::Status { network: "net".into(), status: ConnStatus::Disconnected { reason: "x".into(), retry: std::time::Duration::from_secs(2) } });
+        // Server, #in and the query; not #out, which we had left.
+        assert_eq!(applied, Applied::Lines { network: 0, at: vec![(0, 0), (1, 0), (3, 0)] });
+        assert_eq!(s.networks[0].buffers[1].lines[0].text, "Disconnected from net: x. Reconnecting in 2s — /reconnect to retry now");
+    }
+
+    #[test]
+    fn a_quit_is_not_an_error() {
+        let (kind, text) = status_line("net", &ConnStatus::Offline).unwrap();
+        assert_eq!((kind, text.as_str()), (LineKind::Server, "Disconnected from net — /reconnect to connect again"));
+        let (kind, _) = status_line("net", &ConnStatus::Failed { reason: "SASL failed".into() }).unwrap();
+        assert_eq!(kind, LineKind::Error);
+        assert_eq!(status_line("net", &ConnStatus::Connecting), None);
     }
 }

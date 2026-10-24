@@ -16,8 +16,10 @@ use std::collections::{HashMap, HashSet};
 pub enum Output {
     Send(Message),
     Event(Event),
-    /// Close and don't reconnect until the user asks (bad password, /quit).
+    /// Close and don't reconnect until the user asks (bad password).
     Stop(String),
+    /// The user quit: close and don't reconnect until they ask.
+    Quit,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -85,6 +87,8 @@ pub struct Session {
     seq: u64,
     /// SASL finished (903/907) on this connection.
     authed: bool,
+    /// The server's `ERROR` text: why it is about to close the connection.
+    closing: Option<String>,
 }
 
 fn send<I, S>(command: &str, params: I) -> Output
@@ -112,7 +116,14 @@ impl Session {
             members: HashMap::new(),
             seq: 0,
             authed: false,
+            closing: None,
         }
+    }
+
+    /// Why the server said it is closing the connection (its `ERROR`),
+    /// the reason to show once the socket closes.
+    pub fn closing(&self) -> Option<&str> {
+        self.closing.as_deref()
     }
 
     pub fn caps(&self) -> &Caps {
@@ -177,10 +188,9 @@ impl Session {
             }
             "353" => self.on_names(&msg),
             "MODE" => self.on_mode(&msg, now, &mut out),
-            "ERROR" => {
-                let line = self.line(&msg, now, LineKind::Error, None, last(&msg).to_owned(), false);
-                out.push(self.event_line(Target::Server, line));
-            }
+            // No line of its own: the close follows, and its status line
+            // gives this text as the reason.
+            "ERROR" => self.closing = Some(last(&msg).to_owned()).filter(|t| !t.is_empty()),
             "BATCH" | "TAGMSG" | "366" => {}
             c if c.len() == 3 && c.bytes().all(|b| b.is_ascii_digit()) => {
                 let text = msg.params.get(1..).unwrap_or_default().join(" ");
@@ -478,7 +488,7 @@ impl Session {
                 }
             },
             Command::Disconnect { reason, .. } => {
-                vec![send("QUIT", reason.into_iter().collect::<Vec<_>>()), Output::Stop("disconnected".into())]
+                vec![send("QUIT", reason.into_iter().collect::<Vec<_>>()), Output::Quit]
             }
             Command::Reconnect { .. } => Vec::new(),
         }
@@ -814,8 +824,9 @@ mod tests {
         let mut s = registered(ECHO);
         let (t, l) = lines(&feed(&mut s, ":srv 372 alice :- MOTD line")).remove(0);
         assert_eq!((t, l.kind, l.text.as_str()), (Target::Server, LineKind::Server, "- MOTD line"));
-        let (_, l) = lines(&feed(&mut s, "ERROR :Closing link")).remove(0);
-        assert_eq!(l.kind, LineKind::Error);
+        // ERROR is kept as the reason for the close that follows.
+        assert!(lines(&feed(&mut s, "ERROR :Closing link")).is_empty());
+        assert_eq!(s.closing(), Some("Closing link"));
     }
 
     #[test]
@@ -830,7 +841,7 @@ mod tests {
         assert_eq!(lines(&bad)[0].1.kind, LineKind::Error);
         let out = s.command(Command::Disconnect { network: n(), reason: Some("bye".into()) }, now());
         assert_eq!(sent(&out), ["QUIT bye"]);
-        assert!(out.iter().any(|o| matches!(o, Output::Stop(_))));
+        assert!(out.contains(&Output::Quit), "a quit is not a failure: {out:?}");
     }
 
     #[test]
