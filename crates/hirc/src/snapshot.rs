@@ -103,6 +103,9 @@ pub struct FixtureServer {
     pub echo_message: bool,
     #[serde(default)]
     pub lines: Vec<String>,
+    /// As the config's `bridges`.
+    #[serde(default)]
+    pub bridges: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -174,7 +177,7 @@ pub fn parse_flag(s: &str) -> bool {
 }
 
 fn session_config(s: &FixtureServer) -> SessionConfig {
-    SessionConfig { nickname: s.nick.clone(), username: s.nick.clone(), realname: s.nick.clone(), ..Default::default() }
+    SessionConfig { nickname: s.nick.clone(), username: s.nick.clone(), realname: s.nick.clone(), bridges: s.bridges.clone(), ..Default::default() }
 }
 
 /// Hand one server line to the session, as conn.rs's read loop does, and
@@ -410,7 +413,12 @@ impl Plan {
             .fixture
             .server
             .iter()
-            .map(|s| (s.name.clone(), Server { nickname: s.nick.clone(), server: "fixture.invalid".into(), use_tls: false, ..Default::default() }))
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    Server { nickname: s.nick.clone(), server: "fixture.invalid".into(), use_tls: false, bridges: s.bridges.clone(), ..Default::default() },
+                )
+            })
             .collect();
     }
 
@@ -799,6 +807,21 @@ mod tests {
             _ => None,
         });
         assert!(t.unwrap() > base);
+    }
+
+    #[test]
+    fn a_fixture_bridge_relays_its_authors() {
+        let fx = parse_fixture(DEMO).unwrap();
+        let (events, _) = feed(&fx).unwrap();
+        let said: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Line { network, line, .. } if network == "other" => Some((line.nick.clone().unwrap_or_default(), line.text.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(said.contains(&("jonas".into(), "ivy: incremental builds help a lot".into())), "{said:?}");
+        assert!(said.contains(&("IrcBot".into(), "Relay reconnected".into())), "{said:?}");
     }
 
     #[test]

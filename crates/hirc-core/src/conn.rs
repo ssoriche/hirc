@@ -166,6 +166,7 @@ fn session_config(s: &Server) -> Result<SessionConfig, ConfigError> {
         password: config::secret(s.password.as_deref(), s.password_file.as_deref(), s.password_command.as_deref())?,
         sasl,
         channels: s.channels.clone(),
+        bridges: s.bridges.clone(),
     })
 }
 

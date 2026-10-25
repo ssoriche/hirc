@@ -68,12 +68,20 @@ lines = [
 [[server]]
 name = "other"
 nick = "me"
+# A relay bot (a Discord bridge) whose `<name> text` lines read as name's.
+bridges = ["IrcBot"]
 lines = [
   ":irc.other 001 me :Welcome to the Other network",
   ":me!u@h JOIN #rust",
   ":irc.other 332 me #rust :Fearless concurrency | be excellent to each other",
-  ":irc.other 353 me = #rust :me @gina henry",
+  ":irc.other 353 me = #rust :me @gina henry IrcBot",
   ":irc.other 366 me #rust :End of /NAMES list.",
   ":gina!g@h PRIVMSG #rust :the borrow checker is not your enemy",
   ":henry!h@h PRIVMSG #rust :tell that to my lifetimes",
+  ":IrcBot!bot@relay PRIVMSG #rust :<ivy> the only drawback is the compile times",
+  ":IrcBot!bot@relay PRIVMSG #rust :<jo\u200Bnas> ivy: incremental builds help a lot",
+  ":IrcBot!bot@relay PRIVMSG #rust :* ivy nods slowly",
+  ":IrcBot!bot@relay PRIVMSG #rust :<a_rather_long_discord_name> long names are cut like any other",
+  ":IrcBot!bot@relay PRIVMSG #rust :<ivy> me: are you coming to the meetup?",
+  ":IrcBot!bot@relay PRIVMSG #rust :Relay reconnected",
 ]

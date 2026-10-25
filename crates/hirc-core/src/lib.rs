@@ -2,6 +2,7 @@
 //! state machines, the message store and config loading. No UI types here,
 //! so it builds and tests without gpui.
 
+pub mod bridge;
 pub mod caps;
 pub mod command;
 pub mod config;

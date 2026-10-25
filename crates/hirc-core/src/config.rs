@@ -56,6 +56,9 @@ pub struct Server {
     pub channels: Vec<String>,
     pub chathistory: bool,
     pub sasl: Option<Sasl>,
+    /// Relay bots (a Discord bridge, say) whose `<name> text` lines read
+    /// as `name`'s own. hirc's key; Halloy ignores it.
+    pub bridges: Vec<String>,
 }
 
 impl Default for Server {
@@ -75,6 +78,7 @@ impl Default for Server {
             channels: Vec::new(),
             chathistory: true,
             sasl: None,
+            bridges: Vec::new(),
         }
     }
 }
@@ -307,6 +311,13 @@ password_command = "printf hunter22"
     fn plaintext_default_port() {
         let c: Config = toml::from_str("[servers.x]\nnickname='n'\nserver='localhost'\nuse_tls=false\n").unwrap();
         assert_eq!(c.servers["x"].port(), 6667);
+    }
+
+    #[test]
+    fn bridges_are_listed_per_server_and_default_to_none() {
+        let c: Config = toml::from_str("[servers.x]\nnickname='n'\nserver='h'\nbridges=['IrcBot']\n[servers.y]\nnickname='n'\nserver='h'\n").unwrap();
+        assert_eq!(c.servers["x"].bridges, ["IrcBot"]);
+        assert!(c.servers["y"].bridges.is_empty());
     }
 
     #[test]

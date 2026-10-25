@@ -8,7 +8,7 @@ use crate::event::{Command, ConnStatus, Event, PeerChange, Target};
 use crate::isupport::Isupport;
 use crate::proto::Message;
 use crate::store::{Delivery, Line, LineKind};
-use crate::{sasl, split};
+use crate::{bridge, sasl, split};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
@@ -39,6 +39,8 @@ pub struct SessionConfig {
     pub sasl: Option<SaslPlain>,
     /// `"#chan"` or `"#chan key"`.
     pub channels: Vec<String>,
+    /// Relay bots whose lines are unwrapped to their authors (`bridge`).
+    pub bridges: Vec<String>,
 }
 
 impl std::fmt::Debug for SaslPlain {
@@ -58,6 +60,7 @@ impl std::fmt::Debug for SessionConfig {
             .field("password", &password)
             .field("sasl", &self.sasl)
             .field("channels", &self.channels)
+            .field("bridges", &self.bridges)
             .finish()
     }
 }
@@ -388,8 +391,18 @@ impl Session {
         if from_user && !own {
             out.push(self.seen(msg, from));
         }
-        let nick = from_user.then_some(from);
-        let line = self.line(msg, now, kind, nick, text.to_owned(), own);
+        let mut nick = from_user.then(|| from.to_owned());
+        // A relay bot's `<name> text` reads as `name`'s own line; the bot's
+        // own words and actions stay its.
+        if from_user
+            && !own
+            && kind == LineKind::Privmsg
+            && bridge::is_bridge(&self.cfg.bridges, from)
+            && let Some((relayed, name, rest)) = bridge::unwrap(text)
+        {
+            (kind, nick, text) = (relayed, Some(name), rest);
+        }
+        let line = self.line(msg, now, kind, nick.as_deref(), text.to_owned(), own);
         out.push(self.event_line(target, line));
     }
 
@@ -583,6 +596,7 @@ mod tests {
             password: None,
             sasl: None,
             channels: vec!["#test".into()],
+            bridges: vec![],
         }
     }
 
@@ -777,6 +791,32 @@ mod tests {
         assert_eq!((t, l.own), (Target::Query("bob".into()), false));
         let (t, l) = lines(&feed(&mut s, ":alice!a@h PRIVMSG bob :hey")).remove(0);
         assert_eq!((t, l.own), (Target::Query("bob".into()), true));
+    }
+
+    #[test]
+    fn a_bridge_relays_lines_as_their_authors() {
+        let mut s = registered(ECHO);
+        s.cfg.bridges = vec!["IrcBot".into()];
+        let said = |s: &mut Session, line: &str| {
+            let (t, l) = lines(&feed(s, line)).remove(0);
+            (t, l.kind, l.nick.unwrap_or_default(), l.text)
+        };
+        let chan = Target::Channel("#test".into());
+        // Listed (in any case): the relayed name and text, zero-width gone.
+        let got = said(&mut s, ":ircbot!b@h PRIVMSG #test :<ha\u{200B}cker> The only drawback");
+        assert_eq!(got, (chan.clone(), LineKind::Privmsg, "hacker".into(), "The only drawback".into()));
+        let got = said(&mut s, ":IrcBot!b@h PRIVMSG #test :* hacker waves");
+        assert_eq!(got, (chan.clone(), LineKind::Action, "hacker".into(), "waves".into()));
+        // The bot's own words and its own CTCP ACTION stay its.
+        let got = said(&mut s, ":IrcBot!b@h PRIVMSG #test :Bridge restarted");
+        assert_eq!(got, (chan.clone(), LineKind::Privmsg, "IrcBot".into(), "Bridge restarted".into()));
+        let got = said(&mut s, ":IrcBot!b@h PRIVMSG #test :\x01ACTION <hacker> waves\x01");
+        assert_eq!(got, (chan.clone(), LineKind::Action, "IrcBot".into(), "<hacker> waves".into()));
+        // An unlisted nick is never unwrapped.
+        let got = said(&mut s, ":OtherBot!b@h PRIVMSG #test :<hacker> hi");
+        assert_eq!(got, (chan.clone(), LineKind::Privmsg, "OtherBot".into(), "<hacker> hi".into()));
+        // The bot itself is still the peer seen.
+        assert_eq!(peers(&feed(&mut s, ":IrcBot!b@h PRIVMSG #test :<hacker> x"))[0].0, "IrcBot");
     }
 
     #[test]
