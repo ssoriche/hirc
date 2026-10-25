@@ -388,7 +388,7 @@ impl Element for TextElement {
         let m = input.metrics.unwrap_or_else(|| Metrics::new(f32::from(font_size), Shape::FALLBACK));
         let text = style.color;
         let (bg, dim, hint, selection_bg) = match &input.palette {
-            Some(p) => (p.input_bg, p.text_dim, p.timestamp, p.selection),
+            Some(p) => (p.input_bg, p.text_dim, p.hint, p.selection),
             None => (gpui::transparent_black(), text.opacity(0.6), text.opacity(0.4), text.opacity(0.25)),
         };
         let hidden = input.hidden();
@@ -399,14 +399,16 @@ impl Element for TextElement {
         let normal = input.vim.mode == Mode::Normal;
         let prev_scroll = input.scroll_x;
 
-        // Colours over the line: a recognised `/command` recedes, marked
+        // Colours over the line: a recognised `/command` takes the code
+        // colour (so a typo, left in text, shows before Enter), marked
         // (IME) text is underlined, and the Normal block's glyph is drawn
         // in the background colour, as a terminal's reverse video.
+        let code = input.palette.as_ref().map_or(dim, |p| p.code);
         let mut over = Vec::new();
         if input.vim.mode != Mode::Ex
             && let Some(cmd) = command::leading(&shown)
         {
-            over.push((0..cmd.len() + 1, (dim, false)));
+            over.push((0..cmd.len() + 1, (code, false)));
         }
         if let Some(marked) = &input.marked_range {
             over.push((shift(marked.start)..shift(marked.end), (text, true)));
@@ -430,8 +432,8 @@ impl Element for TextElement {
             window.text_system().shape_line(s, font_size, &[run], None)
         };
         // The placeholder starts on the text column, where typing will:
-        // the bar sits over its first cell, and under the Normal block its
-        // first glyph is reversed, as typed text would be.
+        // the bar sits in the gap before it, as before any glyph, and under
+        // the Normal block its first glyph is reversed, as typed text's is.
         let under_block = normal && input.focus_handle.is_focused(window);
         let placeholder = (input.content.is_empty() && !input.placeholder.is_empty()).then(|| {
             let first = if under_block { next_char_boundary(&input.placeholder, 0) } else { 0 };
@@ -445,10 +447,14 @@ impl Element for TextElement {
         let line = window.text_system().shape_line(shown.clone(), font_size, &runs, None);
 
         // Keep the cursor two cells clear of each edge, so the `…` marks
-        // never cover it; at the end, leave room for the bar.
+        // never cover it; at the end, leave room for the bar. Scrolled, the
+        // first glyph after the leading `…` starts where its cell ends, so
+        // no sliver of a cut glyph shows between them.
         let view = f32::from(bounds.size.width);
         let margin = 2. * m.cell + 2. * m.caret;
-        let scroll_x = px(scroll_for_cursor(f32::from(prev_scroll), f32::from(line.x_for_index(cursor)), f32::from(line.width), view, margin, 2. * m.caret));
+        let edges: Vec<f32> = shown.char_indices().map(|(i, _)| i).chain([shown.len()]).map(|i| f32::from(line.x_for_index(i))).collect();
+        let scroll_x = scroll_for_cursor(f32::from(prev_scroll), f32::from(line.x_for_index(cursor)), f32::from(line.width), view, margin, 2. * m.caret);
+        let scroll_x = px(snap_scroll(scroll_x, &edges, m.cell));
         let origin_x = bounds.left() - scroll_x;
         let cursor_pos = line.x_for_index(cursor);
         let glyph_top = bounds.top() + px(m.glyph_top);
@@ -466,20 +472,29 @@ impl Element for TextElement {
             let width = if end > cursor_pos { end - cursor_pos } else { px(m.cell) };
             block = Some(fill(Bounds::new(point(origin_x + cursor_pos, glyph_top), size(width, px(m.glyph))), text));
         } else {
-            // Half a bar clear of the glyph before it.
-            let x = origin_x + cursor_pos + px((m.caret / 2.).ceil());
+            // A bar's width clear of the glyph beside it: after the glyph
+            // before it, or, at the start of an Insert line (where there is
+            // none, and the placeholder's first glyph may follow), before
+            // the text column, in the cell's gap after the mode label. The
+            // ex line's `:` is that glyph before it, flush to the column.
+            let gap = px(m.caret);
+            let x = if cursor == 0 && input.vim.mode == Mode::Insert { origin_x - gap - px(m.caret) } else { origin_x + cursor_pos + gap };
             caret = Some(fill(Bounds::new(point(x, glyph_top), size(px(m.caret), px(m.glyph))), text));
         }
 
+        // The `…` marks cover whole glyphs only: the leading one its cell
+        // (the scroll is snapped to it), the trailing one from the end of
+        // the last glyph that fits before a cell's room.
         let mut marks = Vec::new();
-        let cell = px(m.cell);
         if scroll_x > px(0.5) {
-            marks.push((bounds.left(), shape("…".into(), dim)));
+            marks.push((bounds.left(), px(m.cell)));
         }
         if line.width - scroll_x > bounds.size.width + px(0.5) {
-            marks.push((bounds.right() - cell, shape("…".into(), dim)));
+            let from = trailing_mark(&edges, f32::from(scroll_x), view, m.cell);
+            marks.push((bounds.left() + px(from), bounds.size.width - px(from)));
         }
-        let marks = marks.into_iter().map(|(x, l)| (fill(Bounds::new(point(x, bounds.top()), size(cell, bounds.size.height)), bg), x, l)).collect();
+        let marks =
+            marks.into_iter().map(|(x, w)| (fill(Bounds::new(point(x, bounds.top()), size(w, bounds.size.height)), bg), x, shape("…".into(), dim))).collect();
         self.input.update(cx, |input, _cx| input.scroll_x = scroll_x);
         PrepaintState { line: Some(line), placeholder, block, caret, scroll_x, selection, marks }
     }
@@ -523,10 +538,12 @@ impl Element for TextElement {
                     tracing::debug!("input paint failed: {e}");
                 }
             }
-            if let Some(caret) = caret {
-                window.paint_quad(caret);
-            }
         });
+        // Outside the mask: at the line's start the bar sits in the gap
+        // just before the text column (the cursor is never scrolled out).
+        if let Some(caret) = caret {
+            window.paint_quad(caret);
+        }
 
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
@@ -800,6 +817,23 @@ fn spans<C: std::marker::Copy + PartialEq>(len: usize, base: C, over: &[(Range<u
     out
 }
 
+/// `scroll` moved on to the next glyph edge (of `edges`, ascending) that
+/// puts a glyph's start exactly `cell` from the view's left, where the
+/// leading `…` mark ends; no scroll stays none.
+fn snap_scroll(scroll: f32, edges: &[f32], cell: f32) -> f32 {
+    if scroll <= 0.5 {
+        return 0.;
+    }
+    edges.iter().map(|x| x - cell).find(|s| *s >= scroll - 0.01).unwrap_or(scroll).max(0.)
+}
+
+/// Where the trailing `…` mark starts (from the view's left), at the end
+/// of the last glyph (of `edges`) that ends at least `cell` short of the
+/// `view`'s right edge, scrolled by `scroll`.
+fn trailing_mark(edges: &[f32], scroll: f32, view: f32, cell: f32) -> f32 {
+    edges.iter().rev().map(|x| x - scroll).find(|x| *x <= view - cell + 0.01).unwrap_or(view - cell).max(0.)
+}
+
 /// Horizontal scroll offset that keeps the cursor inside a `view`-wide window
 /// onto a `line_width`-wide line. Moves `prev` only when the cursor would leave
 /// the visible span, leaving `margin` of context, and never scrolls past the
@@ -823,6 +857,29 @@ mod tests {
     const VIEW: f32 = 100.;
     const MARGIN: f32 = 20.;
     const CURSOR_ALLOWANCE: f32 = 2.;
+
+    #[test]
+    fn a_scrolled_line_starts_on_a_whole_glyph_after_the_mark() {
+        // A monospace line, 10px a glyph; the mark is one 10px cell.
+        let edges: Vec<f32> = (0..=20).map(|i| i as f32 * 10.).collect();
+        assert_eq!(snap_scroll(0., &edges, 10.), 0.);
+        assert_eq!(snap_scroll(0.4, &edges, 10.), 0.);
+        // Off the grid: on to the next glyph, which starts at the mark's end.
+        assert_eq!(snap_scroll(33.7, &edges, 10.), 40.);
+        assert_eq!(snap_scroll(40., &edges, 10.), 40.);
+        // A proportional face: the next edge, whatever its width.
+        let edges = [0., 7., 19., 24., 40.];
+        assert_eq!(snap_scroll(5., &edges, 10.), 9.);
+        assert_eq!(snap_scroll(10., &edges, 10.), 14.);
+    }
+
+    #[test]
+    fn the_trailing_mark_starts_after_the_last_whole_glyph() {
+        let edges: Vec<f32> = (0..=20).map(|i| i as f32 * 10.).collect();
+        // A 95px view scrolled 40: glyph edges at 0, 10 … 80 fit before 85.
+        assert_eq!(trailing_mark(&edges, 40., 95., 10.), 80.);
+        assert_eq!(trailing_mark(&edges, 40., 100., 10.), 90.);
+    }
 
     #[test]
     fn scroll_is_zero_when_line_fits() {

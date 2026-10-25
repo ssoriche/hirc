@@ -375,11 +375,11 @@ impl HircApp {
         }
     }
 
-    /// Rows below the view: the `j` presses back to the newest line.
-    fn rows_below(&self) -> usize {
-        let max = f32::from(self.lines.max_offset_for_scrollbar().y);
-        let cur = -f32::from(self.lines.scroll_px_offset_for_scrollbar().y);
-        scroll::rows_between(cur, max, self.metrics.line)
+    /// Lines (messages and events) below the view, or cut by its bottom.
+    fn lines_below(&self) -> usize {
+        let top = self.lines.logical_scroll_top().item_ix;
+        let bottoms: Vec<Option<f32>> = (top..self.lines.item_count()).map(|ix| self.lines.bounds_for_item(ix).map(|b| f32::from(b.bottom()))).collect();
+        scroll::hidden_below(&bottoms, f32::from(self.lines.viewport_bounds().bottom()))
     }
 
     /// While scrolled, the message whose wrapped tail is the top row (its
@@ -550,7 +550,8 @@ impl HircApp {
     }
 
     /// Hand out nick colours in the selected buffer (`theme::slots`), in
-    /// the order people first appear, again whenever its lines change.
+    /// the order people first appear and apart from whoever they are seen
+    /// next to, again whenever its lines change.
     fn refresh_nick_slots(&mut self) {
         let Some((n, b)) = self.selected else { return };
         let Some(buf) = self.store.networks.get(n).and_then(|net| net.buffers.get(b)) else { return };
@@ -559,16 +560,19 @@ impl HircApp {
         }
         let me = self.store.networks[n].nick.as_deref();
         let channel = buf.target.name();
-        let nicks = buf.lines.iter().flat_map(|line| {
-            let parts = display::event_parts(line.kind, line.nick.as_deref(), &line.text, channel);
-            let named: Vec<String> = match parts {
-                Some(parts) => parts.into_iter().filter(|(part, _)| *part == display::Part::Nick).map(|(_, s)| s).collect(),
-                None => line.nick.iter().cloned().collect(),
-            };
-            named
-        });
-        let nicks: Vec<String> = nicks.filter(|nick| !me.is_some_and(|me| me.eq_ignore_ascii_case(nick))).collect();
-        let slots = theme::slots(nicks.iter().map(String::as_str), self.palette.nicks.len());
+        // The other people each line names, in order.
+        let lines: Vec<Vec<String>> = buf
+            .lines
+            .iter()
+            .map(|line| {
+                let named: Vec<String> = match display::event_parts(line.kind, line.nick.as_deref(), &line.text, channel) {
+                    Some(parts) => parts.into_iter().filter(|(part, _)| *part == display::Part::Nick).map(|(_, s)| s).collect(),
+                    None => line.nick.iter().cloned().collect(),
+                };
+                named.into_iter().filter(|nick| !nick.is_empty() && !me.is_some_and(|me| me.eq_ignore_ascii_case(nick))).collect()
+            })
+            .collect();
+        let slots = theme::slots(&lines, self.palette.nicks.len(), self.palette.nick_hues);
         self.nick_slots.insert((n, b), (buf.lines.len(), slots));
     }
 
@@ -630,7 +634,7 @@ impl Render for HircApp {
         // While scrolled, the `-- more --` line takes the bottom row of its
         // own (it never covers a line), and a wrapped tail at the top shows
         // whose message it is.
-        let more = (!following).then(|| buffer::more(self, self.rows_below(), at_top, self.fresh_below));
+        let more = (!following).then(|| buffer::more(self, self.lines_below(), at_top, self.fresh_below));
         let sticky = (!following)
             .then(|| self.cut_head())
             .flatten()

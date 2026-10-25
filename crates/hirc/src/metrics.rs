@@ -51,6 +51,10 @@ const NICK_MIN_CELLS: usize = 3;
 const NICK_MAX_CELLS: usize = 12;
 /// The nick column never takes more than this share of the message view.
 const NICK_MAX_SHARE: f32 = 0.2;
+/// Cells the text keeps before the nick column gives up its own, down to
+/// `NICK_NARROW_CELLS` (most nicks still fit; longer ones end in `…`).
+const TEXT_MIN_CELLS: usize = 40;
+const NICK_NARROW_CELLS: usize = 8;
 
 /// A label always keeps at least this many cells before tags give way.
 const LABEL_MIN_CELLS: f32 = 6.;
@@ -80,7 +84,7 @@ pub struct Metrics {
     pub glyph_top: f32,
     pub glyph: f32,
     /// Width of the insert cursor (a bar), and its clearance from the
-    /// glyph before it.
+    /// glyph beside it: a hairline that grows with the font.
     pub caret: f32,
 }
 
@@ -105,7 +109,7 @@ impl Metrics {
             edge: (size * 0.5).round(),
             glyph_top,
             glyph: glyph_bottom - glyph_top,
-            caret: (size / 7.).round().max(1.),
+            caret: (size / 14.).round().max(1.),
         }
     }
 
@@ -167,11 +171,14 @@ impl Metrics {
     /// Cells in the message view's nick column for a view `view_width`
     /// wide. The same in every buffer (longer nicks end in an ellipsis), so
     /// the text column and the input line never move when you switch
-    /// windows; narrower in a narrow window so the text keeps most of the
-    /// line.
+    /// windows; narrower in a narrow window, where the text keeps
+    /// `TEXT_MIN_CELLS` while the nicks can give way (to
+    /// `NICK_NARROW_CELLS`), and never more than a share of the view.
     pub fn nick_cells(&self, view_width: f32) -> usize {
         let share = ((view_width * NICK_MAX_SHARE) / self.cell).floor() as usize;
-        NICK_MAX_CELLS.min(share.max(NICK_MIN_CELLS))
+        let cells = ((view_width - 2. * self.gutter) / self.cell).floor().max(0.) as usize;
+        let room = cells.saturating_sub(TIME_CELLS + 2 + TEXT_MIN_CELLS);
+        NICK_MAX_CELLS.min(room.max(NICK_NARROW_CELLS)).min(share.max(NICK_MIN_CELLS))
     }
 
     /// The least a row label keeps when space runs out.
@@ -257,9 +264,17 @@ mod tests {
     fn nick_column_fits_within_limits() {
         let m = menlo(14.);
         assert_eq!(m.nick_cells(1000.), NICK_MAX_CELLS);
-        // A narrow view gives the nick at most a fifth of its width.
-        assert_eq!(m.nick_cells(400.), (400. * NICK_MAX_SHARE / m.cell) as usize);
+        // A very narrow view gives the nick at most a fifth of its width.
+        assert_eq!(m.nick_cells(200.), (200. * NICK_MAX_SHARE / m.cell) as usize);
         assert_eq!(m.nick_cells(10.), NICK_MIN_CELLS);
+        // The review's 640 window (a 481px view): the nicks give way so
+        // the text keeps about 40 cells, but no further than 8.
+        let narrow = m.nick_cells(481.);
+        assert_eq!(narrow, NICK_NARROW_CELLS);
+        let text = ((481. - 2. * m.gutter) / m.cell).floor() as usize - TIME_CELLS - 2 - narrow;
+        assert!(text >= TEXT_MIN_CELLS - 1, "{text}");
+        // Room to spare: the full column.
+        assert_eq!(m.nick_cells(657.), NICK_MAX_CELLS);
     }
 
     #[test]
@@ -282,7 +297,7 @@ mod tests {
             assert!(m.glyph_top <= top + 1e-4 && m.glyph_top + m.glyph >= top + size * (0.928 + 0.236) - 1e-4, "{size}");
         }
         let m = menlo(14.);
-        assert_eq!((m.glyph_top, m.glyph, m.caret), (2., 17., 2.));
+        assert_eq!((m.glyph_top, m.glyph, m.caret), (2., 17., 1.));
         // Centred: as much clear space below the band as above.
         assert_eq!(m.line - m.glyph_top - m.glyph, m.glyph_top);
         assert!(menlo(28.).caret > menlo(14.).caret);

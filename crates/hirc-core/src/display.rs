@@ -32,12 +32,6 @@ pub fn marker(kind: LineKind) -> &'static str {
     }
 }
 
-/// Membership noise (joins, parts, quits, renames) as opposed to changes
-/// to the channel's state (kicks, topics, modes).
-pub fn is_noise(kind: LineKind) -> bool {
-    matches!(kind, LineKind::Join | LineKind::Part | LineKind::Quit | LineKind::Nick)
-}
-
 /// `text` as `session` worded it for an event of `kind` by `nick`, split
 /// into parts. Joins and parts name `channel` (the buffer's), so a line
 /// says where it happened wherever it is read. `None` when the text is not
@@ -183,7 +177,6 @@ mod tests {
         assert_eq!(marker(LineKind::Join), "-->");
         assert_eq!(marker(LineKind::Quit), "<--");
         assert_eq!(marker(LineKind::Topic), "--");
-        assert!(is_noise(LineKind::Nick) && !is_noise(LineKind::Kick));
     }
 
     #[test]

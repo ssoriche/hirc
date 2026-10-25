@@ -281,20 +281,24 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
             nick_run(&mut prefix, p, &fit_nick(cells), cx);
             body.push(&line.text, p.text, false);
         }
+        // A notice: irssi's `-nick-`, the dashes in the event colour so
+        // they read as a marker, and the text a step below conversation.
         LineKind::Notice if !nick.is_empty() => {
-            prefix.push("-", p.text_dim, false);
+            prefix.push("-", p.server, false);
             nick_run(&mut prefix, p, &fit_nick(cells.saturating_sub(2).max(1)), cx);
-            prefix.push("-", p.text_dim, false);
-            body.push(&line.text, p.text, false);
+            prefix.push("-", p.server, false);
+            body.push(&line.text, p.text_dim, false);
         }
         LineKind::Action => {
             prefix.push("*", p.action, false);
             nick_run(&mut body, p, nick, cx);
             body.push(" ", p.action, false).push(&line.text, p.action, false);
         }
+        // The marker carries the error, as arrows carry joins; the
+        // sentence is text, so red never covers a whole line.
         LineKind::Error => {
             prefix.push(display::marker(line.kind), p.error, false);
-            body.push(&line.text, p.error, false);
+            body.push(&line.text, p.text, false);
         }
         // A change of connection state: status, so it reads above the
         // server's own chatter (`--`, quiet text) but is not an error.
@@ -308,20 +312,13 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
         }
         kind => {
             prefix.push(display::marker(kind), p.server, false);
-            // The marker carries the event's colour; the client's own
-            // wording is quiet, so what changed reads first. Membership
-            // noise (joins, parts, quits, renames) recedes to the timestamp
-            // role; changes to the channel (kicks, topics, modes) keep
-            // their wording in text.secondary. Nicks are nick-coloured, a
-            // reason is text.secondary, a new topic is in the topic role
-            // (as the title bar shows it) and mode arguments are text.
-            let noise = display::is_noise(kind);
-            let verb = if noise { p.timestamp } else { p.text_dim };
-            let free = match kind {
-                LineKind::Topic => p.topic,
-                LineKind::Mode => p.text,
-                _ => p.text_dim,
-            };
+            // One ladder for every event: the marker carries the event's
+            // colour, then the nicks (nick-coloured), then what someone
+            // typed (a reason, a new topic, mode arguments) in
+            // text.secondary, and last the client's own wording ("joined",
+            // "kicked", the channel) in the quietest legible role, so what
+            // changed always reads before how hirc says it.
+            let (verb, free) = (p.quiet, p.text_dim);
             match display::event_parts(kind, line.nick.as_deref(), &line.text, cx.channel) {
                 Some(parts) => {
                     for (part, s) in parts {
@@ -372,21 +369,24 @@ pub fn with_marker(app: &HircApp, line: AnyElement) -> AnyElement {
 }
 
 /// Drawn over the top row when it is the wrapped tail of `line`: the
-/// time and nick of the message it belongs to, all in the timestamp role,
-/// so the row says whose it is without reading as a new message.
+/// time of the message it belongs to (in the time column's role), and
+/// its nick after a `…` that says the row goes on from above, in the
+/// quiet role the scroll notes share, so the row says whose it is
+/// without reading as a new message.
 pub fn sticky(app: &HircApp, line: &Line, cells: usize) -> gpui::AnyElement {
     let p = &app.palette;
     let m = &app.metrics;
     let time = line.time.with_timezone(&chrono::Local).format("%H:%M").to_string();
     let nick = line.nick.as_deref().unwrap_or_default();
+    let room = cells.saturating_sub(1).max(1);
     let who = match line.kind {
-        LineKind::Privmsg => fit(nick, cells),
-        LineKind::Notice if !nick.is_empty() => format!("-{}-", fit(nick, cells.saturating_sub(2).max(1))),
+        LineKind::Privmsg => fit(nick, room),
+        LineKind::Notice if !nick.is_empty() => format!("-{}-", fit(nick, room.saturating_sub(2).max(1))),
         LineKind::Action => "*".to_owned(),
         kind => display::marker(kind).to_owned(),
     };
     let mut prefix = Runs::default();
-    prefix.push(&who, p.timestamp, false);
+    prefix.push(&format!("…{who}"), p.quiet, false);
     div()
         .flex()
         .w_full()
@@ -438,19 +438,25 @@ impl Render for Tip {
     }
 }
 
-/// The bottom row while the view is scrolled away from the newest line:
-/// how many rows are below (the `j` presses back to the bottom), irssi's
-/// `-- more --` style. The count takes the unread colour once new lines
-/// have arrived below. The viewport gives it a row of its own.
+/// The bottom row while the view is scrolled away from the newest line,
+/// irssi's `-- more --`: how many lines (messages and events, however
+/// many rows they wrap to) are below, and, once the oldest line shows,
+/// that this is the top, after the count so the count never moves. In
+/// the quiet role the sticky head shares; the count takes the unread
+/// colour once new lines have arrived below. The viewport gives it a row
+/// of its own.
 pub fn more(app: &HircApp, below: usize, top: bool, fresh: bool) -> AnyElement {
     let p = &app.palette;
     let m = &app.metrics;
     let mut runs = Runs::default();
-    runs.push(if top { "-- top: " } else { "-- more: " }, p.text_dim, false).push(&below.to_string(), if fresh { p.unread } else { p.text_dim }, fresh).push(
+    runs.push("-- more: ", p.quiet, false).push(&below.to_string(), if fresh { p.unread } else { p.quiet }, fresh).push(
         if below == 1 { " line below --" } else { " lines below --" },
-        p.text_dim,
+        p.quiet,
         false,
     );
+    if top {
+        runs.push(" (top of buffer)", p.quiet, false);
+    }
     div().w_full().h(px(m.line)).px(px(m.gutter)).child(runs.element()).into_any_element()
 }
 
