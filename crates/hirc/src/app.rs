@@ -145,10 +145,11 @@ impl HircApp {
         let handle = input.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
         // The banner can be dismissed; keep what it said where errors go.
-        if let Some(banner) = &init.banner
-            && !store.networks.is_empty()
-        {
-            store.push_local(0, 0, LineKind::Error, banner.clone());
+        // It is about the whole app, so every network's server window has it.
+        if let Some(banner) = &init.banner {
+            for n in 0..store.networks.len() {
+                store.push_local(n, 0, LineKind::Error, banner.clone());
+            }
         }
         // A dropped network's header counts down to its retry: redraw each
         // second while one waits (a fixed clock has nothing to count).
@@ -433,6 +434,14 @@ impl HircApp {
         match self.store.apply(ev) {
             Applied::Line { network, buffer, index } => self.arrived(network, buffer, index),
             Applied::Lines { network, at } => at.into_iter().for_each(|(buffer, index)| self.arrived(network, buffer, index)),
+            Applied::Replaced { network, buffer, removed, index } => {
+                if self.selected == Some((network, buffer)) {
+                    self.lines.splice(removed..removed + 1, 0);
+                }
+                if let Some(index) = index {
+                    self.arrived(network, buffer, index);
+                }
+            }
             Applied::Changed | Applied::Nothing => {}
         }
         self.sync_layout();
@@ -462,9 +471,10 @@ impl HircApp {
         self.lines.splice(index..index, 1);
     }
 
-    /// Show a local status line (`--`) in the current buffer.
+    /// Show hirc's own answer to a command (`-!-`, the client's voice, not
+    /// the server's `--`) in the current buffer.
     fn local_note(&mut self, n: usize, b: usize, msg: String) {
-        let index = self.store.push_local(n, b, LineKind::Server, msg);
+        let index = self.store.push_local(n, b, LineKind::Status, msg);
         self.lines.splice(index..index, 1);
     }
 
@@ -502,7 +512,7 @@ impl HircApp {
             }
             // A down network drops everything but /reconnect.
             Ok(Input::Send(_)) if status.is_down() => self.local_error(n, b, not_connected(&name, &status)),
-            Ok(Input::Send(Command::Part { channel, .. })) if !self.in_channel(n, &channel) => self.local_error(n, b, format!("Not in {channel}")),
+            Ok(Input::Send(Command::Part { channel, .. })) if !self.in_channel(n, &channel) => self.local_error(n, b, format!("Not joined to {channel}")),
             Ok(Input::Send(Command::Join { channel, .. })) if self.in_channel(n, &channel) => {
                 let j = self.store.buffer_ix(n, &Target::Channel(channel));
                 self.select(n, j, cx);
@@ -543,7 +553,7 @@ impl HircApp {
         let connected = matches!(net.status, ConnStatus::Connected { .. });
         match &buf.target {
             _ if net.status.is_down() => down(&net.name, &net.status),
-            Target::Channel(name) if connected && !buf.joined => format!("Not in {name} — /join to rejoin"),
+            Target::Channel(_) if connected && !buf.joined => "Not joined — /join to rejoin".to_owned(),
             Target::Server => format!("Command for {}", net.name),
             target => format!("Message {}", target.name().unwrap_or_default()),
         }
@@ -690,13 +700,10 @@ fn font_for(window: &Window, family: Option<SharedString>) -> gpui::Font {
     style.font()
 }
 
-/// Why a line typed for network `name` was not sent. The header and the
-/// input's placeholder say what to do about it.
+/// Why a line typed for network `name` was not sent, and the way out: the
+/// line stays in the input, so the placeholder that says it is hidden.
 fn not_connected(name: &str, status: &ConnStatus) -> String {
-    match status {
-        ConnStatus::Offline => format!("Not sent — {name} is offline"),
-        _ => format!("Not sent — {name} is disconnected"),
-    }
+    format!("Not sent — {}", down(name, status))
 }
 
 /// The input's placeholder on a down network: its state, in the words the

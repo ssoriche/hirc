@@ -33,6 +33,7 @@ lines = [
   ":erin!e@h PRIVMSG #general :thanks! glad to be here",
   ":dave!d@h NICK :dave_away",
   ":dave_away!d@h PRIVMSG #general :brb, lunch",
+  ":carol!c@h AWAY :back after lunch",
   ":carol!c@h PART #general :going offline",
   ":frank!f@h QUIT :Ping timeout: 240 seconds",
   ":alice!a@h PRIVMSG #general :me: did you see the notes from yesterday?",

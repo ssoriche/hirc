@@ -8,7 +8,7 @@ pub type CapGroups = &'static [&'static [&'static str]];
 
 /// What hirc implements so far, in request order. Later milestones add
 /// groups here, e.g. `&["draft/chathistory", "chathistory"]`.
-pub const WANTED: CapGroups = &[&["message-tags"], &["server-time"], &["echo-message"], &["cap-notify"], &["sasl"], &["batch"]];
+pub const WANTED: CapGroups = &[&["message-tags"], &["server-time"], &["echo-message"], &["cap-notify"], &["sasl"], &["batch"], &["away-notify"]];
 
 #[derive(Debug)]
 pub struct Caps {
@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(done, [false, true]);
         assert_eq!(caps.value("sasl"), Some("PLAIN,EXTERNAL"));
         let req = caps.to_request();
-        assert_eq!(req, ["message-tags server-time echo-message cap-notify sasl batch"]);
+        assert_eq!(req, ["message-tags server-time echo-message cap-notify sasl batch away-notify"]);
         // Out-of-scope caps Ergo advertises are never requested.
         assert!(!req[0].contains("ergo.chat/nope") && !req[0].contains("znc.in/playback"));
         // Already requested: a second call asks for nothing.

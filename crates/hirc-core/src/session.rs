@@ -4,10 +4,10 @@
 //! moves bytes.
 
 use crate::caps::Caps;
-use crate::event::{Command, ConnStatus, Event, Target};
+use crate::event::{Command, ConnStatus, Event, PeerChange, Target};
 use crate::isupport::Isupport;
 use crate::proto::Message;
-use crate::store::{Line, LineKind};
+use crate::store::{Delivery, Line, LineKind};
 use crate::{sasl, split};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -186,7 +186,23 @@ impl Session {
                     out.push(Output::Event(Event::Topic { network: self.network.clone(), channel: chan.clone(), topic: Some(topic.clone()) }));
                 }
             }
-            "353" => self.on_names(&msg),
+            "353" => self.on_names(&msg, &mut out),
+            // away-notify: someone in a channel we share went away or came back.
+            "AWAY" => {
+                if let Some(nick) = msg.nick().filter(|n| !self.is_me(n)) {
+                    let reason = msg.params.first().filter(|r| !r.is_empty()).cloned();
+                    out.push(self.peer(nick, PeerChange::Away(reason)));
+                }
+            }
+            // RPL_AWAY: the reply to messaging someone who is away.
+            "301" => {
+                if let [_, nick, reason, ..] = msg.params.as_slice() {
+                    out.push(self.peer(nick, PeerChange::Away(Some(reason.clone()))));
+                }
+                let text = msg.params.get(1..).unwrap_or_default().join(" ");
+                let line = self.line(&msg, now, LineKind::Server, None, text, false);
+                out.push(self.event_line(Target::Server, line));
+            }
             "MODE" => self.on_mode(&msg, now, &mut out),
             // No line of its own: the close follows, and its status line
             // gives this text as the reason.
@@ -320,7 +336,18 @@ impl Session {
     fn line(&mut self, msg: &Message, now: DateTime<Utc>, kind: LineKind, nick: Option<&str>, text: String, own: bool) -> Line {
         self.seq += 1;
         let time = msg.tag("time").and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map_or(now, |t| t.with_timezone(&Utc));
-        Line { seq: self.seq, time, msgid: msg.tag("msgid").filter(|m| !m.is_empty()).map(str::to_owned), kind, nick: nick.map(str::to_owned), text, own }
+        let msgid = msg.tag("msgid").filter(|m| !m.is_empty()).map(str::to_owned);
+        Line { seq: self.seq, time, msgid, kind, nick: nick.map(str::to_owned), text, own, delivery: Delivery::Sent }
+    }
+
+    fn peer(&self, nick: &str, change: PeerChange) -> Output {
+        Output::Event(Event::Peer { network: self.network.clone(), nick: nick.to_owned(), change })
+    }
+
+    /// `msg`'s sender as seen: their `user@host` when the source has one.
+    fn seen(&self, msg: &Message, nick: &str) -> Output {
+        let host = msg.source.as_deref().and_then(|s| s.split_once('!')).map(|(_, h)| h.to_owned()).filter(|h| !h.is_empty());
+        self.peer(nick, PeerChange::Seen { host })
     }
 
     fn event_line(&self, target: Target, line: Line) -> Output {
@@ -358,6 +385,9 @@ impl Session {
         } else {
             Target::Query(from.to_owned())
         };
+        if from_user && !own {
+            out.push(self.seen(msg, from));
+        }
         let nick = from_user.then_some(from);
         let line = self.line(msg, now, kind, nick, text.to_owned(), own);
         out.push(self.event_line(target, line));
@@ -372,6 +402,8 @@ impl Session {
         if self.is_me(&nick) {
             self.members.insert(chan.to_ascii_lowercase(), (chan.clone(), HashSet::new()));
             out.push(Output::Event(Event::Joined { network: self.network.clone(), channel: chan.clone() }));
+        } else {
+            out.push(self.seen(msg, &nick));
         }
         self.members_of(&chan).insert(nick.to_ascii_lowercase());
         let line = self.line(msg, now, LineKind::Join, Some(&nick), format!("{nick} joined"), self.is_me(&nick));
@@ -421,10 +453,11 @@ impl Session {
 
     fn on_quit(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
         let Some(nick) = msg.nick().map(str::to_owned) else { return };
-        let text = match msg.params.first().filter(|r| !r.is_empty()) {
-            Some(r) => format!("{nick} quit ({r})"),
-            None => format!("{nick} quit"),
-        };
+        let reason = msg.params.first().cloned().unwrap_or_default();
+        let text = if reason.is_empty() { format!("{nick} quit") } else { format!("{nick} quit ({reason})") };
+        if !self.is_me(&nick) {
+            out.push(self.peer(&nick, PeerChange::Quit(reason)));
+        }
         for chan in self.channels_with(&nick) {
             self.members_of(&chan).remove(&nick.to_ascii_lowercase());
             let line = self.line(msg, now, LineKind::Quit, Some(&nick), text.clone(), false);
@@ -438,6 +471,8 @@ impl Session {
         if own {
             self.nick = new.clone();
             out.push(Output::Event(Event::OwnNick { network: self.network.clone(), nick: new.clone() }));
+        } else {
+            out.push(self.peer(&old, PeerChange::Renamed(new.clone())));
         }
         for chan in self.channels_with(&old) {
             let m = self.members_of(&chan);
@@ -457,11 +492,14 @@ impl Session {
         out.push(self.event_line(Target::Channel(chan), line));
     }
 
-    fn on_names(&mut self, msg: &Message) {
+    fn on_names(&mut self, msg: &Message, out: &mut Vec<Output>) {
         let [_, _, chan, names, ..] = msg.params.as_slice() else { return };
-        let nicks: Vec<String> = names.split_whitespace().map(|n| self.isupport.bare_nick(n).to_ascii_lowercase()).collect();
+        let nicks: Vec<String> = names.split_whitespace().map(|n| self.isupport.bare_nick(n).to_owned()).collect();
+        for nick in nicks.iter().filter(|n| !self.is_me(n)) {
+            out.push(self.peer(nick, PeerChange::Seen { host: None }));
+        }
         let chan = chan.clone();
-        self.members_of(&chan).extend(nicks);
+        self.members_of(&chan).extend(nicks.iter().map(|n| n.to_ascii_lowercase()));
     }
 
     fn on_mode(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
@@ -496,11 +534,13 @@ impl Session {
 
     fn local(&mut self, kind: LineKind, text: String, now: DateTime<Utc>) -> Line {
         self.seq += 1;
-        Line { seq: self.seq, time: now, msgid: None, kind, nick: None, text, own: true }
+        Line { seq: self.seq, time: now, msgid: None, kind, nick: None, text, own: true, delivery: Delivery::Sent }
     }
 
-    /// PRIVMSG, split to fit. With echo-message the server's echo is the
-    /// copy we show (right time, msgid, order); without it we show ours.
+    /// PRIVMSG, split to fit. Each piece shows at once as our own line.
+    /// With echo-message it is pending until the server's echo, the copy
+    /// that stays (right time, msgid, order), takes its place (the store
+    /// matches them); without it, ours is the copy and it is sent.
     fn say(&mut self, target: &str, text: &str, action: bool, now: DateTime<Utc>) -> Vec<Output> {
         let echo = self.caps.is_enabled("echo-message");
         let wrap = if action { "\x01ACTION \x01".len() } else { 0 };
@@ -510,12 +550,14 @@ impl Session {
         for line in text.lines().filter(|l| !l.is_empty()) {
             for chunk in split::split_utf8(line, budget) {
                 let body = if action { format!("\x01ACTION {chunk}\x01") } else { chunk.to_owned() };
-                out.push(send("PRIVMSG", [target.to_owned(), body]));
-                if !echo {
-                    let mut l = self.local(if action { LineKind::Action } else { LineKind::Privmsg }, chunk.to_owned(), now);
-                    l.nick = Some(self.nick.clone());
-                    out.push(self.event_line(dest.clone(), l));
+                let mut l = self.local(if action { LineKind::Action } else { LineKind::Privmsg }, chunk.to_owned(), now);
+                l.nick = Some(self.nick.clone());
+                if echo {
+                    l.delivery = Delivery::Pending;
                 }
+                // Shown before it goes, so an echo can never beat it.
+                out.push(self.event_line(dest.clone(), l));
+                out.push(send("PRIVMSG", [target.to_owned(), body]));
             }
         }
         out
@@ -748,11 +790,12 @@ mod tests {
     }
 
     #[test]
-    fn say_with_echo_message_only_sends() {
+    fn say_with_echo_message_shows_a_pending_line() {
         let mut s = registered(ECHO);
         let out = s.command(Command::Say { network: "net".into(), target: "#test".into(), text: "hi".into() }, now());
         assert_eq!(sent(&out), ["PRIVMSG #test hi"]);
-        assert!(lines(&out).is_empty(), "the echo is the copy we show");
+        let (t, l) = lines(&out).remove(0);
+        assert_eq!((t, l.own, l.delivery, l.text.as_str()), (Target::Channel("#test".into()), true, Delivery::Pending, "hi"));
     }
 
     #[test]
@@ -760,7 +803,34 @@ mod tests {
         let mut s = registered("server-time");
         let out = s.command(Command::Say { network: "net".into(), target: "#test".into(), text: "hi".into() }, now());
         let (t, l) = lines(&out).remove(0);
-        assert_eq!((t, l.own, l.nick.as_deref()), (Target::Channel("#test".into()), true, Some("alice")));
+        assert_eq!((t, l.own, l.nick.as_deref(), l.delivery), (Target::Channel("#test".into()), true, Some("alice"), Delivery::Sent));
+    }
+
+    fn peers(out: &[Output]) -> Vec<(String, PeerChange)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Event(Event::Peer { nick, change, .. }) => Some((nick.clone(), change.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn other_people_are_tracked() {
+        let mut s = registered(ECHO);
+        feed(&mut s, ":alice!a@h JOIN #test");
+        let seen = |host: Option<&str>| PeerChange::Seen { host: host.map(Into::into) };
+        assert_eq!(peers(&feed(&mut s, ":srv 353 alice = #test :alice @bob")), [("bob".to_owned(), seen(None))]);
+        assert_eq!(peers(&feed(&mut s, ":carol!c@h.example JOIN #test")), [("carol".to_owned(), seen(Some("c@h.example")))]);
+        assert_eq!(peers(&feed(&mut s, ":dan!d@h PRIVMSG alice :hi")), [("dan".to_owned(), seen(Some("d@h")))]);
+        assert_eq!(peers(&feed(&mut s, ":bob!b@h AWAY :lunch")), [("bob".to_owned(), PeerChange::Away(Some("lunch".into())))]);
+        assert_eq!(peers(&feed(&mut s, ":bob!b@h AWAY")), [("bob".to_owned(), PeerChange::Away(None))]);
+        assert_eq!(peers(&feed(&mut s, ":srv 301 alice dan :gone fishing")), [("dan".to_owned(), PeerChange::Away(Some("gone fishing".into())))]);
+        assert_eq!(peers(&feed(&mut s, ":carol!c@h NICK carla")), [("carol".to_owned(), PeerChange::Renamed("carla".into()))]);
+        assert_eq!(peers(&feed(&mut s, ":bob!b@h QUIT :bye")), [("bob".to_owned(), PeerChange::Quit("bye".into()))]);
+        // Our own comings and goings are not a peer's.
+        assert!(peers(&feed(&mut s, ":alice!a@h NICK alicia")).is_empty());
+        assert!(peers(&feed(&mut s, ":alicia!a@h PRIVMSG #test :mine")).is_empty());
     }
 
     #[test]

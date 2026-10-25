@@ -17,16 +17,30 @@
 //! in reverse video, the unread colour as its fill (irssi's highlight
 //! activity, louder than plain unread). The selected row is a fill (one
 //! apart from the mention fill, see `theme::fill_apart`), `text.primary`
-//! and a bold label; hover is only a faint wash. A window that can't be
-//! used (network down, channel left) is dimmed as a whole row, selected or
-//! not. Red marks a fault: a red tag, never dimmed, and on a server row a
-//! red ring while hirc retries, a red dot once it has given up. A network
-//! the user quit is offline, not failed: a quiet ring.
+//! and a bold label; hover is only a faint wash.
 //!
-//! A list too long for its pane keeps a row at each end: where rows are
-//! hidden past that end it says how many, with the same columns as a
-//! window row (their unread lines, on the mention fill when some are for
-//! us, and the network of a fault among them); a click scrolls them in.
+//! Each state has one look. Dimming means only "this network is down":
+//! every row of it, its server row included, is dimmed as a whole, except
+//! the selected row, which stays legible on its fill and shows the state
+//! by its tag and the header. Red marks a fault: a red tag, never dimmed,
+//! and on a server row a red ring while hirc retries, a red dot once it
+//! has given up; a network the user quit is offline, not failed: a quiet
+//! ring. A channel we are not in, on a live network, keeps its row and
+//! says so the way the header does: a quiet `○` in the unread column and
+//! its name in `text.secondary`.
+//!
+//! Rows are one text line apart, the message view's own pitch, so the
+//! list and the conversation beside it share one line grid (a terminal's
+//! window list); a row is still easy to hit, since rows touch and each
+//! takes clicks across the whole width of the list.
+//!
+//! A list too long for its pane keeps a row at the top while rows are
+//! hidden above, and one at the bottom while rows are hidden below; each
+//! says how many, with the same columns as a window row (their unread
+//! lines, on the mention fill when some are for us, and the server row's
+//! fault mark when a network among them is down by a fault); a click
+//! scrolls them in. Scrolled to the end, the bottom row goes and the list
+//! takes its place.
 
 use crate::app::HircApp;
 use crate::metrics::{Metrics, count_label};
@@ -43,14 +57,15 @@ pub fn row_centre(m: &Metrics, width: f32, height: f32, count: usize, offset: f3
 
 /// Whether `count` rows overflow a list `height` tall.
 pub fn overflows(m: &Metrics, height: f32, count: usize) -> bool {
-    2. * m.edge + m.row * count as f32 > height
+    2. * m.bar_pad() + m.row * count as f32 > height
 }
 
-/// Top of the first row: the `edge` clear space, and in a list that
-/// overflows, the row that counts what is hidden above.
+/// Top of the first row: the bars' clear space (so the first row's text
+/// sits on the header's line), and in a list that overflows, the row that
+/// counts what is hidden above.
 #[cfg(feature = "snapshot")]
 fn list_top(m: &Metrics, overflow: bool) -> f32 {
-    m.edge + if overflow { m.row } else { 0. }
+    m.bar_pad() + if overflow { m.row } else { 0. }
 }
 
 /// The opacity of a window that can't be used.
@@ -90,7 +105,7 @@ pub fn render(app: &HircApp, width: f32, height: f32, cx: &mut Context<HircApp>)
             widest_tag = widest_tag.max(cells(&net.name));
         }
     }
-    let room = width - 2. * m.gutter - number_width - m.count_width() - 3. * m.gap;
+    let room = width - 2. * m.gutter - number_width - m.count_width() - count_inset(m) - 3. * m.gap;
     let tags = tag_width(m, room, widest_label, widest_tag);
     let cols = Columns { number: number_width, tag: tags.unwrap_or(m.cell), tags: tags.is_some() };
     let mut list = div().id("sidebar").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll().track_scroll(&app.sidebar_scroll);
@@ -102,7 +117,17 @@ pub fn render(app: &HircApp, width: f32, height: f32, cx: &mut Context<HircApp>)
     let windows = |range: std::ops::Range<usize>| rows[range].iter().map(|&(_, n, b)| (n, b)).collect::<Vec<_>>();
     let top = above.map(|k| edge(app, &cols, "↑", &windows(0..k), k - 1, cx));
     let bottom = below.map(|k| edge(app, &cols, "↓", &windows(rows.len() - k..rows.len()), rows.len() - k, cx));
+    // The top row is kept while the list overflows, so the rows never
+    // shift under the pointer as it comes and goes; the bottom one only
+    // while rows are below (going, it gives the list a row at its end).
     let slot = |e: Option<AnyElement>| div().flex_none().h(px(m.row)).children(e);
+    let bottom_slot = bottom.is_some();
+    // An overflowing list shows whole rows only (what is left of a row
+    // goes below the last slot), so it scrolls by rows: no row is ever
+    // cut at an end, and the end rows count only rows out of view.
+    let slots = 1 + usize::from(bottom_slot);
+    let shown = whole_rows(height - 2. * m.bar_pad() - slots as f32 * m.row, m.row);
+    let list = list.when(overflow, |d| d.flex_none().h(px(shown)));
     div()
         .flex()
         .flex_col()
@@ -112,10 +137,15 @@ pub fn render(app: &HircApp, width: f32, height: f32, cx: &mut Context<HircApp>)
         .bg(p.background)
         .border_r_1()
         .border_color(p.border)
-        .py(px(m.edge))
+        .py(px(m.bar_pad()))
         .when(overflow, |d| d.child(slot(top)))
         .child(list)
-        .when(overflow, |d| d.child(slot(bottom)))
+        .when(bottom_slot, |d| d.child(slot(bottom)))
+}
+
+/// The height of the whole rows, `row` px each, that fit in `room`.
+fn whole_rows(room: f32, row: f32) -> f32 {
+    if row <= 0. { 0. } else { (room / row).floor().max(1.) * row }
 }
 
 /// The columns every row shares.
@@ -147,18 +177,40 @@ fn hidden_rows(offset: f32, max: f32, view: f32, row: f32, count: usize) -> (Opt
 
 /// A row's grid: the four columns in their places, a row tall.
 fn grid(m: &Metrics, id: (&'static str, usize)) -> gpui::Stateful<gpui::Div> {
-    div().id(id).flex().flex_none().items_start().h(px(m.row)).px(px(m.gutter)).py(px(m.pad_y)).gap(px(m.gap)).cursor_pointer()
+    div().id(id).flex().flex_none().items_start().h(px(m.row)).px(px(m.gutter)).gap(px(m.gap)).cursor_pointer()
+}
+
+/// How far the unread column keeps in from the gutter: the mention
+/// fill's half cell beyond the digits, so the fill ends on the gutter
+/// like everything else in the list, and plain digits share its column.
+fn count_inset(m: &Metrics) -> f32 {
+    (m.cell / 2.).round()
+}
+
+/// What the unread column holds.
+enum Count {
+    None,
+    Lines(usize),
+    /// A channel we are not in: the header's quiet `○`.
+    NotJoined,
 }
 
 /// The unread column: `count` lines, in reverse video when some are
 /// meant for us.
-fn count_cell(app: &HircApp, count: Option<usize>, mention: bool, dimmed: bool) -> impl IntoElement {
+fn count_cell(app: &HircApp, count: Count, mention: bool, dimmed: bool) -> impl IntoElement {
     let p = &app.palette;
     let m = &app.metrics;
     // The digits stay on the column's right edge; the fill runs half a
     // cell clear of them, the glyph band tall.
-    let half = (m.cell / 2.).round();
-    div().flex_none().flex().justify_end().w(px(m.count_width())).when(dimmed, |d| d.opacity(DIM)).children(count.map(|c| {
+    let half = count_inset(m);
+    let count = match count {
+        Count::None => None,
+        Count::Lines(c) => Some(c),
+        Count::NotJoined => {
+            return div().flex_none().flex().justify_end().w(px(m.count_width())).mr(px(half)).text_color(p.text_dim).child("○");
+        }
+    };
+    div().flex_none().flex().justify_end().w(px(m.count_width())).mr(px(half)).when(dimmed, |d| d.opacity(DIM)).children(count.map(|c| {
         div()
             .when(!mention, |d| d.text_color(p.unread))
             .when(mention, |d| {
@@ -191,9 +243,15 @@ fn row(app: &HircApp, cols: &Columns, pos: usize, n: usize, b: usize, cx: &mut C
         Target::Server => net.name.clone().into(),
         t => t.name().unwrap_or_default().to_owned().into(),
     };
-    let label_color = if buf.unread > 0 && !selected { p.unread } else { p.text };
     let fault = net.status.is_fault();
-    let dimmed = !is_server && (net.status.is_down() || matches!(buf.target, Target::Channel(_)) && !buf.joined);
+    // Dimmed: the network is down. The selected row stays legible.
+    let dimmed = net.status.is_down() && !selected;
+    let parted = !net.status.is_down() && matches!(buf.target, Target::Channel(_)) && !buf.joined;
+    let label_color = match () {
+        _ if buf.unread > 0 && !selected => p.unread,
+        _ if parted && !selected => p.text_dim,
+        _ => p.text,
+    };
     // The network column: a server row's connection state, else the
     // network tag.
     let (network, network_color): (SharedString, _) = if is_server {
@@ -209,14 +267,18 @@ fn row(app: &HircApp, cols: &Columns, pos: usize, n: usize, b: usize, cx: &mut C
             net.name.clone().into(),
             if fault {
                 p.error
-            } else if selected {
+            } else if selected && !net.status.is_down() {
                 p.text
             } else {
                 p.text_dim
             },
         )
     };
-    let count = (buf.unread > 0 && !selected).then_some(buf.unread);
+    let count = match () {
+        _ if buf.unread > 0 && !selected => Count::Lines(buf.unread),
+        _ if parted => Count::NotJoined,
+        _ => Count::None,
+    };
     grid(m, ("window", pos))
         .when(selected, |d| d.bg(p.selected))
         .when(!selected, |d| d.hover(|s| s.bg(p.hover)))
@@ -259,7 +321,12 @@ fn edge(app: &HircApp, cols: &Columns, arrow: &'static str, windows: &[(usize, u
     let p = &app.palette;
     let m = &app.metrics;
     let nets = &app.store.networks;
-    let fault = windows.iter().map(|&(n, _)| &nets[n]).find(|net| net.status.is_fault()).map(|net| SharedString::from(net.name.clone()));
+    // A fault among them, as the server row marks it: a ring while hirc
+    // retries, a dot once it has given up.
+    let fault = windows.iter().map(|&(n, _)| &nets[n].status).find(|s| s.is_fault()).map(|s| match s {
+        ConnStatus::Disconnected { .. } => "○",
+        _ => "●",
+    });
     let unread: usize = windows.iter().map(|&(n, b)| nets[n].buffers[b].unread).sum();
     let mention = windows.iter().any(|&(n, b)| nets[n].buffers[b].mentions > 0);
     grid(m, ("edge", reveal))
@@ -267,8 +334,8 @@ fn edge(app: &HircApp, cols: &Columns, arrow: &'static str, windows: &[(usize, u
         .text_color(p.text_dim)
         .child(div().flex_none().w(px(cols.number)).text_right().child(arrow))
         .child(div().flex_1().min_w(px(0.)).truncate().child(format!("{} more", windows.len())))
-        .child(tag_cell(cols, fault.filter(|_| cols.tags).unwrap_or_default()).text_color(p.error))
-        .child(count_cell(app, (unread > 0).then_some(unread), mention, false))
+        .child(tag_cell(cols, fault.unwrap_or_default().into()).w(px(m.cell.ceil())).text_color(p.error))
+        .child(count_cell(app, if unread > 0 { Count::Lines(unread) } else { Count::None }, mention, false))
         .on_click(cx.listener(move |this, _, _, cx| {
             this.sidebar_scroll.scroll_to_item(reveal);
             cx.notify();
@@ -284,12 +351,12 @@ mod tests {
     #[test]
     fn row_centres_follow_the_row_pitch_and_scroll() {
         let m = Metrics::new(14., Shape::FALLBACK);
-        assert_eq!(row_centre(&m, 240., 800., 6, 0., 0), (120., m.edge + m.row / 2.));
+        assert_eq!(row_centre(&m, 240., 800., 6, 0., 0), (120., m.bar_pad() + m.row / 2.));
         assert_eq!(row_centre(&m, 240., 800., 6, 0., 3).1 - row_centre(&m, 240., 800., 6, 0., 2).1, m.row);
         // Scrolled down by two rows, row 2 sits where row 0 was.
         assert_eq!(row_centre(&m, 240., 800., 6, -2. * m.row, 2), row_centre(&m, 240., 800., 6, 0., 0));
         // A list that overflows starts below the row counting what is above.
-        assert_eq!(row_centre(&m, 240., 300., 28, 0., 0).1, m.edge + m.row + m.row / 2.);
+        assert_eq!(row_centre(&m, 240., 300., 28, 0., 0).1, m.bar_pad() + m.row + m.row / 2.);
     }
 }
 
@@ -319,9 +386,16 @@ mod hidden_tests {
     #[test]
     fn a_list_overflows_when_its_rows_and_edges_do_not_fit() {
         let m = crate::metrics::Metrics::new(14., crate::metrics::Shape::FALLBACK);
-        let fits = 2. * m.edge + 6. * m.row;
+        let fits = 2. * m.bar_pad() + 6. * m.row;
         assert!(!super::overflows(&m, fits, 6));
         assert!(super::overflows(&m, fits - 1., 6));
+    }
+
+    #[test]
+    fn an_overflowing_list_shows_whole_rows() {
+        assert_eq!(super::whole_rows(438., 21.), 420.);
+        assert_eq!(super::whole_rows(420., 21.), 420.);
+        assert_eq!(super::whole_rows(5., 21.), 21.);
     }
 
     #[test]

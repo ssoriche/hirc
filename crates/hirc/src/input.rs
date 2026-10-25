@@ -399,16 +399,17 @@ impl Element for TextElement {
         let normal = input.vim.mode == Mode::Normal;
         let prev_scroll = input.scroll_x;
 
-        // Colours over the line: a recognised `/command` takes the code
-        // colour (so a typo, left in text, shows before Enter), marked
-        // (IME) text is underlined, and the Normal block's glyph is drawn
-        // in the background colour, as a terminal's reverse video.
-        let code = input.palette.as_ref().map_or(dim, |p| p.code);
+        // Colours over the line: a `/command` hirc knows takes the command
+        // colour, one it does not (a typo) the error colour, so either
+        // shows before Enter; marked (IME) text is underlined, and the
+        // Normal block's glyph is drawn in the background colour, as a
+        // terminal's reverse video.
+        let (code, wrong) = input.palette.as_ref().map_or((dim, dim), |p| (p.code, p.error));
         let mut over = Vec::new();
         if input.vim.mode != Mode::Ex
-            && let Some(cmd) = command::leading(&shown)
+            && let Some((cmd, known)) = command::verb(&shown)
         {
-            over.push((0..cmd.len() + 1, (code, false)));
+            over.push((0..cmd.len() + 1, (if known { code } else { wrong }, false)));
         }
         if let Some(marked) = &input.marked_range {
             over.push((shift(marked.start)..shift(marked.end), (text, true)));

@@ -66,12 +66,54 @@ impl ConnStatus {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
-    Status { network: String, status: ConnStatus },
-    Line { network: String, target: Target, line: Line },
-    Joined { network: String, channel: String },
-    Parted { network: String, channel: String },
-    Topic { network: String, channel: String, topic: Option<String> },
-    OwnNick { network: String, nick: String },
+    Status {
+        network: String,
+        status: ConnStatus,
+    },
+    Line {
+        network: String,
+        target: Target,
+        line: Line,
+    },
+    Joined {
+        network: String,
+        channel: String,
+    },
+    Parted {
+        network: String,
+        channel: String,
+    },
+    Topic {
+        network: String,
+        channel: String,
+        topic: Option<String>,
+    },
+    OwnNick {
+        network: String,
+        nick: String,
+    },
+    /// What we learned about someone else on the network (for a query's
+    /// header: are they there, away, gone).
+    Peer {
+        network: String,
+        nick: String,
+        change: PeerChange,
+    },
+}
+
+/// A change in what we know of another user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerChange {
+    /// Seen on the network: in a channel we share, or talking. `host` is
+    /// their `user@host` when the message carried it.
+    Seen { host: Option<String> },
+    /// Marked away (with their message), or back (`None`): away-notify or
+    /// an RPL_AWAY reply.
+    Away(Option<String>),
+    /// Left the network, with their reason (maybe empty).
+    Quit(String),
+    /// Now goes by another nick.
+    Renamed(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

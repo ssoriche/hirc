@@ -27,9 +27,15 @@ pub const COMMANDS: &[&str] =
 
 /// The command a line starts with (`/me waves` is `me`), if it is one.
 pub fn leading(input: &str) -> Option<&str> {
+    verb(input).and_then(|(cmd, known)| known.then_some(cmd))
+}
+
+/// The `/verb` a line starts with, and whether it is a command hirc knows
+/// (`/jion` is not). `None` for chat, `//` (a literal slash) included.
+pub fn verb(input: &str) -> Option<(&str, bool)> {
     let rest = input.strip_prefix('/').filter(|r| !r.starts_with('/'))?;
     let cmd = rest.split(' ').next().unwrap_or(rest);
-    COMMANDS.iter().any(|c| c.eq_ignore_ascii_case(cmd)).then_some(cmd)
+    (!cmd.is_empty()).then(|| (cmd, COMMANDS.iter().any(|c| c.eq_ignore_ascii_case(cmd))))
 }
 
 fn is_channel(s: &str) -> bool {
@@ -101,6 +107,10 @@ mod tests {
         assert_eq!(leading("/mw waves"), None);
         assert_eq!(leading("//me"), None);
         assert_eq!(leading("me"), None);
+        assert_eq!(verb("/jion #a"), Some(("jion", false)));
+        assert_eq!(verb("/join #a"), Some(("join", true)));
+        assert_eq!(verb("/"), None);
+        assert_eq!(verb("//me"), None);
     }
 
     #[test]

@@ -4,10 +4,13 @@
 //! whole px where they stack (line, row, paddings), so rows never land on
 //! half pixels. Hairline borders (1px) are the only fixed value.
 //!
-//! The vertical rhythm: a text `line` plus `pad_y` above and below makes a
-//! `row` (a sidebar row). Panes keep `edge` clear at the top and bottom, and
-//! the header and input bar are one `row` inside `edge` (`bar_pad`), so their
-//! text sits on the same baseline as the first sidebar row.
+//! The vertical rhythm is one line grid, as in a terminal: every row of
+//! text, a message or a window in the list, is one `line` (`row`). The
+//! line is an odd number of px, so the header and the input bar, each a
+//! line of text with `bar_pad` above and below and a hairline rule, are
+//! exactly two lines tall. The window list starts `bar_pad` down, so its
+//! first row sits on the header's line, and the message view `bar_pad`
+//! under the header, so every list row shares a line with a message row.
 //!
 //! The horizontal grid: `gutter` is the inset from every pane edge, `gap`
 //! separates columns in a row, and `cells(n)` is the width of `n` digits.
@@ -28,7 +31,7 @@ impl Shape {
     pub const FALLBACK: Shape = Shape { cell: 0.6, ascent: 0.93, descent: 0.24 };
 }
 
-/// Line height as a multiple of the font size.
+/// Line height as a multiple of the font size (to the nearest odd px).
 const LINE: f32 = 1.5;
 /// The window list's width in cells, and its limits.
 const SIDEBAR_CELLS: f32 = 26.;
@@ -66,18 +69,14 @@ pub struct Metrics {
     pub size: f32,
     /// Width of one digit at `size`.
     pub cell: f32,
-    /// Line height for all text.
+    /// Line height for all text: an odd number of px.
     pub line: f32,
-    /// Space above and below a line inside a row.
-    pub pad_y: f32,
-    /// One row of a list: `line + 2 * pad_y`.
+    /// One row of the window list: a line, on the message view's grid.
     pub row: f32,
     /// Inset from every pane edge.
     pub gutter: f32,
     /// Space between columns in a row.
     pub gap: f32,
-    /// Clear space at the top and bottom of a pane.
-    pub edge: f32,
     /// The font's glyph band (ascent + descent, centred in the line box
     /// as text is), widened to whole px: the cursor covers it, so every
     /// glyph under it, descenders included, is inside.
@@ -91,8 +90,7 @@ pub struct Metrics {
 impl Metrics {
     pub fn new(size: f32, shape: Shape) -> Metrics {
         let size = if size.is_finite() && size > 0. { size } else { 14. };
-        let line = (size * LINE).round();
-        let pad_y = (size * 0.2).round();
+        let line = odd(size * LINE);
         // Text is centred in its line box (gpui): its glyph band runs from
         // `(line - band) / 2` for `band` px. Widen it outward to whole px.
         let band = size * (shape.ascent + shape.descent);
@@ -102,11 +100,9 @@ impl Metrics {
             size,
             cell: size * shape.cell,
             line,
-            pad_y,
-            row: line + 2. * pad_y,
+            row: line,
             gutter: (size * 6. / 7.).round(),
             gap: (size * 0.5).round(),
-            edge: (size * 0.5).round(),
             glyph_top,
             glyph: glyph_bottom - glyph_top,
             caret: (size / 14.).round().max(1.),
@@ -125,10 +121,11 @@ impl Metrics {
         (self.cell * n).ceil()
     }
 
-    /// Vertical padding of the header and input bar: one row centred in
-    /// `edge` clear space, matching the first sidebar row's baseline.
+    /// Vertical padding of the header and input bar, and the clear space
+    /// at the ends of the window list and the message view: with the
+    /// bar's hairline, a bar's padding makes one line, so a bar is two.
     pub fn bar_pad(&self) -> f32 {
-        self.edge + self.pad_y
+        (self.line - 1.) / 2.
     }
 
     /// The window list's width for a window `window_width` wide: a fixed
@@ -187,6 +184,11 @@ impl Metrics {
     }
 }
 
+/// The odd whole number nearest `v` (from below on a tie), at least 1.
+fn odd(v: f32) -> f32 {
+    (2. * ((v - 1.) / 2. - 0.5).ceil() + 1.).max(1.)
+}
+
 /// Decimal digits in `n` (at least one).
 pub fn digits(n: usize) -> usize {
     n.max(1).ilog10() as usize + 1
@@ -209,10 +211,13 @@ mod tests {
     fn stacked_values_are_whole_pixels() {
         for size in [9., 11., 12.5, 13., 14., 15., 16., 18., 21., 24.] {
             let m = menlo(size);
-            for v in [m.line, m.pad_y, m.row, m.gutter, m.gap, m.edge, m.bar_pad(), m.glyph_top, m.glyph] {
+            for v in [m.line, m.row, m.gutter, m.gap, m.bar_pad(), m.glyph_top, m.glyph] {
                 assert_eq!(v, v.round(), "size {size}: {v} is fractional");
             }
-            assert_eq!(m.row, m.line + 2. * m.pad_y);
+            // One line grid: list rows are lines, and a bar (padding,
+            // line, padding, hairline) is two.
+            assert_eq!(m.row, m.line);
+            assert_eq!(2. * m.bar_pad() + m.line + 1., 2. * m.line);
         }
     }
 
@@ -226,8 +231,13 @@ mod tests {
     #[test]
     fn values_at_menlo_14() {
         let m = menlo(14.);
-        assert_eq!((m.line, m.pad_y, m.row, m.gutter, m.gap, m.edge), (21., 3., 27., 12., 7., 7.));
+        assert_eq!((m.line, m.row, m.gutter, m.gap), (21., 21., 12., 7.));
         assert_eq!(m.bar_pad(), 10.);
+        // Monaco 13's 19.5 takes the odd px below.
+        assert_eq!(menlo(13.).line, 19.);
+        assert_eq!(odd(20.), 19.);
+        assert_eq!(odd(21.4), 21.);
+        assert_eq!(odd(22.1), 23.);
     }
 
     #[test]

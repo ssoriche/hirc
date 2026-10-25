@@ -40,6 +40,7 @@
 //! | `at:x,y` | Primary mouse down and up at logical (x, y). |
 //! | `hover:x,y` | Mouse move to (x, y). |
 //! | `scroll:<px>` | Scroll wheel over the buffer view; negative scrolls down. |
+//! | `delay:<ms>` | From now on the fake server holds its echo of our messages this long (simulated time offscreen), so a shot can show a line waiting for its echo. `delay:0` answers at once again. |
 //!
 //! An unknown step prints `snapshot: unknown step <s>` and the script goes on.
 //!
@@ -73,7 +74,7 @@ use hirc_core::session::{Output, Session, SessionConfig};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -115,6 +116,7 @@ pub enum Step {
     At(f32, f32),
     Hover(f32, f32),
     Scroll(f32),
+    Delay(u64),
     Unknown(String),
 }
 
@@ -142,6 +144,7 @@ pub fn parse_script(script: &str) -> Vec<Step> {
                 Some(("key", k)) => Step::Key(k.trim().replace('+', "-")),
                 Some(("type", t)) => Step::Type(t.to_owned()),
                 Some(("wait", ms)) => ms.trim().parse().map_or_else(|_| unknown(), Step::Wait),
+                Some(("delay", ms)) => ms.trim().parse().map_or_else(|_| unknown(), Step::Delay),
                 Some(("shot", p)) => Step::Shot(p.trim().to_owned()),
                 Some(("click", l)) if !l.trim().is_empty() => Step::Click(l.trim().to_owned()),
                 Some(("at", p)) => parse_point(p).map_or_else(unknown, |(x, y)| Step::At(x, y)),
@@ -324,6 +327,12 @@ fn answer(session: &mut Session, cmd: Command, now: DateTime<Utc>, echoes: &mut 
     (events, false)
 }
 
+/// Whether `e` is the fake server's echo of a message we sent (`delay:`
+/// holds these back).
+fn is_echo(e: &Event) -> bool {
+    matches!(e, Event::Line { line, .. } if line.own && line.msgid.as_deref().is_some_and(|m| m.starts_with("echo-")))
+}
+
 /// One UI command, for both command loops (window thread, offscreen task).
 /// A network whose connection ended loses its session, so later commands to
 /// it go nowhere, as conn.rs drops them until /reconnect.
@@ -352,6 +361,8 @@ pub struct Plan {
     /// The fixture's "now": a second after its last line. Replies to
     /// commands and hirc's own lines carry it, so a shot shows one clock.
     pub clock: DateTime<Utc>,
+    /// How long the fake server holds its echoes, in ms (`delay:`).
+    delay: Arc<AtomicU64>,
 }
 
 pub fn fail(reason: &str) -> ! {
@@ -389,6 +400,7 @@ impl Plan {
             theme: std::env::var("HIRC_THEME").ok().filter(|t| !t.is_empty()),
             serve: None,
             clock,
+            delay: Arc::default(),
         }))
     }
 
@@ -418,6 +430,7 @@ impl Plan {
         }
         let fed = self.fed.clone();
         let clock = self.clock;
+        let delay = self.delay.clone();
         std::thread::spawn(move || {
             for ev in events {
                 let _ = ev_tx.send(ev);
@@ -425,7 +438,12 @@ impl Plan {
             fed.store(true, Ordering::SeqCst);
             let mut echoes = 0;
             while let Some(cmd) = cmd_rx.blocking_recv() {
-                for e in serve(&mut sessions, cmd, clock, &mut echoes) {
+                let (later, now): (Vec<Event>, Vec<Event>) = serve(&mut sessions, cmd, clock, &mut echoes).into_iter().partition(is_echo);
+                for e in now {
+                    let _ = ev_tx.send(e);
+                }
+                std::thread::sleep(Duration::from_millis(delay.load(Ordering::SeqCst)));
+                for e in later {
                     let _ = ev_tx.send(e);
                 }
             }
@@ -442,6 +460,9 @@ impl Plan {
         cx.background_executor().timer(Duration::from_millis(250)).await;
         let interactive = self.script.is_empty() && self.shot.is_none();
         for step in &self.script {
+            if let Step::Delay(ms) = step {
+                self.delay.store(*ms, Ordering::SeqCst);
+            }
             if let Err(e) = apply(step, cx, handle).await {
                 fail(&e);
             }
@@ -510,7 +531,7 @@ fn inject<C: AppContext>(step: &Step, cx: &mut C, handle: WindowHandle<HircApp>)
             eprintln!("snapshot: unknown step {s}");
             Ok(())
         }
-        Step::Wait(_) | Step::Shot(_) => Ok(()),
+        Step::Wait(_) | Step::Shot(_) | Step::Delay(_) => Ok(()),
     }
 }
 
@@ -586,11 +607,20 @@ fn offscreen(mut plan: Plan, init: Init) -> Result<(), String> {
         .map_err(|e| format!("cannot open headless window: {e}"))?;
     if let Some((mut sessions, mut cmd_rx, ev_tx)) = plan.serve.take() {
         let clock = plan.clock;
+        let delay = plan.delay.clone();
         cx.update(|cx| {
-            cx.spawn(async move |_| {
+            cx.spawn(async move |cx| {
                 let mut echoes = 0;
                 while let Some(cmd) = cmd_rx.recv().await {
-                    for e in serve(&mut sessions, cmd, clock, &mut echoes) {
+                    let (later, now): (Vec<Event>, Vec<Event>) = serve(&mut sessions, cmd, clock, &mut echoes).into_iter().partition(is_echo);
+                    for e in now {
+                        let _ = ev_tx.send(e);
+                    }
+                    let ms = delay.load(Ordering::SeqCst);
+                    if ms > 0 {
+                        cx.background_executor().timer(Duration::from_millis(ms)).await;
+                    }
+                    for e in later {
                         let _ = ev_tx.send(e);
                     }
                 }
@@ -602,6 +632,7 @@ fn offscreen(mut plan: Plan, init: Init) -> Result<(), String> {
     for step in &plan.script {
         match step {
             Step::Wait(ms) => cx.advance_clock(Duration::from_millis(*ms)),
+            Step::Delay(ms) => plan.delay.store(*ms, Ordering::SeqCst),
             Step::Shot(path) => shot(&mut cx, handle, plan.scale, path)?,
             _ => inject(step, &mut cx, handle)?,
         }
@@ -689,6 +720,7 @@ mod tests {
             ]
         );
         assert_eq!(parse_script("key:ctrl+shift+a"), [Step::Key("ctrl-shift-a".into())]);
+        assert_eq!(parse_script("delay:1500;delay:x"), [Step::Delay(1500), Step::Unknown("delay:x".into())]);
         assert_eq!(parse_script("click:  my chan "), [Step::Click("my chan".into())]);
     }
 
@@ -779,13 +811,14 @@ mod tests {
     }
 
     #[test]
-    fn echo_message_say_sends_only_the_echo() {
+    fn echo_message_say_shows_a_pending_line() {
         let fx = parse_fixture(DEMO).unwrap();
         let (_, mut sessions) = feed(&fx).unwrap();
         let s = sessions.get_mut("demo").unwrap();
         assert!(s.caps().is_enabled("echo-message"));
         let out = s.command(Command::Say { network: "demo".into(), target: "#general".into(), text: "hi".into() }, Utc::now());
-        assert!(out.iter().all(|o| !matches!(o, Output::Event(Event::Line { .. }))), "the server's echo is the copy we show: {out:?}");
+        let pending = |o: &Output| matches!(o, Output::Event(Event::Line { line, .. }) if line.delivery == hirc_core::store::Delivery::Pending);
+        assert_eq!(out.iter().filter(|o| pending(o)).count(), 1, "shown at once, waiting for the server's echo: {out:?}");
         // Without echo-message the other network shows the line locally.
         let s = sessions.get_mut("other").unwrap();
         let out = s.command(Command::Say { network: "other".into(), target: "#rust".into(), text: "hi".into() }, Utc::now());
@@ -824,9 +857,11 @@ mod tests {
         let s = sessions.get_mut("demo").unwrap();
         let mut n = 0;
         let (events, _) = answer(s, Command::Say { network: "demo".into(), target: "#general".into(), text: "hello world".into() }, Utc::now(), &mut n);
+        // Our pending line, then the server's echo, which takes its place.
         let lines: Vec<_> = events.iter().filter(|e| matches!(e, Event::Line { .. })).collect();
-        assert_eq!(lines.len(), 1, "{events:?}");
-        assert!(matches!(lines[0], Event::Line { line, .. } if line.text == "hello world"));
+        assert_eq!(lines.len(), 2, "{events:?}");
+        assert!(lines.iter().all(|e| matches!(e, Event::Line { line, .. } if line.text == "hello world")));
+        assert!(!is_echo(lines[0]) && is_echo(lines[1]));
         // A session without echo-message shows the line locally, once.
         let s = sessions.get_mut("other").unwrap();
         let (events, _) = answer(s, Command::Say { network: "other".into(), target: "#rust".into(), text: "yo".into() }, Utc::now(), &mut n);

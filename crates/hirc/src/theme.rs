@@ -43,7 +43,9 @@ pub struct Palette {
     pub quiet: Hsla,
     /// The input's placeholder: as `quiet`, against the input's background.
     pub hint: Hsla,
-    /// A recognised `/command` in the input (`buffer.code`).
+    /// A recognised `/command` in the input: `buffer.code`, or `buffer.url`
+    /// where the code colour is too near body text to tell apart (see
+    /// `apart_from`).
     pub code: Hsla,
     pub action: Hsla,
     pub server: Hsla,
@@ -110,6 +112,21 @@ fn fill_apart(bg: Color, apart: Color, candidates: &[Color]) -> Color {
         .find(|c| c.a == 255 && contrast(**c, bg) >= FILL_CONTRAST && contrast(**c, apart) >= FILL_CONTRAST)
         .copied()
         .unwrap_or_else(|| fill(bg, candidates))
+}
+
+/// How far (OKLab distance) a colour that marks something in running
+/// text keeps from the text itself, so it reads as a different colour at
+/// a glance and not as a tint of it.
+const TEXT_APART: f32 = 0.1;
+
+/// The first of `candidates` at least `TEXT_APART` from `text`, else the
+/// furthest.
+fn apart_from(text: Color, candidates: &[Color]) -> Color {
+    let far = |c: &Color| {
+        let ([a, b, l], [x, y, z]) = (oklab(*c), oklab(text));
+        ((a - x).powi(2) + (b - y).powi(2) + (l - z).powi(2)).sqrt()
+    };
+    candidates.iter().find(|c| far(c) >= TEXT_APART).or_else(|| candidates.iter().max_by(|a, b| far(a).total_cmp(&far(b)))).copied().unwrap_or(text)
 }
 
 /// The most hues nick colours use. Fewer, further apart, read better than
@@ -373,7 +390,7 @@ pub fn palette(t: &Theme) -> Palette {
         timestamp: c(t.buffer.timestamp),
         quiet: c(legible(t.buffer.background, &quiet)),
         hint: c(legible(t.buffer.background_text_input, &quiet)),
-        code: c(t.buffer.code),
+        code: c(apart_from(t.text.primary, &[t.buffer.code, t.buffer.url])),
         action: c(t.buffer.action),
         server: c(t.buffer.server_messages.default),
         topic: c(t.buffer.topic),
@@ -390,6 +407,15 @@ mod tests {
         assert!((contrast(black, white) - 21.).abs() < 0.01);
         assert_eq!(contrast(white, black), contrast(black, white));
         assert_eq!(contrast(white, white), 1.);
+    }
+
+    #[test]
+    fn a_command_colour_stands_apart_from_text() {
+        let (text, code, url) = (Color::rgb(0xcdd6f4), Color::rgb(0xb7bdf8), Color::rgb(0x89b4fa));
+        // Mocha's code colour is a tint of its text; the link colour is not.
+        assert_eq!(apart_from(text, &[code, url]), url);
+        // Latte's is plainly apart.
+        assert_eq!(apart_from(Color::rgb(0x4c4f69), &[Color::rgb(0x7287fd), Color::rgb(0x1e66f5)]), Color::rgb(0x7287fd));
     }
 
     #[test]

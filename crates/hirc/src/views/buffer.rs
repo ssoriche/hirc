@@ -15,14 +15,16 @@ use crate::theme::Palette;
 use gpui::{AnyElement, FontWeight, HighlightStyle, Hsla, IntoElement, SharedString, StyledText, TextRun, Window, div, prelude::*, px};
 use hirc_core::display::{self, Part};
 use hirc_core::event::{ConnStatus, Target};
-use hirc_core::store::{Line, LineKind};
+use hirc_core::store::{Delivery, Line, LineKind, Peer, Presence};
 use std::collections::HashMap;
 
 /// The title bar, one field rhythm for every window: the window's
 /// identity (its name, in bold, and the network tag as the window list
 /// shows it, a cell apart), then two cells on, its state when it is not
 /// simply usable (a mark and a word, then what to do about it), then two
-/// cells on, the topic (or, for a server, why it went down). A state reads
+/// cells on, the topic (for a query, the peer's `user@host`). The state
+/// is the network's when it is down, else a channel's when we are not in
+/// it, else a query peer's presence (online, away, quit). A state reads
 /// the same in a channel as in its server buffer, and only the state is
 /// ever red. Each field is cut to fit with an ellipsis that ends on the
 /// bar's padding, and the name never takes more than `NAME_SHARE` while
@@ -34,28 +36,36 @@ pub fn title(app: &HircApp, window: &Window, pane: f32) -> impl IntoElement {
     let (name, tag, state, rest): (String, Option<Piece>, Vec<Piece>, Vec<Piece>) = match app.current() {
         Some((net, buf)) => match &buf.target {
             Target::Server => {
+                // Why it went down is the log's to say (it stays true);
+                // the header keeps the live state.
                 let state = match &net.status {
-                    ConnStatus::Connected { nick } => vec![(format!("● connected as {nick}"), p.success)],
+                    ConnStatus::Connected { nick } => vec![("● connected".to_owned(), p.success), (format!(" as {nick}"), p.text_dim)],
                     ConnStatus::Connecting | ConnStatus::Idle => vec![("● connecting".to_owned(), p.text_dim)],
                     _ => network_state(p, net, now),
                 };
-                let reason = match &net.status {
-                    ConnStatus::Disconnected { reason, .. } | ConnStatus::Failed { reason } if !reason.is_empty() => vec![(reason.clone(), p.topic)],
-                    _ => vec![],
-                };
-                (net.name.clone(), None, state, reason)
+                (net.name.clone(), None, state, vec![])
             }
             target => {
                 let channel = matches!(target, Target::Channel(_));
+                let name = target.name().unwrap_or_default();
+                let peer = net.peer(name);
+                // The way back in is the input line's to say.
                 let state = match () {
                     _ if net.status.is_down() => network_state(p, net, now),
-                    _ if channel && !buf.joined => vec![("○ not joined".to_owned(), p.text_dim), (" — /join to rejoin".to_owned(), p.text_dim)],
-                    _ => vec![],
+                    _ if channel && !buf.joined => vec![("○ not joined".to_owned(), p.text_dim)],
+                    _ if channel => vec![],
+                    _ => peer_state(p, peer),
                 };
                 let topic = match &buf.topic {
                     Some(t) if channel && !t.is_empty() => vec![(t.clone(), p.topic)],
                     _ if channel && state.is_empty() => vec![("(no topic)".to_owned(), p.topic)],
-                    _ => vec![],
+                    _ if channel => vec![],
+                    // A query's third field: who the peer is, when known.
+                    _ => match peer.and_then(|peer| peer.host.clone()) {
+                        Some(host) => vec![(host, p.topic)],
+                        None if state.is_empty() => vec![("private".to_owned(), p.topic)],
+                        None => vec![],
+                    },
                 };
                 (target.name().unwrap_or_default().to_owned(), Some((net.name.clone(), p.text_dim)), state, topic)
             }
@@ -144,6 +154,21 @@ fn network_state(p: &Palette, net: &hirc_core::store::Network, now: chrono::Date
     vec![(mark.to_owned(), color), (format!(" — {next}"), p.text_dim)]
 }
 
+/// A query peer's presence, as a state field: a mark and a word, then
+/// what goes with it. Empty while nothing is known (or the network is
+/// down, which the network's state says).
+fn peer_state(p: &Palette, peer: Option<&Peer>) -> Vec<Piece> {
+    let Some(peer) = peer else { return vec![] };
+    let detail = |s: &str| (!s.is_empty()).then(|| (format!(" — {s}"), p.text_dim));
+    match (&peer.presence, &peer.away) {
+        (Presence::Online, Some(away)) => [Some(("● away".to_owned(), p.text_dim)), detail(away)].into_iter().flatten().collect(),
+        (Presence::Online, None) => vec![("● online".to_owned(), p.success)],
+        (Presence::Quit(reason), _) => [Some(("○ quit".to_owned(), p.text_dim)), detail(reason)].into_iter().flatten().collect(),
+        (Presence::Renamed(new), _) => vec![("○ renamed".to_owned(), p.text_dim), (format!(" — now {new}"), p.text_dim)],
+        (Presence::Unknown, _) => vec![],
+    }
+}
+
 /// `pieces` joined and cut after byte `head` of the joined text: each
 /// piece keeps its colour up to the cut, and an ellipsis in the colour of
 /// the piece it cuts ends the line.
@@ -199,7 +224,9 @@ pub fn banner(app: &HircApp, message: String) -> impl IntoElement {
         .child(div().flex_none().child(display::marker(LineKind::Error)))
         .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).child({
             let mut runs = Runs::default();
-            runs.push(&message, p.error, false).push(" (Esc in NORMAL mode to dismiss)", p.text_dim, false);
+            // The marker carries the error, as on a message line; the
+            // sentence is text.
+            runs.push(&message, p.text, false).push(" (Esc in NORMAL mode to dismiss)", p.text_dim, false);
             runs.element()
         }))
 }
@@ -277,9 +304,11 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
         shown
     };
     match line.kind {
+        // Ours, not yet echoed by the server (or lost with the
+        // connection): the text a step down until it is confirmed.
         LineKind::Privmsg => {
             nick_run(&mut prefix, p, &fit_nick(cells), cx);
-            body.push(&line.text, p.text, false);
+            body.push(&line.text, if line.delivery == Delivery::Sent { p.text } else { p.text_dim }, false);
         }
         // A notice: irssi's `-nick-`, the dashes in the event colour so
         // they read as a marker, and the text a step below conversation.
@@ -292,7 +321,8 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
         LineKind::Action => {
             prefix.push("*", p.action, false);
             nick_run(&mut body, p, nick, cx);
-            body.push(" ", p.action, false).push(&line.text, p.action, false);
+            let color = if line.delivery == Delivery::Sent { p.action } else { p.text_dim };
+            body.push(" ", color, false).push(&line.text, color, false);
         }
         // The marker carries the error, as arrows carry joins; the
         // sentence is text, so red never covers a whole line.
@@ -300,11 +330,12 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
             prefix.push(display::marker(line.kind), p.error, false);
             body.push(&line.text, p.text, false);
         }
-        // A change of connection state: status, so it reads above the
-        // server's own chatter (`--`, quiet text) but is not an error.
+        // hirc's own voice (a quit, an answer to a command): irssi's
+        // `-!-`, so it never reads as the server's `--` chatter, and the
+        // text a step below conversation.
         LineKind::Status => {
             prefix.push(display::marker(line.kind), p.server, false);
-            body.push(&line.text, p.text, false);
+            body.push(&line.text, p.text_dim, false);
         }
         LineKind::Server | LineKind::Notice => {
             prefix.push(display::marker(line.kind), p.server, false);
@@ -333,6 +364,14 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
             }
         }
     }
+    // The time cell says where a line we sent stands until the server
+    // has it: `…` while it waits for the echo, `✕` once the connection
+    // dropped first (it may never have gone out).
+    let (time, time_color) = match line.delivery {
+        Delivery::Sent => (time, if mention { p.text_dim } else { p.timestamp }),
+        Delivery::Pending => ("…".to_owned(), p.timestamp),
+        Delivery::Unsent => ("✕".to_owned(), p.error),
+    };
     // `w_full`: gpui's list measures each row as a root with a definite width,
     // and an auto-width flex root would size to its content and never wrap.
     // Rows have no vertical padding: every row is whole text lines, so the
@@ -343,7 +382,7 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
         .min_w(px(0.))
         .px(px(m.gutter))
         .when(mention, |d| d.bg(p.highlight))
-        .child(div().flex_none().w(px(m.grid(TIME_CELLS))).whitespace_nowrap().text_color(if mention { p.text_dim } else { p.timestamp }).child(time))
+        .child(div().flex_none().w(px(m.grid(TIME_CELLS))).whitespace_nowrap().text_color(time_color).child(time))
         .child(nick_column(app, cells, prefix, cut.map(|full| (full, line.seq))))
         .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).child(body.element()))
         .into_any_element()

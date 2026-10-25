@@ -2,9 +2,9 @@
 //! server time (arrival order breaks ties), and a msgid seen twice is kept
 //! once, so a live copy and a replayed copy of a message collapse.
 
-use crate::event::{ConnStatus, Event, Target};
+use crate::event::{ConnStatus, Event, PeerChange, Target};
 use chrono::{DateTime, Utc};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
@@ -38,6 +38,43 @@ pub struct Line {
     pub text: String,
     /// Sent by us.
     pub own: bool,
+    /// For a line we sent: whether the server has it yet.
+    pub delivery: Delivery,
+}
+
+/// Where a line we sent stands. Everything else is `Sent`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Delivery {
+    #[default]
+    Sent,
+    /// Shown the moment it was sent, waiting for the server's echo
+    /// (echo-message), which takes its place.
+    Pending,
+    /// The connection dropped before the echo came: it may never have
+    /// gone out.
+    Unsent,
+}
+
+/// What we know of another user on a network, for a query's header.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Peer {
+    pub presence: Presence,
+    /// Their away message, while they are marked away.
+    pub away: Option<String>,
+    /// `user@host`, from the last message that carried it.
+    pub host: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Presence {
+    /// Nothing seen since we connected.
+    #[default]
+    Unknown,
+    Online,
+    /// Quit the network, with their reason (maybe empty).
+    Quit(String),
+    /// Changed nick: now this one.
+    Renamed(String),
 }
 
 #[derive(Debug)]
@@ -69,6 +106,15 @@ impl Buffer {
         let ix = self.lines.partition_point(|l| (l.time, l.seq) <= (line.time, line.seq));
         self.lines.insert(ix, line);
         Some(ix)
+    }
+
+    /// The pending line our echo `line` confirms: our own line of the same
+    /// kind and text still waiting (the oldest, if several).
+    fn pending_for(&self, line: &Line) -> Option<usize> {
+        if !line.own || line.delivery != Delivery::Sent {
+            return None;
+        }
+        self.lines.iter().position(|l| l.delivery != Delivery::Sent && l.kind == line.kind && l.text == line.text)
     }
 
     /// Where the unread lines begin: the first of the last `unread`
@@ -107,6 +153,9 @@ pub struct Network {
     /// `buffers[0]` is the server buffer. Buffers are never removed, so
     /// indexes stay valid.
     pub buffers: Vec<Buffer>,
+    /// Other users, by lowercased nick: what this connection has seen of
+    /// them.
+    pub peers: HashMap<String, Peer>,
 }
 
 impl Network {
@@ -117,6 +166,38 @@ impl Network {
         let since = self.since.unwrap_or(now);
         let left = retry.as_millis() as i64 - (now - since).num_milliseconds();
         Some((left.max(0) as u64).div_ceil(1000))
+    }
+
+    /// What we know of `nick` (ASCII case-insensitive).
+    pub fn peer(&self, nick: &str) -> Option<&Peer> {
+        self.peers.get(&nick.to_ascii_lowercase())
+    }
+
+    fn see(&mut self, nick: &str, change: PeerChange) {
+        let key = nick.to_ascii_lowercase();
+        match change {
+            PeerChange::Seen { host } => {
+                let peer = self.peers.entry(key).or_default();
+                peer.presence = Presence::Online;
+                if host.is_some() {
+                    peer.host = host;
+                }
+            }
+            PeerChange::Away(away) => {
+                let peer = self.peers.entry(key).or_default();
+                peer.presence = Presence::Online;
+                peer.away = away;
+            }
+            PeerChange::Quit(reason) => {
+                let peer = self.peers.entry(key).or_default();
+                peer.presence = Presence::Quit(reason);
+                peer.away = None;
+            }
+            PeerChange::Renamed(new) => {
+                let old = self.peers.insert(key, Peer { presence: Presence::Renamed(new.clone()), ..Peer::default() }).unwrap_or_default();
+                self.peers.insert(new.to_ascii_lowercase(), Peer { presence: Presence::Online, ..old });
+            }
+        }
     }
 }
 
@@ -135,6 +216,15 @@ pub enum Applied {
     Lines {
         network: usize,
         at: Vec<(usize, usize)>,
+    },
+    /// The server's echo took the place of our pending line: the line at
+    /// `removed` went, then the echo went in at `index` (`None` when its
+    /// msgid was already here).
+    Replaced {
+        network: usize,
+        buffer: usize,
+        removed: usize,
+        index: Option<usize>,
     },
 }
 
@@ -160,7 +250,14 @@ impl Store {
         if let Some(i) = self.networks.iter().position(|n| n.name == name) {
             return i;
         }
-        self.networks.push(Network { name: name.to_owned(), status: ConnStatus::Idle, since: None, nick: None, buffers: vec![Buffer::new(Target::Server)] });
+        self.networks.push(Network {
+            name: name.to_owned(),
+            status: ConnStatus::Idle,
+            since: None,
+            nick: None,
+            buffers: vec![Buffer::new(Target::Server)],
+            peers: HashMap::new(),
+        });
         self.networks.len() - 1
     }
 
@@ -176,7 +273,16 @@ impl Store {
     /// A line hirc itself writes (errors, notices about input). Returns its index.
     pub fn push_local(&mut self, network: usize, buffer: usize, kind: LineKind, text: String) -> usize {
         self.local_seq += 1;
-        let line = Line { seq: u64::MAX / 2 + self.local_seq, time: self.clock.unwrap_or_else(Utc::now), msgid: None, kind, nick: None, text, own: true };
+        let line = Line {
+            seq: u64::MAX / 2 + self.local_seq,
+            time: self.clock.unwrap_or_else(Utc::now),
+            msgid: None,
+            kind,
+            nick: None,
+            text,
+            own: true,
+            delivery: Delivery::Sent,
+        };
         self.networks[network].buffers[buffer].insert(line).unwrap_or(0)
     }
 
@@ -198,9 +304,20 @@ impl Store {
                     None => Vec::new(),
                 };
                 if matches!(status, ConnStatus::Connecting) || status.is_down() {
-                    // The server forgets our channels with the connection.
-                    for b in &mut self.networks[n].buffers {
+                    // The server forgets our channels with the connection,
+                    // and what we saw of others is no longer news.
+                    let net = &mut self.networks[n];
+                    net.peers.clear();
+                    for b in &mut net.buffers {
                         b.joined = false;
+                    }
+                }
+                if status.is_down() {
+                    // An echo that has not come by now never will: say so.
+                    for l in self.networks[n].buffers.iter_mut().flat_map(|b| b.lines.iter_mut()) {
+                        if l.delivery == Delivery::Pending {
+                            l.delivery = Delivery::Unsent;
+                        }
                     }
                 }
                 self.networks[n].status = status;
@@ -213,6 +330,11 @@ impl Store {
             Event::OwnNick { network, nick } => {
                 let n = self.network_ix(&network);
                 self.networks[n].nick = Some(nick);
+                Applied::Changed
+            }
+            Event::Peer { network, nick, change } => {
+                let n = self.network_ix(&network);
+                self.networks[n].see(&nick, change);
                 Applied::Changed
             }
             Event::Joined { network, channel } => self.set_joined(&network, channel, true),
@@ -231,6 +353,11 @@ impl Store {
                 let me = net.nick.as_deref();
                 let mention = counts && (matches!(target, Target::Query(_)) || me.is_some_and(|me| crate::display::mentions(&line.text, me)));
                 let buf = &mut net.buffers[b];
+                if let Some(removed) = buf.pending_for(&line) {
+                    buf.lines.remove(removed);
+                    let index = buf.insert(line);
+                    return Applied::Replaced { network: n, buffer: b, removed, index };
+                }
                 match buf.insert(line) {
                     Some(index) => {
                         if counts {
@@ -256,15 +383,15 @@ impl Store {
 }
 
 /// What a change of connection state says, and how loud: a fault is an
-/// error, a quit the user chose is a plain status line. Each says what
-/// happens next and how to act on it.
+/// error, a quit the user chose is a plain status line. Scrollback keeps
+/// only what happened and why, which stays true however late it is read;
+/// what happens next (a countdown) and what to do live in the header and
+/// the input line, which follow the state.
 pub fn status_line(network: &str, status: &ConnStatus) -> Option<(LineKind, String)> {
     match status {
-        ConnStatus::Disconnected { reason, retry } => {
-            Some((LineKind::Error, format!("Disconnected from {network}: {reason}. Reconnecting in {}s — /reconnect to retry now", retry.as_secs().max(1))))
-        }
-        ConnStatus::Failed { reason } => Some((LineKind::Error, format!("Disconnected from {network}: {reason}. Not retrying — /reconnect to try again"))),
-        ConnStatus::Offline => Some((LineKind::Status, format!("{network} is offline — /reconnect"))),
+        ConnStatus::Disconnected { reason, .. } => Some((LineKind::Error, format!("Disconnected from {network}: {reason}"))),
+        ConnStatus::Failed { reason } => Some((LineKind::Error, format!("Could not connect to {network}: {reason}"))),
+        ConnStatus::Offline => Some((LineKind::Status, format!("Disconnected from {network} (you quit)"))),
         _ => None,
     }
 }
@@ -278,7 +405,16 @@ mod tests {
     }
 
     fn line(seq: u64, secs: i64, msgid: Option<&str>, text: &str) -> Line {
-        Line { seq, time: at(secs), msgid: msgid.map(Into::into), kind: LineKind::Privmsg, nick: Some("bob".into()), text: text.into(), own: false }
+        Line {
+            seq,
+            time: at(secs),
+            msgid: msgid.map(Into::into),
+            kind: LineKind::Privmsg,
+            nick: Some("bob".into()),
+            text: text.into(),
+            own: false,
+            delivery: Delivery::Sent,
+        }
     }
 
     #[test]
@@ -381,7 +517,7 @@ mod tests {
             s.apply(Event::Status { network: "net".into(), status: ConnStatus::Disconnected { reason: "x".into(), retry: std::time::Duration::from_secs(2) } });
         // Server, #in and the query; not #out, which we had left.
         assert_eq!(applied, Applied::Lines { network: 0, at: vec![(0, 0), (1, 0), (3, 0)] });
-        assert_eq!(s.networks[0].buffers[1].lines[0].text, "Disconnected from net: x. Reconnecting in 2s — /reconnect to retry now");
+        assert_eq!(s.networks[0].buffers[1].lines[0].text, "Disconnected from net: x");
     }
 
     #[test]
@@ -418,9 +554,53 @@ mod tests {
     #[test]
     fn a_quit_is_not_an_error() {
         let (kind, text) = status_line("net", &ConnStatus::Offline).unwrap();
-        assert_eq!((kind, text.as_str()), (LineKind::Status, "net is offline — /reconnect"));
+        assert_eq!((kind, text.as_str()), (LineKind::Status, "Disconnected from net (you quit)"));
         let (kind, _) = status_line("net", &ConnStatus::Failed { reason: "SASL failed".into() }).unwrap();
         assert_eq!(kind, LineKind::Error);
         assert_eq!(status_line("net", &ConnStatus::Connecting), None);
+    }
+
+    fn mine(seq: u64, secs: i64, msgid: Option<&str>, text: &str, delivery: Delivery) -> Line {
+        Line { own: true, nick: Some("me".into()), delivery, ..line(seq, secs, msgid, text) }
+    }
+
+    #[test]
+    fn the_echo_takes_the_pending_lines_place() {
+        let mut s = Store::new(["net".to_string()]);
+        let chan = || Target::Channel("#a".into());
+        let ev = |line| Event::Line { network: "net".into(), target: chan(), line };
+        s.apply(ev(line(1, 1, None, "before")));
+        assert_eq!(s.apply(ev(mine(2, 2, None, "hi", Delivery::Pending))), Applied::Line { network: 0, buffer: 1, index: 1 });
+        s.apply(ev(mine(3, 2, None, "again", Delivery::Pending)));
+        // The echo of "hi" replaces it; "again" still waits.
+        assert_eq!(s.apply(ev(mine(9, 3, Some("m1"), "hi", Delivery::Sent))), Applied::Replaced { network: 0, buffer: 1, removed: 1, index: Some(2) });
+        let lines: Vec<_> = s.networks[0].buffers[1].lines.iter().map(|l| (l.text.as_str(), l.delivery)).collect();
+        assert_eq!(lines, [("before", Delivery::Sent), ("again", Delivery::Pending), ("hi", Delivery::Sent)]);
+        // Someone else saying the same is no echo.
+        assert!(matches!(s.apply(ev(line(10, 4, None, "again"))), Applied::Line { .. }));
+        // A drop leaves what never came back marked.
+        s.apply(Event::Status { network: "net".into(), status: ConnStatus::Disconnected { reason: "x".into(), retry: std::time::Duration::from_secs(2) } });
+        assert_eq!(s.networks[0].buffers[1].lines.iter().find(|l| l.text == "again" && l.own).unwrap().delivery, Delivery::Unsent);
+    }
+
+    #[test]
+    fn peers_follow_what_the_session_saw() {
+        let mut s = Store::new(["net".to_string()]);
+        let peer = |s: &mut Store, nick: &str, change| s.apply(Event::Peer { network: "net".into(), nick: nick.into(), change });
+        peer(&mut s, "Carol", PeerChange::Seen { host: Some("c@h".into()) });
+        peer(&mut s, "carol", PeerChange::Away(Some("lunch".into())));
+        let carol = s.networks[0].peer("CAROL").unwrap().clone();
+        assert_eq!(carol, Peer { presence: Presence::Online, away: Some("lunch".into()), host: Some("c@h".into()) });
+        // Seen again (no host on a NAMES reply): still away, host kept.
+        peer(&mut s, "carol", PeerChange::Seen { host: None });
+        assert_eq!(s.networks[0].peer("carol"), Some(&carol));
+        peer(&mut s, "carol", PeerChange::Renamed("carla".into()));
+        assert_eq!(s.networks[0].peer("carol").unwrap().presence, Presence::Renamed("carla".into()));
+        assert_eq!(s.networks[0].peer("carla").unwrap().away.as_deref(), Some("lunch"));
+        peer(&mut s, "carla", PeerChange::Quit("bye".into()));
+        assert_eq!(s.networks[0].peer("carla").unwrap(), &Peer { presence: Presence::Quit("bye".into()), away: None, host: Some("c@h".into()) });
+        // A new connection knows no one.
+        s.apply(Event::Status { network: "net".into(), status: ConnStatus::Connecting });
+        assert_eq!(s.networks[0].peer("carla"), None);
     }
 }
