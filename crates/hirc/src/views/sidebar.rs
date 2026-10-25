@@ -22,17 +22,21 @@
 //! and a bold label; hover is only a faint wash.
 //!
 //! Each state has one look. Dimming means only "this network is down":
-//! every row of it, its server row included, is dimmed as a whole, the
-//! selected row too (its fill says it is selected, its dimmed text that
-//! it is down). Red marks a fault: a red tag, never dimmed, and on a
-//! server row a red ring while hirc retries, a red dot once it has given
-//! up; a network the user quit is offline, not failed: a quiet ring. A
+//! every row of it, its server row included, is dimmed, except the
+//! selected row's name and number, which the user is reading (its tag
+//! and state mark say it is down), and a mention count, which still
+//! matters. Every window of a down network carries the server row's mark
+//! in its state column while it has no count. Red marks a fault: a red
+//! tag, never dimmed, and a red ring while hirc retries, a red dot once
+//! it has given up; a network the user quit is offline, not failed: a
+//! quiet ring. A
 //! channel we are not in, on a live network, keeps its row and says so
 //! the way the header does: a quiet `○` in the state column and its name
 //! in `text.secondary`. A server row's state sits in that column too, a
 //! dot or a ring, so every window's state reads down one column; its
 //! unread lines show in its label's colour (and lines meant for us as the
-//! count, which then takes the column).
+//! count, which then takes the column). A row with no tag lets its label
+//! run up to a mark (one cell), as there is nothing else between them.
 //!
 //! Rows are one text line apart, the message view's own pitch, so the
 //! list and the conversation beside it share one line grid (a terminal's
@@ -42,8 +46,8 @@
 //! A list too long for its pane keeps a row at the top while rows are
 //! hidden above, and one at the bottom while rows are hidden below; each
 //! says how many, with the same columns as a window row (their unread
-//! lines, on the mention fill when some are for us, and the server row's
-//! fault mark when a network among them is down by a fault); a click
+//! lines, on the mention fill when some are for us, and in the network
+//! column, in red, the networks among them down by a fault); a click
 //! scrolls them in. Scrolled to the end, the bottom row goes and the list
 //! takes its place.
 
@@ -204,8 +208,9 @@ enum Count {
 }
 
 /// The unread column: `count` lines, in reverse video when some are
-/// meant for us.
-fn count_cell(app: &HircApp, count: Count, mention: bool, dimmed: bool) -> impl IntoElement {
+/// meant for us (never dimmed: a mention still matters on a network that
+/// is down). `narrow`: a mark takes one cell, and the label the rest.
+fn count_cell(app: &HircApp, count: Count, mention: bool, dimmed: bool, narrow: bool) -> impl IntoElement {
     let p = &app.palette;
     let m = &app.metrics;
     // The digits stay on the column's right edge; the fill runs half a
@@ -219,14 +224,14 @@ fn count_cell(app: &HircApp, count: Count, mention: bool, dimmed: bool) -> impl 
                 .flex_none()
                 .flex()
                 .justify_end()
-                .w(px(m.count_width()))
+                .w(px(if narrow { m.cells(1.) } else { m.count_width() }))
                 .mr(px(half))
                 .text_color(color)
                 .when(dimmed && !fault, |d| d.opacity(DIM))
                 .child(mark);
         }
     };
-    div().flex_none().flex().justify_end().w(px(m.count_width())).mr(px(half)).when(dimmed, |d| d.opacity(DIM)).children(count.map(|c| {
+    div().flex_none().flex().justify_end().w(px(m.count_width())).mr(px(half)).when(dimmed && !mention, |d| d.opacity(DIM)).children(count.map(|c| {
         div()
             .when(!mention, |d| d.text_color(p.unread))
             .when(mention, |d| {
@@ -270,27 +275,36 @@ fn row(app: &HircApp, cols: &Columns, pos: usize, n: usize, b: usize, cx: &mut C
         _ if selected => p.selected_text,
         _ => p.text,
     };
-    // The network tag, red for a fault.
+    // The network tag, red for a fault; on the selected fill, its own
+    // role still, a step below the name.
     let tag_color = if fault {
         p.error
     } else if selected {
-        p.selected_text
+        p.selected_tag
     } else {
-        p.text_dim
+        p.tag
     };
-    // The state column: unread lines, else the window's state.
+    // The network's state, as its server row marks it.
+    let state = match net.status {
+        ConnStatus::Connected { .. } => Count::Mark("●", p.success, false),
+        ConnStatus::Connecting | ConnStatus::Idle => Count::Mark("●", p.text_dim, false),
+        ConnStatus::Disconnected { .. } => Count::Mark("○", p.error, true),
+        ConnStatus::Failed { .. } => Count::Mark("●", p.error, true),
+        ConnStatus::Offline => Count::Mark("○", p.text_dim, false),
+    };
+    // The state column: unread lines, else the window's state (a down
+    // network's on every window of it).
     let count = match () {
         _ if buf.unread > 0 && !selected && (!is_server || buf.mentions > 0) => Count::Lines(buf.unread),
-        _ if is_server => match net.status {
-            ConnStatus::Connected { .. } => Count::Mark("●", p.success, false),
-            ConnStatus::Connecting | ConnStatus::Idle => Count::Mark("●", p.text_dim, false),
-            ConnStatus::Disconnected { .. } => Count::Mark("○", p.error, true),
-            ConnStatus::Failed { .. } => Count::Mark("●", p.error, true),
-            ConnStatus::Offline => Count::Mark("○", p.text_dim, false),
-        },
+        _ if is_server || dimmed => state,
         _ if parted => Count::Mark("○", p.text_dim, false),
         _ => Count::None,
     };
+    let tagged = !is_server && cols.tags;
+    let narrow = !tagged && matches!(count, Count::Mark(..));
+    // The selected row's name and number are what the user is reading:
+    // never dimmed.
+    let faded = dimmed && !selected;
     grid(m, ("window", pos))
         .when(selected, |d| d.bg(p.selected))
         .when(!selected, |d| d.hover(|s| s.bg(p.hover)))
@@ -300,7 +314,7 @@ fn row(app: &HircApp, cols: &Columns, pos: usize, n: usize, b: usize, cx: &mut C
                 .w(px(cols.number))
                 .text_right()
                 .text_color(if selected { p.selected_text } else { p.text_dim })
-                .when(dimmed, |d| d.opacity(DIM))
+                .when(faded, |d| d.opacity(DIM))
                 .child((pos + 1).to_string()),
         )
         .child(
@@ -310,12 +324,12 @@ fn row(app: &HircApp, cols: &Columns, pos: usize, n: usize, b: usize, cx: &mut C
                 .truncate()
                 .text_color(label_color)
                 .when(selected, |d| d.font_weight(FontWeight::BOLD))
-                .when(dimmed, |d| d.opacity(DIM))
+                .when(faded, |d| d.opacity(DIM))
                 .child(label),
         )
         // A server row's label is the network, so it takes the tag's
         // column; with the tags left out, a window's label does too.
-        .when(!is_server && cols.tags, |d| {
+        .when(tagged, |d| {
             d.child(
                 tag_cell(cols, net.name.clone().into())
                     .text_color(tag_color)
@@ -323,35 +337,45 @@ fn row(app: &HircApp, cols: &Columns, pos: usize, n: usize, b: usize, cx: &mut C
                     .when(dimmed && !fault, |d| d.opacity(DIM)),
             )
         })
-        .child(count_cell(app, count, buf.mentions > 0, dimmed))
+        .child(count_cell(app, count, buf.mentions > 0, dimmed, narrow))
         .on_click(cx.listener(move |this, _, _, cx| this.select(n, b, cx)))
 }
 
 /// The row at one end of a list that overflows, for the `windows` hidden
-/// past it: `arrow`, how many, the mark of a network among them down by a
-/// fault (as its server row shows it), and their unread lines. A click
-/// scrolls row `reveal` into view.
+/// past it: `arrow`, how many, the networks among them down by a fault
+/// (named in red in the network column, as their rows' tags are), and
+/// their unread lines. A click scrolls row `reveal` into view.
 fn edge(app: &HircApp, cols: &Columns, arrow: &'static str, windows: &[(usize, usize)], reveal: usize, cx: &mut Context<HircApp>) -> AnyElement {
     let p = &app.palette;
     let m = &app.metrics;
     let nets = &app.store.networks;
-    // A fault among them, as the server row marks it: a ring while hirc
-    // retries, a dot once it has given up.
-    let fault = windows.iter().map(|&(n, _)| &nets[n].status).find(|s| s.is_fault()).map(|s| match s {
-        ConnStatus::Disconnected { .. } => "○",
-        _ => "●",
-    });
+    // The networks among them down by a fault, each once, in order.
+    let mut faults: Vec<&str> = Vec::new();
+    for &(n, _) in windows {
+        if nets[n].status.is_fault() && !faults.contains(&nets[n].name.as_str()) {
+            faults.push(&nets[n].name);
+        }
+    }
     let unread: usize = windows.iter().map(|&(n, b)| nets[n].buffers[b].unread).sum();
     let mention = windows.iter().any(|&(n, b)| nets[n].buffers[b].mentions > 0);
+    let faulted = !faults.is_empty();
+    let faults = faults.join(", ");
+    // Unread lines; with no network column to name a fault in, the
+    // state column's red ring, as a faulted window's own row shows it.
+    let count = match () {
+        _ if unread > 0 => Count::Lines(unread),
+        _ if faulted && !cols.tags => Count::Mark("○", p.error, true),
+        _ => Count::None,
+    };
     grid(m, ("edge", reveal))
         .hover(|s| s.bg(p.hover))
         .text_color(p.text_dim)
         .child(div().flex_none().w(px(cols.number)).text_right().child(arrow))
         .child(div().flex_1().min_w(px(0.)).truncate().child(format!("{} more", windows.len())))
-        // The network column: a network among them that is down by a
-        // fault (a row of many windows has no one network to name).
-        .child(tag_cell(cols, fault.unwrap_or_default().into()).w(px(m.cell.ceil())).text_color(p.error))
-        .child(count_cell(app, if unread > 0 { Count::Lines(unread) } else { Count::None }, mention, false))
+        // The network column: the faulted networks, red as their tags
+        // are (with no tags, they stay out of the row, as tags do).
+        .when(cols.tags, |d| d.child(tag_cell(cols, faults.into()).text_color(p.error)))
+        .child(count_cell(app, count, mention, false, false))
         .on_click(cx.listener(move |this, _, _, cx| {
             this.sidebar_scroll.scroll_to_item(reveal);
             cx.notify();

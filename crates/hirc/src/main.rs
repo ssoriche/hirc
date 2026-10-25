@@ -8,6 +8,7 @@ mod snapshot;
 mod theme;
 mod views;
 mod vim;
+mod wrap;
 
 use app::{HircApp, Init, Quit};
 use gpui::{App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size};

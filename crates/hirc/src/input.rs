@@ -343,6 +343,9 @@ struct PrepaintState {
     /// `…` at an edge with text scrolled out of view past it, over a
     /// background-coloured cell.
     marks: Vec<(PaintQuad, Pixels, ShapedLine)>,
+    /// While the ex line is open, the draft it parked: at the row's far
+    /// end in the placeholder's role, and where it starts.
+    parked: Option<(ShapedLine, Pixels)>,
 }
 
 impl IntoElement for TextElement {
@@ -479,8 +482,12 @@ impl Element for TextElement {
             // none, and the placeholder's first glyph may follow), before
             // the text column, in the cell's gap after the mode label. The
             // ex line's `:` is that glyph before it, flush to the column.
+            // Before the column, it keeps two bars' width clear of the
+            // stem of a glyph that starts flush on it (the placeholder's
+            // `M`), the clearance a glyph's own side bearing gives it after
+            // typed text.
             let gap = px(m.caret);
-            let x = if cursor == 0 && input.vim.mode == Mode::Insert { origin_x - gap - px(m.caret) } else { origin_x + cursor_pos + gap };
+            let x = if cursor == 0 && input.vim.mode == Mode::Insert { origin_x - gap * 2. - px(m.caret) } else { origin_x + cursor_pos + gap };
             caret = Some(fill(Bounds::new(point(x, glyph_top), size(px(m.caret), px(m.glyph))), text));
         }
 
@@ -497,8 +504,19 @@ impl Element for TextElement {
         }
         let marks =
             marks.into_iter().map(|(x, w)| (fill(Bounds::new(point(x, bounds.top()), size(w, bounds.size.height)), bg), x, shape("…".into(), dim))).collect();
+        // The draft under an open ex line stays in sight (vim keeps the
+        // buffer on screen under its `:` line): its end, right-aligned,
+        // cut from the front with `…` and giving way to the command, two
+        // cells clear of it, and gone once fewer than a few cells are left.
+        let parked = input.vim.parked().filter(|d| !d.is_empty()).and_then(|draft| {
+            let room = view - (f32::from(line.width) - f32::from(scroll_x)).max(0.) - 2. * m.cell - 2. * m.caret;
+            let shown = tail_fit(draft, room, |s| f32::from(shape(s.to_owned().into(), hint).width))?;
+            let shaped = shape(shown.into(), hint);
+            let x = bounds.right() - shaped.width;
+            Some((shaped, x))
+        });
         self.input.update(cx, |input, _cx| input.scroll_x = scroll_x);
-        PrepaintState { line: Some(line), placeholder, block, reversed, caret, scroll_x, selection, marks }
+        PrepaintState { line: Some(line), placeholder, block, reversed, caret, scroll_x, selection, marks, parked }
     }
 
     fn paint(
@@ -544,6 +562,11 @@ impl Element for TextElement {
                         }
                     });
                 }
+            }
+            if let Some((parked, x)) = prepaint.parked.take()
+                && let Err(e) = parked.paint(point(x, bounds.origin.y), line_height, gpui::TextAlign::Left, None, window, cx)
+            {
+                tracing::debug!("input paint failed: {e}");
             }
             for (quad, x, mark) in prepaint.marks.drain(..) {
                 window.paint_quad(quad);
@@ -830,6 +853,21 @@ fn spans<C: std::marker::Copy + PartialEq>(len: usize, base: C, over: &[(Range<u
     out
 }
 
+/// The fewest cells a parked draft shows: less says nothing.
+const PARKED_MIN_CHARS: usize = 4;
+
+/// The end of `text` that fits `room`, given `width` of a string: all of
+/// it, or its tail after a `…`; `None` when fewer than `PARKED_MIN_CHARS`
+/// would show.
+fn tail_fit(text: &str, room: f32, width: impl Fn(&str) -> f32) -> Option<String> {
+    if width(text) <= room {
+        return Some(text.to_owned());
+    }
+    let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let shown = starts.iter().map(|&i| format!("…{}", &text[i..])).find(|s| width(s) <= room)?;
+    (shown.chars().count() > PARKED_MIN_CHARS).then_some(shown)
+}
+
 /// `scroll` moved on to the next glyph edge (of `edges`, ascending) that
 /// puts a glyph's start exactly `cell` from the view's left, where the
 /// leading `…` mark ends; no scroll stays none.
@@ -866,6 +904,16 @@ fn scroll_for_cursor(prev: f32, cursor_x: f32, line_width: f32, view: f32, margi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_parked_draft_gives_way_from_the_front() {
+        let w = |s: &str| s.chars().count() as f32;
+        assert_eq!(tail_fit("my draft", 8., w).as_deref(), Some("my draft"));
+        assert_eq!(tail_fit("my draft", 6., w).as_deref(), Some("…draft"));
+        // Too little room to say anything: nothing.
+        assert_eq!(tail_fit("my draft", 4., w), None);
+        assert_eq!(tail_fit("my draft", 0., w), None);
+    }
 
     const VIEW: f32 = 100.;
     const MARGIN: f32 = 20.;

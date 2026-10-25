@@ -83,8 +83,14 @@ pub struct HircApp {
     drafts: HashMap<(usize, usize), String>,
     lines: ListState,
     /// The message view's time and nick columns, in cells (sized to the
-    /// view).
+    /// view, the nicks to the selected buffer's).
     cols: Columns,
+    /// The message view's width at the last render: text is broken onto
+    /// lines against it (see `wrap`).
+    pane: f32,
+    /// Each buffer's widest nick column entry (see `widest_nick`), and its
+    /// line count when measured.
+    nick_widths: HashMap<(usize, usize), (usize, usize)>,
     /// Wheel movement not yet a whole line.
     wheel: Rc<Cell<f32>>,
     /// What is left of a line beside the message view's whole lines,
@@ -208,6 +214,8 @@ impl HircApp {
             // below the view are exact (lines are cached once measured).
             lines: ListState::new(0, ListAlignment::Bottom, px(400.)).measure_all(),
             cols: Columns::default(),
+            pane: 0.,
+            nick_widths: HashMap::new(),
             wheel: Rc::default(),
             extra: Rc::default(),
             bar_extra: (0., 0.),
@@ -490,6 +498,19 @@ impl HircApp {
         self.lines.splice(index..index, 1);
     }
 
+    /// The selected window has been answered: whatever the user sends
+    /// there says they have read it, so its "new" rule goes.
+    fn caught_up(&mut self) {
+        let Some((n, b, seq)) = self.marker else { return };
+        if self.selected != Some((n, b)) {
+            return;
+        }
+        self.marker = None;
+        if let Some(ix) = self.store.networks[n].buffers[b].lines.iter().position(|l| l.seq == seq) {
+            self.lines.splice(ix..ix + 1, 1);
+        }
+    }
+
     /// Show hirc's own answer to a command (`-!-`, the client's voice, not
     /// the server's `--`) in the current buffer.
     fn local_note(&mut self, n: usize, b: usize, msg: String) {
@@ -531,13 +552,16 @@ impl HircApp {
             }
             // A down network drops everything but /reconnect.
             Ok(Input::Send(_)) if status.is_down() => self.local_error(n, b, not_connected(&name, &status)),
-            // Nothing to leave: hirc's own answer, not a fault.
-            Ok(Input::Send(Command::Part { channel, .. })) if !self.in_channel(n, &channel) => self.local_note(n, b, format!("Not in {channel}")),
+            // Nothing to leave: the command failed, so it reads as one.
+            Ok(Input::Send(Command::Part { channel, .. })) if !self.in_channel(n, &channel) => self.local_error(n, b, format!("Not in {channel}")),
             Ok(Input::Send(Command::Join { channel, .. })) if self.in_channel(n, &channel) => {
                 let j = self.store.buffer_ix(n, &Target::Channel(channel));
                 self.select(n, j, cx);
             }
             Ok(Input::Send(cmd)) => {
+                if matches!(cmd, Command::Say { .. } | Command::Action { .. }) {
+                    self.caught_up();
+                }
                 if let Command::Join { channel, .. } = &cmd
                     && let Some(first) = channel.split(',').next()
                 {
@@ -610,21 +634,59 @@ impl HircApp {
         self.cols
     }
 
+    /// The message view's width, in px.
+    pub fn pane(&self) -> f32 {
+        self.pane
+    }
+
+    /// Cells the selected buffer's nick column needs: its longest nick,
+    /// `-notice-` or event marker, and our own nick (which any line we
+    /// send will show).
+    fn widest_nick(&mut self) -> usize {
+        let Some((n, b)) = self.selected else { return 0 };
+        let Some(net) = self.store.networks.get(n) else { return 0 };
+        let Some(buf) = net.buffers.get(b) else { return 0 };
+        if let Some((len, widest)) = self.nick_widths.get(&(n, b))
+            && *len == buf.lines.len()
+        {
+            return *widest;
+        }
+        let cells = |s: &str| s.chars().count();
+        let widest = buf
+            .lines
+            .iter()
+            .map(|line| match (line.kind, line.nick.as_deref()) {
+                (LineKind::Privmsg, Some(nick)) => cells(nick),
+                (LineKind::Notice, Some(nick)) if !nick.is_empty() => cells(nick) + 2,
+                (LineKind::Action, _) => 1,
+                (kind, _) => cells(display::marker(kind)),
+            })
+            .chain(net.nick.as_deref().map(cells))
+            .max()
+            .unwrap_or(0);
+        self.nick_widths.insert((n, b), (buf.lines.len(), widest));
+        widest
+    }
+
     /// The note for the header when no server is configured.
     pub fn hint(&self) -> Option<&str> {
         self.hint.as_deref()
     }
 
-    fn line_element(&mut self, ix: usize) -> gpui::AnyElement {
+    fn line_element(&mut self, ix: usize, window: &Window) -> gpui::AnyElement {
         self.refresh_nick_slots();
         let slots = self.selected.and_then(|key| self.nick_slots.get(&key)).map(|(_, s)| s);
         let empty = HashMap::new();
         let slots = slots.unwrap_or(&empty);
         match self.current().and_then(|(net, buf)| Some((net, buf.lines.get(ix)?))) {
             Some((net, line)) => {
-                let line_el = buffer::line(self, line, &buffer::Context { me: net.nick.as_deref(), cols: self.cols, slots });
+                let line_el = buffer::line(self, window, line, &buffer::Context { me: net.nick.as_deref(), cols: self.cols, slots });
+                let server = self.current().is_some_and(|(_, buf)| buf.target == Target::Server);
                 match self.marker {
                     Some((n, b, seq)) if self.selected == Some((n, b)) && line.seq == seq => buffer::with_marker(self, line_el),
+                    // In a server buffer, a quiet rule where one
+                    // connection's lines end, so sessions never run together.
+                    _ if server && line.boundary && ix > 0 => buffer::with_rule(self, None, line_el),
                     _ => line_el,
                 }
             }
@@ -641,11 +703,14 @@ impl Render for HircApp {
         self.sidebar_width = m.sidebar_width(width);
         self.sidebar_height = f32::from(window.viewport_size().height);
         self.bar_extra = viewport::halves(self.extra.get(), window.scale_factor());
-        // The time and nick columns follow the view's width; rows wrap
-        // against them, so a change means measuring them again.
-        let cols = m.columns(width - self.sidebar_width);
-        if cols != self.cols {
+        // The time and nick columns follow the view's width and the
+        // buffer's nicks; rows wrap against them and the width, so a
+        // change means measuring them again.
+        let pane = width - self.sidebar_width;
+        let cols = m.columns(pane).fit(self.widest_nick());
+        if cols != self.cols || pane != self.pane {
             self.cols = cols;
+            self.pane = pane;
             self.lines.remeasure();
         }
         let following = scroll::following(&self.lines);
@@ -668,7 +733,7 @@ impl Render for HircApp {
             .then(|| self.cut_head())
             .flatten()
             .and_then(|ix| self.current().and_then(|(_, buf)| buf.lines.get(ix)).map(|line| buffer::sticky(self, line, cols)));
-        let lines = list(self.lines.clone(), cx.processor(|this, ix: usize, _window, _cx| this.line_element(ix))).size_full();
+        let lines = list(self.lines.clone(), cx.processor(|this, ix: usize, window, _cx| this.line_element(ix, window))).size_full();
         let mut root = div().size_full();
         macro_rules! window_keys {
             ($($action:ident => $n:expr),*) => {
@@ -740,11 +805,11 @@ fn font_for(window: &Window, family: Option<SharedString>) -> gpui::Font {
 }
 
 /// Why a line typed for network `name` was not sent, in the words the
-/// header uses (offline for a quit, disconnected for a fault), and the
-/// way out: the line stays in the input, so the placeholder is hidden.
+/// header uses (offline for a quit, disconnected for a fault). The way out
+/// is the header's and the input's to say.
 fn not_connected(name: &str, status: &ConnStatus) -> String {
     let state = if matches!(status, ConnStatus::Offline) { "offline" } else { "disconnected" };
-    format!("Not sent: {name} is {state} — {}", way_out(status))
+    format!("Not sent: {name} is {state}")
 }
 
 /// The way back on a down network: the input's placeholder (the header

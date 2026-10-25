@@ -68,8 +68,8 @@ pub enum Effect {
     Submit,
     /// Run the ex line (without the leading `:`).
     Ex(String),
-    /// Escape in Normal, where it has nothing else to do: put away a
-    /// notice (the config banner).
+    /// Escape, out of Insert or in Normal: put away a notice (the config
+    /// banner), so one Esc does it whatever the mode.
     Dismiss,
 }
 
@@ -132,6 +132,12 @@ impl Vim {
         self.pending = Pending::None;
     }
 
+    /// While the ex line is open: the draft it was opened over, which
+    /// comes back when it closes.
+    pub fn parked(&self) -> Option<&str> {
+        self.saved.as_ref().filter(|_| self.mode == Mode::Ex).map(|(text, _)| text.as_str())
+    }
+
     /// The input is about to show another window's line. Anything tied to
     /// the old line goes; an open ex line is abandoned, and the draft it was
     /// opened over is returned (that, not the ex line, is the old window's).
@@ -160,7 +166,7 @@ impl Vim {
         self.mode = Mode::Normal;
         self.pending = Pending::None;
         let cursor = clamp_normal(text, prev_char(text, cursor));
-        vec![edit(text, cursor)]
+        vec![edit(text, cursor), Effect::Dismiss]
     }
 
     fn ex_key(&mut self, key: &Key, text: &str) -> Vec<Effect> {
@@ -503,6 +509,11 @@ mod tests {
         s.feed(esc());
         assert_eq!(s.effects, vec![Effect::Dismiss]);
         assert_eq!(s.state(), ("ab", 1, Mode::Normal));
+        // Out of Insert, the same one Esc puts it away.
+        let mut s = Sim::new("ab", 2);
+        s.feed(esc());
+        assert_eq!(s.effects.last(), Some(&Effect::Dismiss));
+        assert_eq!(s.state(), ("ab", 1, Mode::Normal));
     }
 
     #[test]
@@ -662,6 +673,16 @@ mod tests {
         assert_eq!(Sim::normal("ab", 0).feed(k('a')).state(), ("ab", 1, Mode::Insert));
         assert_eq!(Sim::normal("ab", 1).feed(k('i')).state(), ("ab", 1, Mode::Insert));
         assert_eq!(Sim::normal("", 0).feed(k('a')).state(), ("", 0, Mode::Insert));
+    }
+
+    #[test]
+    fn the_ex_line_shows_the_draft_it_parked() {
+        let mut s = Sim::normal("my draft", 2);
+        assert_eq!(s.vim.parked(), None);
+        s.feed(k(':'));
+        assert_eq!(s.vim.parked(), Some("my draft"));
+        s.feed(esc());
+        assert_eq!(s.vim.parked(), None);
     }
 
     #[test]

@@ -49,10 +49,11 @@ const MESSAGE_CELLS: f32 = 60.;
 /// Unread counts get this many cells; larger counts are abbreviated.
 pub const COUNT_CELLS: usize = 3;
 /// A network tag never takes more than this many cells, and gives up
-/// cells to the label down to `TAG_MIN_CELLS` (an ellipsis included),
-/// enough to tell networks apart.
+/// cells to the label down to `TAG_MIN_CELLS` (four letters and an
+/// ellipsis, enough to tell networks apart): a cut name is worth more
+/// than its tag.
 const TAG_CELLS: f32 = 8.;
-const TAG_MIN_CELLS: f32 = 7.;
+const TAG_MIN_CELLS: f32 = 5.;
 /// Message lines: the timestamp (`HH:MM`) and the nick column, in cells.
 pub const TIME_CELLS: usize = 5;
 const NICK_MIN_CELLS: usize = 3;
@@ -68,9 +69,9 @@ const NICK_COMPACT_CELLS: usize = 6;
 /// The least the messages keep in a narrow window before the list gives
 /// up its tags: no time, narrow nicks and `TEXT_MIN_CELLS` of text.
 const MESSAGE_MIN_CELLS: f32 = (NICK_NARROW_CELLS + 1 + TEXT_MIN_CELLS) as f32;
-/// The text a line keeps beside a nick too long for the column: such a
-/// nick shows whole and pushes its own line's text on, up to this.
-const OVERFLOW_TEXT_CELLS: usize = 16;
+/// The input's mode label (`INSERT`, `NORMAL`) sits where nicks do, so
+/// the time and nick columns together never take fewer cells.
+const MODE_LABEL_CELLS: usize = 6;
 
 /// A label always keeps at least this many cells before tags give way.
 const LABEL_MIN_CELLS: f32 = 6.;
@@ -184,10 +185,8 @@ impl Metrics {
         self.cell * n as f32
     }
 
-    /// The message view's columns for a view `view_width` wide. The same
-    /// in every buffer (a longer nick shows whole on its own line and
-    /// pushes that line's text on), so the text column and the input line
-    /// never move when you switch windows. As the view narrows, the nick
+    /// The message view's columns for a view `view_width` wide (a buffer
+    /// then narrows its nicks to its own, `Columns::fit`). As the view narrows, the nick
     /// column gives way first (to `NICK_NARROW_CELLS`) so the text keeps
     /// `TEXT_MIN_CELLS`, then the time column goes, then the nicks narrow
     /// to `NICK_COMPACT_CELLS`; the nicks never take more than a share of
@@ -226,11 +225,15 @@ impl Columns {
         if self.time > 0 { self.time + 1 } else { 0 }
     }
 
-    /// The most a nick too long for the column may take on its own line,
-    /// shown whole, before it too ends in `…`: what leaves the line's text
-    /// `OVERFLOW_TEXT_CELLS`.
-    pub fn nick_overflow(&self) -> usize {
-        self.view.saturating_sub(self.lead() + 1 + OVERFLOW_TEXT_CELLS).max(self.nick)
+    /// The columns for a buffer whose nick column needs `widest` cells
+    /// (its longest nick, notice or marker, and our own nick): as narrow
+    /// as that, so text sits tight to the time as in weechat, but never
+    /// wider than the view allows (a longer nick ends in `…`), and wide
+    /// enough for the input's mode label. The text column is then one
+    /// edge for every line of the buffer.
+    pub fn fit(self, widest: usize) -> Columns {
+        let floor = NICK_MIN_CELLS.max(MODE_LABEL_CELLS.saturating_sub(self.lead()));
+        Columns { nick: widest.max(floor).min(self.nick), ..self }
     }
 }
 
@@ -350,15 +353,19 @@ mod tests {
     }
 
     #[test]
-    fn a_long_nick_may_overflow_its_column_but_leaves_the_text_room() {
+    fn a_buffer_sizes_its_nick_column_to_its_nicks() {
         let m = menlo(14.);
         let wide = m.columns(957.);
-        assert!(wide.nick_overflow() >= 32 && wide.view - wide.lead() - wide.nick_overflow() > OVERFLOW_TEXT_CELLS);
-        // At 640 an IRC nick of 32 still shows whole.
-        assert!(m.columns(640. - m.sidebar_width(640.)).nick_overflow() >= 31);
-        // Never less than the column itself.
-        let tiny = m.columns(100.);
-        assert_eq!(tiny.nick_overflow(), tiny.nick);
+        // A query of `carol` and `me`: five cells, tight to the time.
+        assert_eq!(wide.fit(5).nick, 5);
+        // A long nick: the view's most, no more (it ends in `…`).
+        assert_eq!(wide.fit(22).nick, NICK_MAX_CELLS);
+        // Never below the fewest, nor too narrow for the mode label.
+        assert_eq!(wide.fit(1).nick, NICK_MIN_CELLS);
+        let compact = m.columns(400.);
+        assert_eq!(compact.time, 0);
+        assert_eq!(compact.fit(2).nick, MODE_LABEL_CELLS);
+        assert!(compact.lead() + compact.fit(2).nick >= MODE_LABEL_CELLS);
     }
 
     #[test]

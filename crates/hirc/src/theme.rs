@@ -47,6 +47,19 @@ pub struct Palette {
     /// Selected text in the input (`buffer.selection`, by contrast).
     pub selection: Hsla,
     pub timestamp: Hsla,
+    /// The timestamp on the mention fill: the least lift that keeps it
+    /// legible there, so the time column stays one colour as near as it
+    /// can.
+    pub timestamp_band: Hsla,
+    /// A network tag (the window list's and the header's):
+    /// `text.secondary` at the quiet floor, a plain step below the name it
+    /// follows, so the two read apart by colour whatever weights the font
+    /// has. `selected_tag` is the same on the selected fill.
+    pub tag: Hsla,
+    pub selected_tag: Hsla,
+    /// A peer who is away: a state, not identity, so not the tag's role
+    /// (the event colour, `buffer.server_messages.default`).
+    pub away: Hsla,
     /// The quietest legible text on the buffer: the client's own wording
     /// (event verbs, scroll notes). The first of `buffer.timestamp`,
     /// `buffer.topic` and `text.secondary` that reaches `QUIET_CONTRAST`.
@@ -158,6 +171,17 @@ fn fill_apart(bg: Color, apart: Color, candidates: &[Color]) -> Color {
         .unwrap_or_else(|| fill(bg, candidates))
 }
 
+/// `c` laid over `bg` at the least opacity (in steps of 1%) that stands
+/// `min` off it: a wash of the colour, opaque. The colour itself when no
+/// wash gets there.
+fn tint(c: Color, bg: Color, min: f32) -> Color {
+    let mix = |a: f32| {
+        let m = |x: u8, y: u8| (f32::from(x) * a + f32::from(y) * (1. - a)).round() as u8;
+        Color { r: m(c.r, bg.r), g: m(c.g, bg.g), b: m(c.b, bg.b), a: 255 }
+    };
+    (1..=100).map(|k| mix(k as f32 / 100.)).find(|w| contrast(*w, bg) >= min).unwrap_or(Color { a: 255, ..c })
+}
+
 /// Least contrast a hover wash keeps from the list's background (seen,
 /// though quiet), and from the selected fill (never read as selection).
 const HOVER_CONTRAST: f32 = 1.15;
@@ -203,7 +227,7 @@ const NICK_SEPARATION: f32 = 24.;
 /// like us), from the colours that mean something on a message line
 /// (actions, event markers, errors), and from those that mean something
 /// elsewhere (success, links, unread), which matter less beside a nick.
-const CLEAR_OWN: f32 = 30.;
+const CLEAR_OWN: f32 = 40.;
 const CLEAR_LINE: f32 = 25.;
 const CLEAR_ELSEWHERE: f32 = 12.;
 /// Colours with less OKLCH chroma than this are greys: they take no hue.
@@ -303,14 +327,14 @@ fn at_contrast(hue: f32, chroma: f32, bg: Color, aim: f32) -> Color {
 /// hue repeats). In order of placement, so the first few are the
 /// furthest apart.
 fn nick_hues(own: Color, line: &[Color], elsewhere: &[Color]) -> (Vec<f32>, Vec<f32>) {
-    // `near`: how much of their clearance our own nick and the colours
-    // with a meaning elsewhere keep (a second-tier nick, darker or
-    // lighter than they are, may come closer to them; never closer to a
+    // `near`: how much of their clearance the colours with a meaning
+    // elsewhere keep (a second-tier nick, darker or lighter than they
+    // are, may come closer to them; never closer to our own nick or a
     // meaning on the message line).
     let taken = |scale: f32, near: f32| -> Vec<(f32, f32)> {
         let with =
             |cs: &[Color], clear: f32| cs.iter().map(|c| chroma_hue(*c)).filter(|(c, _)| *c > GREY).map(move |(_, h)| (h, clear * scale)).collect::<Vec<_>>();
-        [with(&[own], CLEAR_OWN * near), with(line, CLEAR_LINE), with(elsewhere, CLEAR_ELSEWHERE * near)].concat()
+        [with(&[own], CLEAR_OWN), with(line, CLEAR_LINE), with(elsewhere, CLEAR_ELSEWHERE * near)].concat()
     };
     let place = |taken: &[(f32, f32)], mut out: Vec<f32>, separation: f32, most: usize| {
         let free: Vec<f32> = (0..360).map(|d| d as f32).filter(|h| taken.iter().all(|(t, clear)| hue_gap(*h, *t) >= *clear)).collect();
@@ -465,7 +489,11 @@ pub fn palette(t: &Theme) -> Palette {
     );
     let (bg, title, input, side) = (t.buffer.background, t.buffer.background_title_bar, t.buffer.background_text_input, t.general.background);
     let quiet = [t.buffer.timestamp, t.buffer.topic, t.text.secondary];
-    let highlight = fill(bg, &[t.buffer.highlight, t.buffer.selection, t.buffer.border_selected]);
+    // A mention: the theme's highlight, or where that vanishes into the
+    // buffer (Latte's), a wash of the unread colour the mention badge
+    // uses, so the line keeps the meaning's hue and never looks like a
+    // selection; only then the neutral roles.
+    let highlight = fill(bg, &[t.buffer.highlight, tint(t.general.unread_indicator, bg, FILL_CONTRAST), t.buffer.selection, t.buffer.border_selected]);
     let selected = fill_apart(
         side,
         highlight,
@@ -507,6 +535,10 @@ pub fn palette(t: &Theme) -> Palette {
         highlight: c(highlight),
         selection: c(fill(input, &[t.buffer.selection, t.buffer.border_selected, t.buffer.highlight])),
         timestamp: c(lift(t.buffer.timestamp, &[bg], QUIET_CONTRAST)),
+        timestamp_band: c(lift(lift(t.buffer.timestamp, &[bg], QUIET_CONTRAST), &[highlight], QUIET_CONTRAST)),
+        tag: c(lift(t.text.secondary, &[side, title], QUIET_CONTRAST)),
+        selected_tag: c(lift(t.text.secondary, &[selected], QUIET_CONTRAST)),
+        away: read(t.buffer.server_messages.default, &[title]),
         quiet: c(legible(bg, &quiet)),
         hint: c(legible(input, &quiet)),
         code: read(code, &[input]),
@@ -572,7 +604,7 @@ mod tests {
             assert_eq!(second.len(), hues.len());
             for (i, a) in second.iter().enumerate() {
                 assert!(hues.iter().chain(&second[..i]).all(|b| a == b || hue_gap(*a, *b) >= NICK_SEPARATION / 4.), "{own:06x}: {second:?}");
-                assert!(hue_gap(*a, chroma_hue(Color::rgb(own)).1) >= CLEAR_OWN / 2., "{own:06x}: {a} is near our own");
+                assert!(hue_gap(*a, chroma_hue(Color::rgb(own)).1) >= CLEAR_OWN, "{own:06x}: {a} is near our own");
             }
             for (i, a) in hues.iter().enumerate() {
                 assert!(hues[i + 1..].iter().all(|b| hue_gap(*a, *b) >= NICK_SEPARATION), "{own:06x}: {hues:?}");
@@ -835,7 +867,10 @@ background_selected_hover = "#ACB0BE"
 "##;
 
     fn theme(name: &str, text: &str) -> Theme {
-        let dir = std::env::temp_dir().join(format!("hirc-theme-test-{}-{name}", std::process::id()));
+        // One dir per call: tests run at once and each removes its own.
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("hirc-theme-test-{}-{call}-{name}", std::process::id()));
         std::fs::create_dir_all(dir.join("themes")).unwrap();
         std::fs::write(dir.join("themes").join(format!("{name}.toml")), text).unwrap();
         let theme = hirc_core::theme::load(&dir, name).unwrap();
@@ -917,6 +952,31 @@ background_selected_hover = "#ACB0BE"
         assert_eq!(picked, Color::rgb(0x2c324a));
         // Nothing apart from both: as `fill` would pick.
         assert_eq!(fill_apart(bg, Color::rgb(0x4c4163), &[Color::rgb(0x4c4163)]), Color::rgb(0x4c4163));
+    }
+
+    #[test]
+    fn a_mention_on_a_theme_without_a_usable_highlight_keeps_the_unread_hue() {
+        let p = palette(&theme("Latte", LATTE));
+        let (fill, unread) = (rgb(p.highlight), Color::rgb(0x8839ef));
+        // A wash of the unread colour: its hue, a band off the buffer.
+        assert!(hue_gap(chroma_hue(fill).1, chroma_hue(unread).1) < 10., "{fill:?}");
+        assert!(contrast(fill, Color::rgb(0xeff1f5)) >= FILL_CONTRAST);
+        // Mocha's own highlight is used as is.
+        assert_eq!(rgb(palette(&theme("Mocha", MOCHA)).highlight), Color::rgb(0x594c76));
+    }
+
+    #[test]
+    fn a_tag_reads_a_step_below_the_name() {
+        for (name, text) in [("Mocha", MOCHA), ("Latte", LATTE), ("defaults", "")] {
+            let p = palette(&theme(name, text));
+            let ratio = |a: Hsla, b: Hsla| contrast(rgb(a), rgb(b));
+            assert!(ratio(p.tag, p.background) >= QUIET_CONTRAST - 0.01 && ratio(p.tag, p.title_bg) >= QUIET_CONTRAST - 0.01, "{name}");
+            assert!(ratio(p.selected_tag, p.selected) >= QUIET_CONTRAST - 0.01, "{name}");
+            // Apart from the name beside it, by colour alone.
+            assert!(ratio(p.tag, p.text) >= 1.5, "{name}: {:.2}", ratio(p.tag, p.text));
+            assert!(ratio(p.away, p.title_bg) >= TEXT_CONTRAST - 0.01, "{name}");
+            assert!(ratio(p.timestamp_band, p.highlight) >= QUIET_CONTRAST - 0.01, "{name}");
+        }
     }
 
     #[test]

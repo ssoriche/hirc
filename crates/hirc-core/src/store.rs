@@ -40,6 +40,9 @@ pub struct Line {
     pub own: bool,
     /// For a line we sent: whether the server has it yet.
     pub delivery: Delivery,
+    /// A change of connection state (a drop, a quit, a failed connect):
+    /// the end of one session's lines and the start of the next.
+    pub boundary: bool,
 }
 
 /// Where a line we sent stands. Everything else is `Sent`.
@@ -282,8 +285,18 @@ impl Store {
             text,
             own: true,
             delivery: Delivery::Sent,
+            boundary: false,
         };
         self.networks[network].buffers[buffer].insert(line).unwrap_or(0)
+    }
+
+    /// `push_local`, for a change of connection state (see `Line::boundary`).
+    fn push_boundary(&mut self, network: usize, buffer: usize, kind: LineKind, text: String) -> usize {
+        let ix = self.push_local(network, buffer, kind, text);
+        if let Some(line) = self.networks[network].buffers[buffer].lines.get_mut(ix) {
+            line.boundary = true;
+        }
+        ix
     }
 
     pub fn apply(&mut self, ev: Event) -> Applied {
@@ -293,7 +306,10 @@ impl Store {
                 if let ConnStatus::Connected { nick } = &status {
                     self.networks[n].nick = Some(nick.clone());
                 }
-                let said = status_line(&network, &status);
+                // The server buffer is the network's own: its line leaves
+                // the name out (the header names it).
+                let said = status_line(&network, &status, false);
+                let said_here = status_line(&network, &status, true);
                 // Said where the user may be looking: the server buffer, every
                 // channel we were in and every query (irssi does the same).
                 let to: Vec<usize> = match said {
@@ -322,9 +338,12 @@ impl Store {
                 }
                 self.networks[n].status = status;
                 self.networks[n].since = Some(self.clock.unwrap_or_else(Utc::now));
-                match said {
-                    Some((kind, text)) => Applied::Lines { network: n, at: to.into_iter().map(|b| (b, self.push_local(n, b, kind, text.clone()))).collect() },
-                    None => Applied::Changed,
+                match (said, said_here) {
+                    (Some((kind, text)), Some((_, here))) => Applied::Lines {
+                        network: n,
+                        at: to.into_iter().map(|b| (b, self.push_boundary(n, b, kind, if b == 0 { here.clone() } else { text.clone() }))).collect(),
+                    },
+                    _ => Applied::Changed,
                 }
             }
             Event::OwnNick { network, nick } => {
@@ -386,12 +405,14 @@ impl Store {
 /// error, a quit the user chose is a plain status line. Scrollback keeps
 /// only what happened and why, which stays true however late it is read;
 /// what happens next (a countdown) and what to do live in the header and
-/// the input line, which follow the state.
-pub fn status_line(network: &str, status: &ConnStatus) -> Option<(LineKind, String)> {
+/// the input line, which follow the state. In the network's own server
+/// buffer (`server`) the name is left out, so the reason comes first.
+pub fn status_line(network: &str, status: &ConnStatus, server: bool) -> Option<(LineKind, String)> {
+    let from = |word: &str| if server { String::new() } else { format!(" {word} {network}") };
     match status {
-        ConnStatus::Disconnected { reason, .. } => Some((LineKind::Error, format!("Disconnected from {network}: {reason}"))),
-        ConnStatus::Failed { reason } => Some((LineKind::Error, format!("Could not connect to {network}: {reason}"))),
-        ConnStatus::Offline => Some((LineKind::Status, format!("Disconnected from {network} (you quit)"))),
+        ConnStatus::Disconnected { reason, .. } => Some((LineKind::Error, format!("Disconnected{}: {reason}", from("from")))),
+        ConnStatus::Failed { reason } => Some((LineKind::Error, format!("Could not connect{}: {reason}", from("to")))),
+        ConnStatus::Offline => Some((LineKind::Status, format!("Disconnected{} (you quit)", from("from")))),
         _ => None,
     }
 }
@@ -414,6 +435,7 @@ mod tests {
             text: text.into(),
             own: false,
             delivery: Delivery::Sent,
+            boundary: false,
         }
     }
 
@@ -518,6 +540,9 @@ mod tests {
         // Server, #in and the query; not #out, which we had left.
         assert_eq!(applied, Applied::Lines { network: 0, at: vec![(0, 0), (1, 0), (3, 0)] });
         assert_eq!(s.networks[0].buffers[1].lines[0].text, "Disconnected from net: x");
+        assert_eq!(s.networks[0].buffers[0].lines[0].text, "Disconnected: x");
+        // Each copy marks where the session ended.
+        assert!(s.networks[0].buffers.iter().filter(|b| !b.lines.is_empty()).all(|b| b.lines[0].boundary));
     }
 
     #[test]
@@ -553,11 +578,15 @@ mod tests {
 
     #[test]
     fn a_quit_is_not_an_error() {
-        let (kind, text) = status_line("net", &ConnStatus::Offline).unwrap();
+        let (kind, text) = status_line("net", &ConnStatus::Offline, false).unwrap();
         assert_eq!((kind, text.as_str()), (LineKind::Status, "Disconnected from net (you quit)"));
-        let (kind, _) = status_line("net", &ConnStatus::Failed { reason: "SASL failed".into() }).unwrap();
+        let (kind, _) = status_line("net", &ConnStatus::Failed { reason: "SASL failed".into() }, false).unwrap();
         assert_eq!(kind, LineKind::Error);
-        assert_eq!(status_line("net", &ConnStatus::Connecting), None);
+        assert_eq!(status_line("net", &ConnStatus::Connecting, false), None);
+        // The server buffer leaves its own name out.
+        assert_eq!(status_line("net", &ConnStatus::Offline, true).unwrap().1, "Disconnected (you quit)");
+        let drop = ConnStatus::Disconnected { reason: "Ping timeout".into(), retry: std::time::Duration::from_secs(2) };
+        assert_eq!(status_line("net", &drop, true).unwrap().1, "Disconnected: Ping timeout");
     }
 
     fn mine(seq: u64, secs: i64, msgid: Option<&str>, text: &str, delivery: Delivery) -> Line {

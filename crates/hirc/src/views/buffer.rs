@@ -3,10 +3,11 @@
 //!
 //! A message line is four columns on the monospace grid: the time, a nick
 //! column (nicks right-aligned against the text, irssi/weechat style), and
-//! the text, which wraps with a hanging indent on its own column. A nick
-//! too long for the column shows whole and pushes its own line's text on
-//! (irssi), so no one is ever known by a prefix; every other line keeps
-//! the shared column. In a narrow view the time column goes first. The nick
+//! the text, which wraps with a hanging indent on its own column (breaking
+//! by `wrap`, so punctuation stays with its word). A buffer's nick column
+//! is as wide as its longest nick (weechat), up to a most; a longer nick
+//! ends in `…` (its whole shows on hover), so the text column is one edge
+//! for every line. In a narrow view the time column goes first. The nick
 //! column says what kind of line it is without relying on colour: a nick
 //! for a message, `-nick-` for a notice, `*` for an action, and a marker
 //! for events (`-->` joins, `<--` parts and quits, `<-x` kicks, `--` the rest, `=!=`
@@ -15,6 +16,7 @@
 use crate::app::HircApp;
 use crate::metrics::{Columns, Metrics};
 use crate::theme::Palette;
+use crate::wrap;
 use gpui::{AnyElement, FontWeight, HighlightStyle, Hsla, IntoElement, SharedString, StyledText, TextRun, Window, div, prelude::*, px};
 use hirc_core::display::{self, Part};
 use hirc_core::event::{ConnStatus, Target};
@@ -61,8 +63,9 @@ pub fn title(app: &HircApp, window: &Window, pane: f32) -> impl IntoElement {
                 };
                 let topic = match &buf.topic {
                     Some(t) if channel && !t.is_empty() => vec![(t.clone(), p.topic)],
-                    _ if channel && state.is_empty() => vec![("(no topic)".to_owned(), p.topic)],
-                    _ if channel => vec![],
+                    // The last-known topic in every state, so the slot
+                    // never comes and goes with it.
+                    _ if channel => vec![("(no topic)".to_owned(), p.topic)],
                     // A query's third field: who the peer is, when known.
                     _ => match peer.and_then(|peer| peer.host.clone()) {
                         Some(host) => vec![(host, p.topic)],
@@ -72,8 +75,9 @@ pub fn title(app: &HircApp, window: &Window, pane: f32) -> impl IntoElement {
                 };
                 // The tag in the window list's role whatever the font: with
                 // no bold face the name still leads by colour (primary
-                // against secondary), and spacing groups the tag with it.
-                (target.name().unwrap_or_default().to_owned(), Some((net.name.clone(), p.text_dim)), state, topic)
+                // against the quieter tag), and spacing groups the tag
+                // with it.
+                (target.name().unwrap_or_default().to_owned(), Some((net.name.clone(), p.tag)), state, topic)
             }
         },
         None => ("No servers configured".to_owned(), None, vec![], app.hint().map(|h| (h.to_owned(), p.topic)).into_iter().collect()),
@@ -171,7 +175,9 @@ fn peer_state(p: &Palette, peer: Option<&Peer>) -> Vec<Piece> {
     let Some(peer) = peer else { return vec![] };
     let detail = |s: &str| (!s.is_empty()).then(|| (format!(" — {s}"), p.text_dim));
     match (&peer.presence, &peer.away) {
-        (Presence::Online, Some(away)) => [Some(("● away".to_owned(), p.text_dim)), detail(away)].into_iter().flatten().collect(),
+        // Away is a state, not identity: its own role (the event colour),
+        // apart from the network tag beside it.
+        (Presence::Online, Some(away)) => [Some(("● away".to_owned(), p.away)), detail(away)].into_iter().flatten().collect(),
         (Presence::Online, None) => vec![("● online".to_owned(), p.success)],
         (Presence::Quit(reason), _) => [Some(("○ quit".to_owned(), p.text_dim)), detail(reason)].into_iter().flatten().collect(),
         (Presence::Renamed(new), _) => vec![("○ renamed".to_owned(), p.text_dim), (format!(" — now {new}"), p.text_dim)],
@@ -241,7 +247,8 @@ pub fn banner(app: &HircApp, message: String) -> impl IntoElement {
             let mut runs = Runs::default();
             // The marker carries the error, as on a message line; the
             // sentence is text.
-            runs.push(&message, p.text, false).push(" (Esc in NORMAL mode to dismiss)", p.text_dim, false);
+            // One Esc puts it away in any mode (see `vim`).
+            runs.push(&message, p.text, false).push(" (Esc to dismiss)", p.text_dim, false);
             runs.element()
         }))
 }
@@ -285,6 +292,36 @@ impl Runs {
     fn element(self) -> StyledText {
         StyledText::new(self.text).with_highlights(self.runs)
     }
+
+    /// The text broken onto lines `width` wide (see `wrap`), in the
+    /// app's font as it will be drawn, so its lines always fit and gpui
+    /// never breaks them again.
+    fn wrap(self, app: &HircApp, window: &Window, width: f32) -> Runs {
+        if self.text.is_empty() || width <= 0. {
+            return self;
+        }
+        let runs: Vec<TextRun> = self
+            .runs
+            .iter()
+            .map(|(range, style)| TextRun {
+                len: range.len(),
+                font: gpui::Font { weight: style.font_weight.unwrap_or(app.font.weight), ..app.font.clone() },
+                color: style.color.unwrap_or_default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            })
+            .collect();
+        let shaped = window.text_system().shape_line(self.text.clone().into(), px(app.metrics.size), &runs, None);
+        // Half a px short, so rounding never tips a line over.
+        let breaks = wrap::breaks(&self.text, |i| f32::from(shaped.x_for_index(i)), width - 0.5);
+        if breaks.is_empty() {
+            return self;
+        }
+        let (text, shift) = wrap::apply(&self.text, &breaks);
+        let runs = self.runs.into_iter().map(|(r, style)| (shift(r.start)..shift(r.end), style)).collect();
+        Runs { text, runs }
+    }
 }
 
 /// A nick, as the nick column or an event shows it (`shown`, which may be
@@ -299,7 +336,7 @@ fn nick_run(runs: &mut Runs, p: &Palette, shown: &str, nick: &str, cx: &Context,
     }
 }
 
-pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
+pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyElement {
     let p = &app.palette;
     let m = &app.metrics;
     let time = line.time.with_timezone(&chrono::Local).format("%H:%M").to_string();
@@ -314,26 +351,22 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
     if cols.time == 0 && line.delivery == Delivery::Unsent {
         prefix.push("✕ ", p.error, false);
     }
-    // A nick longer than the column shows whole, its line's text pushed
-    // on; only past what leaves that text room does it end in `…` (its
-    // whole shows on hover). `room` is what the nick has beside its
-    // marks; the column takes the nick's width plus `marks`.
+    // A nick longer than the column ends in `…` (its whole shows on
+    // hover), so every line's text starts on one edge. `extra` is what
+    // the nick has around it (a notice's dashes).
     let marks = prefix.text.chars().count();
     let mut cut = None;
-    let mut wide = cols.nick;
     let mut fit_nick = |extra: usize| {
-        let room = cols.nick.saturating_sub(extra + marks).max(1);
-        let most = cols.nick_overflow().saturating_sub(extra + marks).max(1);
-        let shown = if nick.chars().count() <= room { nick.to_owned() } else { fit(nick, most) };
+        let shown = fit(nick, cols.nick.saturating_sub(extra + marks).max(1));
         if shown != nick {
             cut = Some(nick.to_owned());
         }
-        wide = wide.max(shown.chars().count() + extra + marks);
         shown
     };
-    // Ours, not yet echoed by the server: the text in the quiet role
-    // until it is confirmed (a notice's text is a step above it).
-    let pending = line.delivery != Delivery::Sent;
+    // Ours, not yet echoed by the server: the time cell says so (`··:··`)
+    // and the text reads as said. Without a time cell, the text is in the
+    // quiet role until it is confirmed.
+    let pending = line.delivery != Delivery::Sent && cols.time == 0;
     match line.kind {
         LineKind::Privmsg => {
             nick_run(&mut prefix, p, &fit_nick(0), nick, cx, mention);
@@ -400,7 +433,7 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
     // waits for the echo, `✕` once the connection dropped first (it may
     // never have gone out). `…` only ever means a cut.
     let (time, time_color) = match line.delivery {
-        Delivery::Sent => (time, if mention { p.text_dim } else { p.timestamp }),
+        Delivery::Sent => (time, if mention { p.timestamp_band } else { p.timestamp }),
         Delivery::Pending => ("··:··".to_owned(), p.timestamp),
         Delivery::Unsent => ("✕".to_owned(), p.error),
     };
@@ -408,6 +441,7 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
     // and an auto-width flex root would size to its content and never wrap.
     // Rows have no vertical padding: every row is whole text lines, so the
     // view scrolls on one line grid, as a terminal does.
+    let body = body.wrap(app, window, app.pane() - 2. * m.gutter - m.text_column(cols));
     div()
         .flex()
         .w_full()
@@ -415,7 +449,7 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
         .px(px(m.gutter))
         .when(mention, |d| d.bg(p.highlight))
         .when(cols.time > 0, |d| d.child(div().flex_none().w(px(m.grid(cols.time))).whitespace_nowrap().text_color(time_color).child(time)))
-        .child(nick_column(app, cols, wide, prefix, cut.map(|full| (full, line.seq))))
+        .child(nick_column(app, cols, prefix, cut.map(|full| (full, line.seq))))
         .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).child(body.element()))
         .into_any_element()
 }
@@ -426,6 +460,13 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
 /// as markers sit, and a hairline in the separators' colour across the
 /// text column.
 pub fn with_marker(app: &HircApp, line: AnyElement) -> AnyElement {
+    with_rule(app, Some("new"), line)
+}
+
+/// `line` with a rule above it and `label` (in the unread colour) on the
+/// nick column's edge: the read marker, or with no label, the quiet break
+/// a server buffer draws where one connection's lines end.
+pub fn with_rule(app: &HircApp, label: Option<&'static str>, line: AnyElement) -> AnyElement {
     let p = &app.palette;
     let m = &app.metrics;
     let rule = div().flex_1().min_w(px(0.)).ml(px(m.cell)).h(px(m.line)).flex().items_center().child(div().w_full().h(px(1.)).bg(p.border));
@@ -435,7 +476,7 @@ pub fn with_marker(app: &HircApp, line: AnyElement) -> AnyElement {
         .w_full()
         .px(px(m.gutter))
         .when(cols.time > 0, |d| d.child(div().flex_none().w(px(m.grid(cols.time)))))
-        .child(div().flex_none().flex().justify_end().w(px(m.grid(cols.nick))).when(cols.time > 0, |d| d.ml(px(m.cell))).text_color(p.unread).child("new"))
+        .child(div().flex_none().flex().justify_end().w(px(m.grid(cols.nick))).when(cols.time > 0, |d| d.ml(px(m.cell))).text_color(p.unread).children(label))
         .child(rule);
     div().flex().flex_col().w_full().child(marker).child(line).into_any_element()
 }
@@ -451,31 +492,33 @@ pub fn sticky(app: &HircApp, line: &Line, cols: Columns) -> gpui::AnyElement {
     let m = &app.metrics;
     let time = line.time.with_timezone(&chrono::Local).format("%H:%M").to_string();
     let nick = line.nick.as_deref().unwrap_or_default();
-    let room = cols.nick.saturating_sub(2).max(1);
     let who = match line.kind {
-        LineKind::Privmsg => fit(nick, room),
-        LineKind::Notice if !nick.is_empty() => format!("-{}-", fit(nick, room.saturating_sub(2).max(1))),
+        LineKind::Privmsg => nick.to_owned(),
+        LineKind::Notice if !nick.is_empty() => format!("-{nick}-"),
         LineKind::Action => "*".to_owned(),
         kind => display::marker(kind).to_owned(),
     };
+    // The arrow when it fits beside the whole of who it is (a buffer's
+    // nick column is only as wide as its nicks); else who, cut to the
+    // column, in the quiet role, which already says it is no new line.
+    let who = if who.chars().count() + 2 <= cols.nick { format!("↑ {who}") } else { fit(&who, cols.nick) };
     let mut prefix = Runs::default();
-    prefix.push(&format!("↑ {who}"), p.quiet, false);
+    prefix.push(&who, p.quiet, false);
     div()
         .flex()
         .w_full()
         .px(px(m.gutter))
         .text_color(p.timestamp)
         .when(cols.time > 0, |d| d.child(div().flex_none().w(px(m.grid(cols.time))).whitespace_nowrap().child(time)))
-        .child(nick_column(app, cols, cols.nick, prefix, None))
+        .child(nick_column(app, cols, prefix, None))
         .into_any_element()
 }
 
-/// The nick column, `cells` wide (the column's own width, or more on a
-/// line whose nick overflows it), nicks right-aligned against the text,
-/// a space after the time column when there is one. `cut` is the whole
-/// of a nick shortened even so (and the line's seq, for a stable id):
-/// hovering the column shows it.
-fn nick_column(app: &HircApp, cols: Columns, cells: usize, prefix: Runs, cut: Option<(String, u64)>) -> AnyElement {
+/// The nick column, nicks right-aligned against the text, a space after
+/// the time column when there is one. `cut` is the whole of a nick
+/// shortened to fit (and the line's seq, for a stable id): hovering the
+/// column shows it.
+fn nick_column(app: &HircApp, cols: Columns, prefix: Runs, cut: Option<(String, u64)>) -> AnyElement {
     let m = &app.metrics;
     let column = div()
         .flex_none()
@@ -483,7 +526,7 @@ fn nick_column(app: &HircApp, cols: Columns, cells: usize, prefix: Runs, cut: Op
         .justify_end()
         .overflow_hidden()
         .whitespace_nowrap()
-        .w(px(m.grid(cells)))
+        .w(px(m.grid(cols.nick)))
         .when(cols.time > 0, |d| d.ml(px(m.cell)))
         .child(prefix.element());
     match cut {

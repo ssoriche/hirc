@@ -337,7 +337,7 @@ impl Session {
         self.seq += 1;
         let time = msg.tag("time").and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map_or(now, |t| t.with_timezone(&Utc));
         let msgid = msg.tag("msgid").filter(|m| !m.is_empty()).map(str::to_owned);
-        Line { seq: self.seq, time, msgid, kind, nick: nick.map(str::to_owned), text, own, delivery: Delivery::Sent }
+        Line { seq: self.seq, time, msgid, kind, nick: nick.map(str::to_owned), text, own, delivery: Delivery::Sent, boundary: false }
     }
 
     fn peer(&self, nick: &str, change: PeerChange) -> Output {
@@ -536,7 +536,7 @@ impl Session {
 
     fn local(&mut self, kind: LineKind, text: String, now: DateTime<Utc>) -> Line {
         self.seq += 1;
-        Line { seq: self.seq, time: now, msgid: None, kind, nick: None, text, own: true, delivery: Delivery::Sent }
+        Line { seq: self.seq, time: now, msgid: None, kind, nick: None, text, own: true, delivery: Delivery::Sent, boundary: false }
     }
 
     /// PRIVMSG, split to fit. Each piece shows at once as our own line.
