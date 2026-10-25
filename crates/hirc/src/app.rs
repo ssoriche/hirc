@@ -4,11 +4,12 @@
 use crate::input::{Submit, TextInput, VimEvent};
 use crate::metrics::{Metrics, Shape};
 use crate::scroll::{self, Pos};
-use crate::theme::{Palette, palette};
+use crate::theme::{self, Palette, palette};
 use crate::views::{buffer, sidebar, viewport};
 use crate::vim::{self, Effect, Ex, Nav, Scroll};
 use gpui::{App, Context, Entity, Focusable, KeyBinding, ListAlignment, ListState, ScrollHandle, SharedString, Window, actions, div, list, prelude::*, px};
 use hirc_core::command::{self, Input, WindowAction};
+use hirc_core::display;
 use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::layout::{self, Layout};
 use hirc_core::store::{Applied, Buffer, LineKind, Network, Store};
@@ -52,6 +53,8 @@ pub struct Init {
     pub events: UnboundedReceiver<Event>,
     /// Snapshot runs neither read nor write the window layout.
     pub no_layout_file: bool,
+    /// A fixed clock for the lines hirc writes (snapshot fixtures).
+    pub clock: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub struct HircApp {
@@ -81,6 +84,8 @@ pub struct HircApp {
     nick_cells: usize,
     /// Wheel movement not yet a whole line.
     wheel: Rc<Cell<f32>>,
+    /// Each buffer's nick colour slots, and its line count when handed out.
+    nick_slots: HashMap<(usize, usize), (usize, HashMap<String, usize>)>,
     /// Lines arrived below while the view was scrolled up.
     fresh_below: bool,
     /// The channel a /join asked for, by network name: its window is
@@ -92,6 +97,7 @@ pub struct HircApp {
 impl HircApp {
     pub fn new(init: Init, window: &mut Window, cx: &mut Context<Self>) -> HircApp {
         let mut store = Store::new(init.networks.clone());
+        store.clock = init.clock;
         let layout_path = layout::path();
         let saved = if init.no_layout_file { None } else { Layout::load(&layout_path) };
         let missing = saved.is_none();
@@ -162,6 +168,7 @@ impl HircApp {
             lines: ListState::new(0, ListAlignment::Bottom, px(400.)).measure_all(),
             nick_cells: 0,
             wheel: Rc::default(),
+            nick_slots: HashMap::new(),
             fresh_below: false,
             pending_join: None,
             commands: init.commands,
@@ -187,6 +194,7 @@ impl HircApp {
         self.selected = Some((n, b));
         let buf = &mut self.store.networks[n].buffers[b];
         buf.unread = 0;
+        buf.mentions = 0;
         self.lines.reset(buf.lines.len());
         self.fresh_below = false;
         self.wheel.set(0.);
@@ -404,7 +412,9 @@ impl HircApp {
         if self.selected == Some((n, b)) {
             self.fresh_below |= !scroll::following(&self.lines);
             self.lines.splice(index..index, 1);
-            self.store.networks[n].buffers[b].unread = 0;
+            let buf = &mut self.store.networks[n].buffers[b];
+            buf.unread = 0;
+            buf.mentions = 0;
         }
     }
 
@@ -501,16 +511,43 @@ impl HircApp {
         }
     }
 
+    /// Hand out nick colours in the selected buffer (`theme::slots`), in
+    /// the order people first appear, again whenever its lines change.
+    fn refresh_nick_slots(&mut self) {
+        let Some((n, b)) = self.selected else { return };
+        let Some(buf) = self.store.networks.get(n).and_then(|net| net.buffers.get(b)) else { return };
+        if self.nick_slots.get(&(n, b)).is_some_and(|(len, _)| *len == buf.lines.len()) {
+            return;
+        }
+        let me = self.store.networks[n].nick.as_deref();
+        let channel = buf.target.name();
+        let nicks = buf.lines.iter().flat_map(|line| {
+            let parts = display::event_parts(line.kind, line.nick.as_deref(), &line.text, channel);
+            let named: Vec<String> = match parts {
+                Some(parts) => parts.into_iter().filter(|(part, _)| *part == display::Part::Nick).map(|(_, s)| s).collect(),
+                None => line.nick.iter().cloned().collect(),
+            };
+            named
+        });
+        let nicks: Vec<String> = nicks.filter(|nick| !me.is_some_and(|me| me.eq_ignore_ascii_case(nick))).collect();
+        let slots = theme::slots(nicks.iter().map(String::as_str), self.palette.nicks.len());
+        self.nick_slots.insert((n, b), (buf.lines.len(), slots));
+    }
+
     /// The note for the header when no server is configured.
     pub fn hint(&self) -> Option<&str> {
         self.hint.as_deref()
     }
 
     fn line_element(&mut self, ix: usize) -> gpui::AnyElement {
+        self.refresh_nick_slots();
+        let slots = self.selected.and_then(|key| self.nick_slots.get(&key)).map(|(_, s)| s);
+        let empty = HashMap::new();
+        let slots = slots.unwrap_or(&empty);
         match self.current().and_then(|(net, buf)| Some((net, buf, buf.lines.get(ix)?))) {
             Some((net, buf, line)) => {
                 let channel = matches!(buf.target, Target::Channel(_)).then(|| buf.target.name()).flatten();
-                buffer::line(self, line, &buffer::Context { me: net.nick.as_deref(), nick_cells: self.nick_cells, channel })
+                buffer::line(self, line, &buffer::Context { me: net.nick.as_deref(), nick_cells: self.nick_cells, channel, slots })
             }
             None => div().into_any_element(),
         }
@@ -550,7 +587,6 @@ impl Render for HircApp {
             .then(|| self.cut_head())
             .flatten()
             .and_then(|ix| self.current().and_then(|(_, buf)| buf.lines.get(ix)).map(|line| buffer::sticky(self, line, nick_cells)));
-        let reserve = if following { 0. } else { m.line };
         let lines = list(self.lines.clone(), cx.processor(|this, ix: usize, _window, _cx| this.line_element(ix))).size_full();
         let mut root = div().size_full();
         macro_rules! window_keys {
@@ -583,16 +619,9 @@ impl Render for HircApp {
                             .min_h(px(0.))
                             .flex()
                             .flex_col()
-                            .child(viewport::viewport(
-                                self.lines.clone(),
-                                lines.into_any_element(),
-                                m.line,
-                                m.edge,
-                                m.edge + reserve,
-                                self.wheel.clone(),
-                                sticky,
-                            ))
-                            .children(more),
+                            // The pane keeps the bars' own padding clear on
+                            // both sides of their rules.
+                            .child(viewport::viewport(self.lines.clone(), lines.into_any_element(), m.line, m.bar_pad(), self.wheel.clone(), sticky, more)),
                     )
                     .child(div().px(px(m.gutter)).py(px(m.bar_pad())).bg(p.input_bg).border_t_1().border_color(p.border).child(self.input.clone())),
             )

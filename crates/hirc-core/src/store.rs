@@ -45,12 +45,15 @@ pub struct Buffer {
     /// For channels: are we in it right now.
     pub joined: bool,
     pub unread: usize,
+    /// Unread lines meant for us: a message that names us, or anything
+    /// said in a query (irssi's highlight activity).
+    pub mentions: usize,
     msgids: HashSet<String>,
 }
 
 impl Buffer {
     pub fn new(target: Target) -> Buffer {
-        Buffer { target, lines: Vec::new(), topic: None, joined: false, unread: 0, msgids: HashSet::new() }
+        Buffer { target, lines: Vec::new(), topic: None, joined: false, unread: 0, mentions: 0, msgids: HashSet::new() }
     }
 
     /// Where the line went, or `None` if we already have its msgid.
@@ -98,6 +101,9 @@ pub enum Applied {
 pub struct Store {
     pub networks: Vec<Network>,
     local_seq: u64,
+    /// The time lines hirc writes itself are stamped with; `None` is the
+    /// wall clock. Fixtures set it so their screenshots keep one clock.
+    pub clock: Option<DateTime<Utc>>,
 }
 
 impl Store {
@@ -129,7 +135,7 @@ impl Store {
     /// A line hirc itself writes (errors, notices about input). Returns its index.
     pub fn push_local(&mut self, network: usize, buffer: usize, kind: LineKind, text: String) -> usize {
         self.local_seq += 1;
-        let line = Line { seq: u64::MAX / 2 + self.local_seq, time: Utc::now(), msgid: None, kind, nick: None, text, own: true };
+        let line = Line { seq: u64::MAX / 2 + self.local_seq, time: self.clock.unwrap_or_else(Utc::now), msgid: None, kind, nick: None, text, own: true };
         self.networks[network].buffers[buffer].insert(line).unwrap_or(0)
     }
 
@@ -179,11 +185,17 @@ impl Store {
                 let n = self.network_ix(&network);
                 let b = self.buffer_ix(n, &target);
                 let counts = !line.own && matches!(line.kind, LineKind::Privmsg | LineKind::Action | LineKind::Notice);
-                let buf = &mut self.networks[n].buffers[b];
+                let net = &mut self.networks[n];
+                let me = net.nick.as_deref();
+                let mention = counts && (matches!(target, Target::Query(_)) || me.is_some_and(|me| crate::display::mentions(&line.text, me)));
+                let buf = &mut net.buffers[b];
                 match buf.insert(line) {
                     Some(index) => {
                         if counts {
                             buf.unread += 1;
+                        }
+                        if mention {
+                            buf.mentions += 1;
                         }
                         Applied::Line { network: n, buffer: b, index }
                     }
@@ -258,6 +270,31 @@ mod tests {
         own.own = true;
         s.apply(Event::Line { network: "net".into(), target: Target::Channel("#a".into()), line: own });
         assert_eq!(s.networks[0].buffers[1].unread, 2);
+        assert_eq!(s.networks[0].buffers[1].mentions, 0);
+    }
+
+    #[test]
+    fn mentions_count_lines_meant_for_us() {
+        let mut s = Store::new(["net".to_string()]);
+        s.apply(Event::Status { network: "net".into(), status: ConnStatus::Connected { nick: "me".into() } });
+        let chan = || Target::Channel("#a".into());
+        s.apply(Event::Line { network: "net".into(), target: chan(), line: line(1, 1, None, "hello all") });
+        s.apply(Event::Line { network: "net".into(), target: chan(), line: line(2, 2, None, "Me: are you there?") });
+        s.apply(Event::Line { network: "net".into(), target: chan(), line: line(3, 3, None, "meme time") });
+        let b = s.buffer_ix(0, &chan());
+        assert_eq!((s.networks[0].buffers[b].unread, s.networks[0].buffers[b].mentions), (3, 1));
+        // Everything said in a query is for us.
+        s.apply(Event::Line { network: "net".into(), target: Target::Query("bob".into()), line: line(4, 4, None, "psst") });
+        let q = s.buffer_ix(0, &Target::Query("bob".into()));
+        assert_eq!(s.networks[0].buffers[q].mentions, 1);
+    }
+
+    #[test]
+    fn local_lines_use_the_store_clock() {
+        let mut s = Store::new(["net".to_string()]);
+        s.clock = Some(at(42));
+        let i = s.push_local(0, 0, LineKind::Server, "note".into());
+        assert_eq!(s.networks[0].buffers[0].lines[i].time, at(42));
     }
 
     #[test]

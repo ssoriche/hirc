@@ -2,6 +2,7 @@
 
 use gpui::{Hsla, rgba};
 use hirc_core::theme::{Color, Theme};
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct Palette {
@@ -21,12 +22,15 @@ pub struct Palette {
     pub hover: Hsla,
     /// The selected sidebar row's fill, distinct from `background` (see `fill`).
     pub selected: Hsla,
+    /// Our own nick (`buffer.nickname`, in bold): no one else gets it.
     pub nickname: Hsla,
     /// Other people's nicks: the theme's nickname colour turned around the
-    /// hue wheel (see `nick_hues`); pick one with `nick`.
+    /// hue wheel (see `nick_hues`); a buffer hands them out with `slots`.
     pub nicks: Vec<Hsla>,
     /// Background of a line that mentions us (`buffer.highlight`).
     pub highlight: Hsla,
+    /// The same role behind a window's count of mentions, in the list.
+    pub mention: Hsla,
     /// Selected text in the input (`buffer.selection`, by contrast).
     pub selection: Hsla,
     pub timestamp: Hsla,
@@ -72,10 +76,16 @@ fn fill(bg: Color, candidates: &[Color]) -> Color {
 }
 
 /// How many hues nick colours are picked from (some are skipped).
-const NICK_HUES: usize = 8;
+const NICK_HUES: usize = 16;
+/// Derived nicks sit in a contrast band from the theme nickname's own
+/// contrast up by this much, so every nick weighs about the same.
+const NICK_BAND: f32 = 1.;
 /// Least contrast a derived nick colour gets against the buffer (WCAG's
 /// minimum for large or bold text; themes often set nicks near it).
 const NICK_CONTRAST_MIN: f32 = 3.;
+/// The band starts no higher than this: a theme whose nickname is near
+/// white would push every derived hue to a pastel that reads as body text.
+const NICK_CONTRAST_MAX: f32 = 7.;
 /// How far (in turns) a nick hue keeps from a hue with another meaning.
 const HUE_CLEARANCE: f32 = 0.05;
 
@@ -117,14 +127,16 @@ fn from_hsl(h: f32, s: f32, l: f32) -> Color {
 }
 
 /// Nick colours derived from the theme: `nickname` first, then the same
-/// saturation and lightness at evenly spaced hues, skipping hues close to
-/// the colours that mean something else in the buffer (`avoid`: actions,
-/// events, errors), so a nick never reads as one of those. A hue that reads darker
-/// (blue) or lighter (yellow) is moved away from `bg` in lightness until it
-/// is as legible as `nickname`, and at least `NICK_CONTRAST_MIN` (capped at
-/// WCAG AA), so no derived nick is harder to read than the theme's own.
+/// saturation at evenly spaced hues, skipping hues close to the colours
+/// that mean something else in the buffer (`avoid`: actions, events,
+/// errors), so a nick never reads as one of those. Each derived hue takes
+/// the lightness that puts it in one contrast band against `bg`, from the
+/// theme nickname's own contrast (kept between `NICK_CONTRAST_MIN` and
+/// `NICK_CONTRAST_MAX`) up by `NICK_BAND`: every nick is legible, none
+/// shouts because of its hue, and none fades into the body text. Neighbouring hues alternate between the low
+/// and high end of the band, so they differ in lightness too.
 fn nick_hues(nickname: Color, bg: Color, avoid: &[Color]) -> Vec<Color> {
-    let (h, s, l) = to_hsl(nickname);
+    let (h, s, _) = to_hsl(nickname);
     let taken: Vec<f32> = avoid.iter().map(|c| to_hsl(*c)).filter(|(_, s, _)| *s > 0.2).map(|(h, ..)| h).collect();
     let near = |hue: f32| {
         taken.iter().any(|t| {
@@ -132,8 +144,8 @@ fn nick_hues(nickname: Color, bg: Color, avoid: &[Color]) -> Vec<Color> {
             d.min(1. - d) < HUE_CLEARANCE
         })
     };
-    let want = contrast(nickname, bg).clamp(NICK_CONTRAST_MIN, 4.5);
-    let step = if luminance(bg) < 0.5 { 0.01 } else { -0.01 };
+    let want = contrast(nickname, bg).clamp(NICK_CONTRAST_MIN, NICK_CONTRAST_MAX);
+    let dark = luminance(bg) < 0.5;
     (0..NICK_HUES)
         .filter_map(|i| {
             if i == 0 {
@@ -143,15 +155,43 @@ fn nick_hues(nickname: Color, bg: Color, avoid: &[Color]) -> Vec<Color> {
             if near(hue) {
                 return None;
             }
-            let mut l = l;
-            let mut c = from_hsl(hue, s, l);
-            while contrast(c, bg) < want && (0.0..=1.0).contains(&(l + step)) {
-                l += step;
-                c = from_hsl(hue, s, l);
-            }
-            Some(c)
+            let aim = want + if i % 2 == 0 { 0.2 } else { 0.8 } * NICK_BAND;
+            // Lightnesses on the far side of the background, closest to `aim`.
+            (0..=1000)
+                .map(|k| from_hsl(hue, s, k as f32 / 1000.))
+                .filter(|c| (luminance(*c) > luminance(bg)) == dark)
+                .min_by(|a, b| (contrast(*a, bg) - aim).abs().total_cmp(&(contrast(*b, bg) - aim).abs()))
         })
         .collect()
+}
+
+/// Colour slots for the nicks of one buffer, in the order they first
+/// appear: each takes the free slot furthest (in hue) from those already
+/// taken, the hashed slot (`nick_slot`) breaking ties, so the people in a
+/// conversation never share a colour while there are slots to go round,
+/// and the first few are as far apart as the wheel allows. Keys are
+/// ASCII-lowercased, as IRC compares nicks.
+pub fn slots<'a>(nicks: impl IntoIterator<Item = &'a str>, count: usize) -> HashMap<String, usize> {
+    let mut out: HashMap<String, usize> = HashMap::new();
+    let mut used = vec![false; count];
+    for nick in nicks {
+        let key = nick.to_ascii_lowercase();
+        if count == 0 || out.contains_key(&key) {
+            continue;
+        }
+        let start = nick_slot(nick, count);
+        // Slots sit in hue order: take the free one furthest from every
+        // slot in use, nearest the hashed slot among equals.
+        let ring = |a: usize, b: usize| {
+            let d = a.abs_diff(b);
+            d.min(count - d)
+        };
+        let clear = |s: usize| (0..count).filter(|&u| used[u]).map(|u| ring(s, u)).min().unwrap_or(count);
+        let slot = (0..count).filter(|&s| !used[s]).max_by_key(|&s| (clear(s), std::cmp::Reverse(ring(s, start)))).unwrap_or(start);
+        used[slot] = true;
+        out.insert(key, slot);
+    }
+    out
 }
 
 /// A stable slot among `slots` colours for `nick` (FNV-1a over the
@@ -162,9 +202,11 @@ pub fn nick_slot(nick: &str, slots: usize) -> usize {
 }
 
 impl Palette {
-    /// The colour for someone else's nick.
-    pub fn nick(&self, nick: &str) -> Hsla {
-        self.nicks.get(nick_slot(nick, self.nicks.len())).copied().unwrap_or(self.nickname)
+    /// The colour for someone else's nick: its slot in `slots` (see
+    /// `slots`), else its hashed slot.
+    pub fn nick(&self, nick: &str, slots: &HashMap<String, usize>) -> Hsla {
+        let slot = slots.get(&nick.to_ascii_lowercase()).copied().unwrap_or_else(|| nick_slot(nick, self.nicks.len()));
+        self.nicks.get(slot).copied().unwrap_or(self.nickname)
     }
 }
 
@@ -186,9 +228,11 @@ pub fn palette(t: &Theme) -> Palette {
         nickname: c(t.buffer.nickname),
         nicks: nick_hues(t.buffer.nickname, t.buffer.background, &[t.buffer.action, t.buffer.server_messages.default, t.text.error])
             .into_iter()
+            .skip(1)
             .map(c)
             .collect(),
         highlight: c(fill(t.buffer.background, &[t.buffer.highlight, t.buffer.selection, t.buffer.border_selected])),
+        mention: c(fill(t.general.background, &[t.buffer.highlight, t.buffer.border_selected, t.buffer.selection])),
         selection: c(fill(t.buffer.background_text_input, &[t.buffer.selection, t.buffer.border_selected, t.buffer.highlight])),
         timestamp: c(t.buffer.timestamp),
         action: c(t.buffer.action),
@@ -226,8 +270,10 @@ mod tests {
             let hues = nick_hues(nick, bg, &[]);
             assert_eq!(hues.len(), NICK_HUES);
             assert_eq!(hues[0], nick);
-            let want = contrast(nick, bg).clamp(NICK_CONTRAST_MIN, 4.5) - 0.05;
-            assert!(hues[1..].iter().all(|c| contrast(*c, bg) >= want), "{hues:?}");
+            // One contrast band: none harder to read than the theme's own,
+            // none much louder.
+            let want = contrast(nick, bg).clamp(NICK_CONTRAST_MIN, NICK_CONTRAST_MAX);
+            assert!(hues[1..].iter().all(|c| (want - 0.15..=want + NICK_BAND + 0.15).contains(&contrast(*c, bg))), "{hues:?}");
             for (i, a) in hues.iter().enumerate() {
                 assert!(hues[i + 1..].iter().all(|b| b != a));
             }
@@ -261,6 +307,20 @@ mod tests {
         let used: std::collections::HashSet<_> =
             ["alice", "bob", "carol", "dave", "erin", "frank", "gina", "henry"].map(|n| nick_slot(n, 8)).into_iter().collect();
         assert!(used.len() >= 5, "{used:?}");
+    }
+
+    #[test]
+    fn a_buffer_hands_out_distinct_slots_in_order() {
+        let nicks = ["alice", "bob", "carol", "dave", "erin", "dave_away", "x", "a_really_long_nickname"];
+        let got = slots(nicks, 8);
+        let distinct: std::collections::HashSet<_> = got.values().collect();
+        assert_eq!(distinct.len(), 8, "{got:?}");
+        // The first to speak keeps its hashed slot; case does not matter.
+        assert_eq!(got["alice"], nick_slot("alice", 8));
+        assert_eq!(slots(["Bob", "bob"], 8).len(), 1);
+        // More nicks than slots: the rest share, from their hashed slot.
+        assert_eq!(slots(nicks, 3).len(), nicks.len());
+        assert!(slots(nicks, 0).is_empty());
     }
 
     #[test]

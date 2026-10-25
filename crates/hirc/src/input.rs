@@ -327,7 +327,7 @@ struct TextElement {
 
 struct PrepaintState {
     line: Option<ShapedLine>,
-    /// The placeholder, drawn clear of the cursor so it never covers it.
+    /// The placeholder, on the text column under the cursor.
     placeholder: Option<ShapedLine>,
     /// The Normal-mode block, drawn under the text (its glyph is inverted).
     block: Option<PaintQuad>,
@@ -429,7 +429,19 @@ impl Element for TextElement {
             let run = TextRun { len: s.len(), font: style.font(), color, background_color: None, underline: None, strikethrough: None };
             window.text_system().shape_line(s, font_size, &[run], None)
         };
-        let placeholder = (input.content.is_empty() && !input.placeholder.is_empty()).then(|| shape(input.placeholder.clone(), hint));
+        // The placeholder starts on the text column, where typing will:
+        // the bar sits over its first cell, and under the Normal block its
+        // first glyph is reversed, as typed text would be.
+        let under_block = normal && input.focus_handle.is_focused(window);
+        let placeholder = (input.content.is_empty() && !input.placeholder.is_empty()).then(|| {
+            let first = if under_block { next_char_boundary(&input.placeholder, 0) } else { 0 };
+            let runs: Vec<TextRun> = [(first, bg), (input.placeholder.len() - first, hint)]
+                .into_iter()
+                .filter(|(len, _)| *len > 0)
+                .map(|(len, color)| TextRun { len, font: style.font(), color, background_color: None, underline: None, strikethrough: None })
+                .collect();
+            window.text_system().shape_line(input.placeholder.clone(), font_size, &runs, None)
+        });
         let line = window.text_system().shape_line(shown.clone(), font_size, &runs, None);
 
         // Keep the cursor two cells clear of each edge, so the `…` marks
@@ -439,7 +451,7 @@ impl Element for TextElement {
         let scroll_x = px(scroll_for_cursor(f32::from(prev_scroll), f32::from(line.x_for_index(cursor)), f32::from(line.width), view, margin, 2. * m.caret));
         let origin_x = bounds.left() - scroll_x;
         let cursor_pos = line.x_for_index(cursor);
-        let glyph_top = bounds.top() + px(m.glyph_top());
+        let glyph_top = bounds.top() + px(m.glyph_top);
         let (mut block, mut caret, mut selection) = (None, None, None);
         if !selected_range.is_empty() {
             selection = Some(fill(
@@ -492,9 +504,6 @@ impl Element for TextElement {
         let caret = prepaint.caret.take().filter(|_| focused);
         let origin = point(bounds.origin.x - prepaint.scroll_x, bounds.origin.y);
         let line_height = window.line_height();
-        // The placeholder starts a cell and a bar clear of the cursor, so
-        // neither the bar nor the block ever sits on it.
-        let hint_x = self.input.read(cx).metrics.map_or(px(0.), |m| px(m.cell + 2. * m.caret));
         // The line is scrolled, so keep everything inside the input's bounds.
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for quad in [prepaint.selection.take(), block].into_iter().flatten() {
@@ -504,7 +513,7 @@ impl Element for TextElement {
                 tracing::debug!("input paint failed: {e}");
             }
             if let Some(placeholder) = prepaint.placeholder.take()
-                && let Err(e) = placeholder.paint(point(bounds.origin.x + hint_x, bounds.origin.y), line_height, gpui::TextAlign::Left, None, window, cx)
+                && let Err(e) = placeholder.paint(bounds.origin, line_height, gpui::TextAlign::Left, None, window, cx)
             {
                 tracing::debug!("input paint failed: {e}");
             }

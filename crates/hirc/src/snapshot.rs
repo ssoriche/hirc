@@ -220,6 +220,18 @@ fn feed_line(session: &mut Session, network: &str, line: &str, now: DateTime<Utc
     Ok(take(session, network, msg, now, events))
 }
 
+/// When a fixture's lines end: a second after the latest one.
+fn clock(fx: &Fixture) -> Result<DateTime<Utc>, String> {
+    let base = DateTime::parse_from_rfc3339(fx.base_time.as_deref().unwrap_or(DEFAULT_BASE)).map_err(|e| format!("bad base_time: {e}"))?.with_timezone(&Utc);
+    let times = fx.server.iter().flat_map(|srv| {
+        srv.lines.iter().enumerate().map(move |(i, line)| {
+            let at = Message::parse(line).ok().and_then(|m| m.tag("time").and_then(|t| DateTime::parse_from_rfc3339(t).ok())).map(|t| t.with_timezone(&Utc));
+            at.unwrap_or_else(|| base + Delta::seconds(i as i64))
+        })
+    });
+    Ok(times.max().unwrap_or(base) + Delta::seconds(1))
+}
+
 /// Run every server's lines through a real `Session`, as the network
 /// thread would. Returns the events for the UI and the sessions, which keep
 /// answering commands afterwards. A server whose connection ended (`Stop`,
@@ -337,6 +349,9 @@ pub struct Plan {
     scale: f32,
     pub theme: Option<String>,
     serve: Option<Serve>,
+    /// The fixture's "now": a second after its last line. Replies to
+    /// commands and hirc's own lines carry it, so a shot shows one clock.
+    pub clock: DateTime<Utc>,
 }
 
 pub fn fail(reason: &str) -> ! {
@@ -351,6 +366,7 @@ impl Plan {
         let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
         let fixture = parse_fixture(&text)?;
         let canned = Some(feed(&fixture)?);
+        let clock = clock(&fixture)?;
         let size = match std::env::var("HIRC_SIZE") {
             Ok(s) => parse_size(&s).ok_or_else(|| format!("bad HIRC_SIZE {s:?}, want WxH"))?,
             Err(_) => (1200., 800.),
@@ -372,6 +388,7 @@ impl Plan {
             scale,
             theme: std::env::var("HIRC_THEME").ok().filter(|t| !t.is_empty()),
             serve: None,
+            clock,
         }))
     }
 
@@ -400,6 +417,7 @@ impl Plan {
             return (cmd_tx, ev_rx);
         }
         let fed = self.fed.clone();
+        let clock = self.clock;
         std::thread::spawn(move || {
             for ev in events {
                 let _ = ev_tx.send(ev);
@@ -407,7 +425,7 @@ impl Plan {
             fed.store(true, Ordering::SeqCst);
             let mut echoes = 0;
             while let Some(cmd) = cmd_rx.blocking_recv() {
-                for e in serve(&mut sessions, cmd, Utc::now(), &mut echoes) {
+                for e in serve(&mut sessions, cmd, clock, &mut echoes) {
                     let _ = ev_tx.send(e);
                 }
             }
@@ -567,11 +585,12 @@ fn offscreen(mut plan: Plan, init: Init) -> Result<(), String> {
         .open_window(size(px(w), px(h)), |window, cx| cx.new(|cx| HircApp::new(init, window, cx)))
         .map_err(|e| format!("cannot open headless window: {e}"))?;
     if let Some((mut sessions, mut cmd_rx, ev_tx)) = plan.serve.take() {
+        let clock = plan.clock;
         cx.update(|cx| {
             cx.spawn(async move |_| {
                 let mut echoes = 0;
                 while let Some(cmd) = cmd_rx.recv().await {
-                    for e in serve(&mut sessions, cmd, Utc::now(), &mut echoes) {
+                    for e in serve(&mut sessions, cmd, clock, &mut echoes) {
                         let _ = ev_tx.send(e);
                     }
                 }
@@ -748,6 +767,15 @@ mod tests {
             _ => None,
         });
         assert!(t.unwrap() > base);
+    }
+
+    #[test]
+    fn the_fixture_clock_follows_its_last_line() {
+        let fx = parse_fixture(DEMO).unwrap();
+        let (events, _) = feed(&fx).unwrap();
+        let last = events.iter().filter_map(|e| if let Event::Line { line, .. } = e { Some(line.time) } else { None }).max().unwrap();
+        let now = clock(&fx).unwrap();
+        assert!(now > last && now - last < Delta::minutes(1), "{now} vs {last}");
     }
 
     #[test]

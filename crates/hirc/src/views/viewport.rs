@@ -1,8 +1,10 @@
 //! The message view's frame: it gives the line list a height of whole text
-//! lines (the remainder becomes space above it, so no row is ever cut by
-//! the title bar), keeps `bottom` clear above the input bar, and turns the
-//! wheel into whole-line steps on the same grid as the vim keys. An
-//! optional `sticky` row is drawn over the list's top row.
+//! lines, so no row is ever cut, with at least `pad` clear above and below;
+//! the remainder is split between the two, so the view sits centred
+//! between the title bar and the input bar at any window height. It turns
+//! the wheel into whole-line steps on the same grid as the vim keys. An
+//! optional `sticky` row is drawn over the list's top row, and an optional
+//! `footer` takes the bottom row for itself (the list gives it up).
 
 use crate::scroll;
 use gpui::{
@@ -16,18 +18,35 @@ pub struct Viewport {
     list: ListState,
     child: AnyElement,
     line: f32,
-    top: f32,
-    bottom: f32,
+    pad: f32,
     /// Wheel movement not yet a whole line.
     wheel: Rc<Cell<f32>>,
     sticky: Option<AnyElement>,
+    footer: Option<AnyElement>,
 }
 
 /// `child` is the list drawn from `list`; it must fill its parent
-/// (`size_full`). At least `top` and `bottom` px stay clear above and below.
-/// `sticky`, one line tall, is drawn over the list's first visible row.
-pub fn viewport(list: ListState, child: AnyElement, line: f32, top: f32, bottom: f32, wheel: Rc<Cell<f32>>, sticky: Option<AnyElement>) -> Viewport {
-    Viewport { list, child, line, top, bottom, wheel, sticky }
+/// (`size_full`). At least `pad` px stay clear above and below. `sticky`,
+/// one line tall, is drawn over the list's first visible row; `footer`,
+/// one line tall, below its last.
+pub fn viewport(
+    list: ListState,
+    child: AnyElement,
+    line: f32,
+    pad: f32,
+    wheel: Rc<Cell<f32>>,
+    sticky: Option<AnyElement>,
+    footer: Option<AnyElement>,
+) -> Viewport {
+    Viewport { list, child, line, pad, wheel, sticky, footer }
+}
+
+/// Clear space above and below `lines` whole lines in `height`, at least
+/// `pad` each: the remainder is split, the odd px going below.
+pub fn margins(height: f32, line: f32, pad: f32) -> (usize, f32, f32) {
+    let (lines, spare) = scroll::whole_lines(height - 2. * pad, line);
+    let above = (spare / 2.).floor();
+    (lines, pad + above, pad + spare - above)
 }
 
 impl IntoElement for Viewport {
@@ -66,15 +85,21 @@ impl Element for Viewport {
         window: &mut Window,
         cx: &mut App,
     ) -> Hitbox {
-        let (lines, spare) = scroll::whole_lines(f32::from(bounds.size.height) - self.top - self.bottom, self.line);
-        let height = px(lines as f32 * self.line);
+        let (lines, above, _) = margins(f32::from(bounds.size.height), self.line, self.pad);
+        let rows = lines.saturating_sub(usize::from(self.footer.is_some()));
+        let height = px(rows as f32 * self.line);
         let available = size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::Definite(height));
         self.child.layout_as_root(available, window, cx);
-        let origin = point(bounds.origin.x, bounds.origin.y + px(self.top + spare));
+        let origin = point(bounds.origin.x, bounds.origin.y + px(above));
         self.child.prepaint_at(origin, window, cx);
+        let row = size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::Definite(px(self.line)));
         if let Some(sticky) = &mut self.sticky {
-            sticky.layout_as_root(size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::Definite(px(self.line))), window, cx);
+            sticky.layout_as_root(row, window, cx);
             sticky.prepaint_at(origin, window, cx);
+        }
+        if let Some(footer) = &mut self.footer {
+            footer.layout_as_root(row, window, cx);
+            footer.prepaint_at(origin + point(px(0.), height), window, cx);
         }
         window.insert_hitbox(bounds, HitboxBehavior::Normal)
     }
@@ -93,6 +118,9 @@ impl Element for Viewport {
         if let Some(sticky) = &mut self.sticky {
             sticky.paint(window, cx);
         }
+        if let Some(footer) = &mut self.footer {
+            footer.paint(window, cx);
+        }
         let (list, line, wheel, hitbox, view) = (self.list.clone(), self.line, self.wheel.clone(), hitbox.clone(), window.current_view());
         // Capture phase, so the list's own pixel scrolling never runs.
         window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
@@ -110,5 +138,23 @@ impl Element for Viewport {
             cx.stop_propagation();
             cx.notify(view);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spare_space_is_split_above_and_below() {
+        // 3 px over 10 whole lines of 21: 1 above, 2 below.
+        assert_eq!(margins(10. * 21. + 20. + 3., 21., 10.), (10, 11., 12.));
+        // An exact fit leaves just the pad.
+        assert_eq!(margins(10. * 21. + 20., 21., 10.), (10, 10., 10.));
+        // Never more than half a line beyond the pad on either side.
+        for h in 300..400 {
+            let (_, above, below) = margins(h as f32, 21., 10.);
+            assert!(above >= 10. && below >= 10. && above <= 20.5 && below <= 21. && below - above <= 1., "{h}");
+        }
     }
 }

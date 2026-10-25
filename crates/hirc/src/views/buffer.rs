@@ -12,10 +12,11 @@
 use crate::app::HircApp;
 use crate::metrics::{Metrics, TIME_CELLS};
 use crate::theme::Palette;
-use gpui::{AnyElement, FontWeight, HighlightStyle, Hsla, IntoElement, StyledText, TextRun, Window, div, prelude::*, px};
+use gpui::{AnyElement, FontWeight, HighlightStyle, Hsla, IntoElement, SharedString, StyledText, TextRun, Window, div, prelude::*, px};
 use hirc_core::display::{self, Part};
 use hirc_core::event::{ConnStatus, Target};
 use hirc_core::store::{Line, LineKind};
+use std::collections::HashMap;
 
 /// The title bar: the window's name, its network (as the window list tags
 /// it) or, for a server, its connection state, then the topic. Each part
@@ -82,10 +83,14 @@ pub fn title(app: &HircApp, window: &Window, pane: f32) -> impl IntoElement {
         }
     };
     let inner = (pane - 2. * m.gutter).max(0.);
-    let gap = m.cell;
+    // One cell inside the window's identity (name, network), two between
+    // it and what follows (state, topic), so the topic never reads as
+    // part of the tag.
+    let gap = m.grid(1);
+    let slot_gap = m.grid(2);
     let (tag, tag_w) = match tag {
         Some((t, c)) => {
-            let (t, w) = fit(&t, m.small, (inner * TAG_SHARE).max(m.tag_max()));
+            let (t, w) = fit(&t, m.size, (inner * TAG_SHARE).max(m.tag_max()));
             (Some((t, c)), w + gap)
         }
         None => (None, 0.),
@@ -96,7 +101,7 @@ pub fn title(app: &HircApp, window: &Window, pane: f32) -> impl IntoElement {
     // colour up to the cut, and the ellipsis takes the colour it ends.
     let slot = (!slot.is_empty()).then(|| {
         let text = slot.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join(" ");
-        let (shown, _) = fit(&text, m.size, (inner - name_w - tag_w - gap).max(0.));
+        let (shown, _) = fit(&text, m.size, (inner - name_w - tag_w - slot_gap).max(0.));
         let head = if shown == text { text.len() } else { shown.len() - '…'.len_utf8() };
         let mut runs = Runs::default();
         for (s, color) in clip_pieces(&slot, head) {
@@ -113,8 +118,8 @@ pub fn title(app: &HircApp, window: &Window, pane: f32) -> impl IntoElement {
         .border_b_1()
         .border_color(p.border)
         .child(part().text_color(p.text).child(name))
-        .children(tag.map(|(t, c)| part().ml(px(gap)).text_size(px(m.small)).relative().top(px(m.small_drop)).text_color(c).child(t)))
-        .children(slot.map(|t| part().flex_shrink(1.).min_w(px(0.)).ml(px(gap)).child(t)))
+        .children(tag.map(|(t, c)| part().ml(px(gap)).text_color(c).child(t)))
+        .children(slot.map(|t| part().flex_shrink(1.).min_w(px(0.)).ml(px(slot_gap)).child(t)))
 }
 
 /// `pieces` joined by spaces and cut after byte `head` of the joined
@@ -191,6 +196,8 @@ pub struct Context<'a> {
     pub nick_cells: usize,
     /// The channel, in a channel's buffer (join and part lines name it).
     pub channel: Option<&'a str>,
+    /// Each nick's colour slot in this buffer (`theme::slots`).
+    pub slots: &'a HashMap<String, usize>,
 }
 
 /// Text with coloured (and possibly bold) runs.
@@ -214,13 +221,13 @@ impl Runs {
     }
 }
 
-/// A nick, as the nick column or an event shows it: ours in the primary
-/// text colour and bold, anyone else's in their own colour.
-fn nick_run(runs: &mut Runs, p: &Palette, nick: &str, me: Option<&str>) {
-    if me.is_some_and(|me| me.eq_ignore_ascii_case(nick)) {
-        runs.push(nick, p.text, true);
+/// A nick, as the nick column or an event shows it: ours in the theme's
+/// nickname colour and bold, anyone else's in their own colour.
+fn nick_run(runs: &mut Runs, p: &Palette, nick: &str, cx: &Context) {
+    if cx.me.is_some_and(|me| me.eq_ignore_ascii_case(nick)) {
+        runs.push(nick, p.nickname, true);
     } else {
-        runs.push(nick, p.nick(nick), false);
+        runs.push(nick, p.nick(nick, cx.slots), false);
     }
 }
 
@@ -234,20 +241,29 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
     let mention =
         !own && matches!(line.kind, LineKind::Privmsg | LineKind::Action | LineKind::Notice) && cx.me.is_some_and(|me| display::mentions(&line.text, me));
     let (mut prefix, mut body) = (Runs::default(), Runs::default());
+    // A nick cut to fit the column; the whole of it shows on hover.
+    let mut cut = None;
+    let mut fit_nick = |cells: usize| {
+        let shown = fit(nick, cells);
+        if shown != nick {
+            cut = Some(nick.to_owned());
+        }
+        shown
+    };
     match line.kind {
         LineKind::Privmsg => {
-            nick_run(&mut prefix, p, &fit(nick, cells), cx.me);
+            nick_run(&mut prefix, p, &fit_nick(cells), cx);
             body.push(&line.text, p.text, false);
         }
         LineKind::Notice if !nick.is_empty() => {
             prefix.push("-", p.text_dim, false);
-            nick_run(&mut prefix, p, &fit(nick, cells.saturating_sub(2).max(1)), cx.me);
+            nick_run(&mut prefix, p, &fit_nick(cells.saturating_sub(2).max(1)), cx);
             prefix.push("-", p.text_dim, false);
             body.push(&line.text, p.text, false);
         }
         LineKind::Action => {
             prefix.push("*", p.action, false);
-            nick_run(&mut body, p, nick, cx.me);
+            nick_run(&mut body, p, nick, cx);
             body.push(" ", p.action, false).push(&line.text, p.action, false);
         }
         LineKind::Error => {
@@ -260,18 +276,27 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
         }
         kind => {
             prefix.push(display::marker(kind), p.server, false);
-            // Membership noise recedes; changes to the channel keep the
-            // event colour. Nicks are nick-coloured and free text (reasons,
-            // topics) uses the topic role, so the client's wording stands
-            // apart from what people typed.
-            let verb = if display::is_noise(kind) { p.text_dim } else { p.server };
+            // The marker carries the event's colour; the client's own
+            // wording is quiet, so what changed reads first. Membership
+            // noise (joins, parts, quits, renames) recedes to the timestamp
+            // role; changes to the channel (kicks, topics, modes) keep
+            // their wording in text.secondary. Nicks are nick-coloured, a
+            // reason is text.secondary, a new topic is in the topic role
+            // (as the title bar shows it) and mode arguments are text.
+            let noise = display::is_noise(kind);
+            let verb = if noise { p.timestamp } else { p.text_dim };
+            let free = match kind {
+                LineKind::Topic => p.topic,
+                LineKind::Mode => p.text,
+                _ => p.text_dim,
+            };
             match display::event_parts(kind, line.nick.as_deref(), &line.text, cx.channel) {
                 Some(parts) => {
                     for (part, s) in parts {
                         match part {
-                            Part::Nick => nick_run(&mut body, p, &s, cx.me),
-                            Part::Verb => _ = body.push(&s, verb, false),
-                            Part::Channel | Part::Free => _ = body.push(&s, p.topic, false),
+                            Part::Nick => nick_run(&mut body, p, &s, cx),
+                            Part::Verb | Part::Channel => _ = body.push(&s, verb, false),
+                            Part::Free => _ = body.push(&s, free, false),
                         }
                     }
                 }
@@ -290,7 +315,7 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
         .px(px(m.gutter))
         .when(mention, |d| d.bg(p.highlight))
         .child(div().flex_none().w(px(m.grid(TIME_CELLS))).whitespace_nowrap().text_color(if mention { p.text_dim } else { p.timestamp }).child(time))
-        .child(nick_column(m, cells, prefix))
+        .child(nick_column(app, cells, prefix, cut.map(|full| (full, line.seq))))
         .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).child(body.element()))
         .into_any_element()
 }
@@ -317,19 +342,56 @@ pub fn sticky(app: &HircApp, line: &Line, cells: usize) -> gpui::AnyElement {
         .px(px(m.gutter))
         .text_color(p.timestamp)
         .child(div().flex_none().w(px(m.grid(TIME_CELLS))).whitespace_nowrap().child(time))
-        .child(nick_column(m, cells, prefix))
+        .child(nick_column(app, cells, prefix, None))
         .into_any_element()
 }
 
-fn nick_column(m: &Metrics, cells: usize, prefix: Runs) -> impl IntoElement {
-    div().flex_none().flex().justify_end().overflow_hidden().whitespace_nowrap().w(px(m.grid(cells))).ml(px(m.cell)).child(prefix.element())
+/// The nick column, `cells` wide, nicks right-aligned against the text.
+/// `cut` is the whole of a nick the column shortened (and the line's
+/// seq, for a stable id): hovering the column shows it.
+fn nick_column(app: &HircApp, cells: usize, prefix: Runs, cut: Option<(String, u64)>) -> AnyElement {
+    let m = &app.metrics;
+    let column = div().flex_none().flex().justify_end().overflow_hidden().whitespace_nowrap().w(px(m.grid(cells))).ml(px(m.cell)).child(prefix.element());
+    match cut {
+        None => column.into_any_element(),
+        Some((full, seq)) => {
+            let tip = Tip { text: full.into(), palette: app.palette.clone(), metrics: app.metrics, font: app.font.family.clone() };
+            column.id(SharedString::from(format!("nick-{seq}"))).tooltip(move |_, cx| cx.new(|_| tip.clone()).into()).into_any_element()
+        }
+    }
+}
+
+/// A hover note in the title bar's colours: one line of text.
+#[derive(Clone)]
+struct Tip {
+    text: SharedString,
+    palette: Palette,
+    metrics: Metrics,
+    font: SharedString,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        let (p, m) = (&self.palette, &self.metrics);
+        div()
+            .font_family(self.font.clone())
+            .text_size(px(m.size))
+            .line_height(px(m.line))
+            .px(px(m.cell))
+            .bg(p.title_bg)
+            .border_1()
+            .border_color(p.border)
+            .text_color(p.text)
+            .whitespace_nowrap()
+            .child(self.text.clone())
+    }
 }
 
 /// The bottom row while the view is scrolled away from the newest line:
 /// how many rows are below (the `j` presses back to the bottom), irssi's
 /// `-- more --` style. The count takes the unread colour once new lines
-/// have arrived below.
-pub fn more(app: &HircApp, below: usize, top: bool, fresh: bool) -> impl IntoElement {
+/// have arrived below. The viewport gives it a row of its own.
+pub fn more(app: &HircApp, below: usize, top: bool, fresh: bool) -> AnyElement {
     let p = &app.palette;
     let m = &app.metrics;
     let mut runs = Runs::default();
@@ -338,7 +400,7 @@ pub fn more(app: &HircApp, below: usize, top: bool, fresh: bool) -> impl IntoEle
         p.text_dim,
         false,
     );
-    div().absolute().left_0().right_0().bottom(px(m.edge)).h(px(m.line)).px(px(m.gutter)).bg(p.buffer_bg).child(runs.element())
+    div().w_full().h(px(m.line)).px(px(m.gutter)).child(runs.element()).into_any_element()
 }
 
 #[cfg(test)]

@@ -30,17 +30,20 @@ impl Shape {
 
 /// Line height as a multiple of the font size.
 const LINE: f32 = 1.5;
-/// Secondary text (network tags) as a fraction of the font size.
-const SMALL: f32 = 6. / 7.;
 /// The window list's width in cells, and its limits.
 const SIDEBAR_CELLS: f32 = 26.;
 const SIDEBAR_MIN_CELLS: f32 = 16.;
 /// The most of the window the list may take.
 const SIDEBAR_MAX_SHARE: f32 = 0.3;
+/// Cells the message view keeps before the list takes more than its
+/// minimum: the time and nick columns and about 40 cells of text.
+const MESSAGE_CELLS: f32 = 60.;
 /// Unread counts get this many cells; larger counts are abbreviated.
 pub const COUNT_CELLS: usize = 3;
-/// A network tag never takes more than this many (small) cells.
+/// A network tag never takes more than this many cells, and gives up
+/// cells to the label down to `TAG_MIN_CELLS` (an ellipsis included).
 const TAG_CELLS: f32 = 8.;
+const TAG_MIN_CELLS: f32 = 5.;
 /// Message lines: the timestamp (`HH:MM`) and the nick column, in cells.
 pub const TIME_CELLS: usize = 5;
 const NICK_MIN_CELLS: usize = 3;
@@ -53,10 +56,9 @@ const LABEL_MIN_CELLS: f32 = 6.;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Metrics {
-    /// The configured font size.
+    /// The configured font size: every piece of text uses it, as a
+    /// terminal does; hierarchy comes from colour roles and weight.
     pub size: f32,
-    /// Font size of secondary text (network tags).
-    pub small: f32,
     /// Width of one digit at `size`.
     pub cell: f32,
     /// Line height for all text.
@@ -71,10 +73,10 @@ pub struct Metrics {
     pub gap: f32,
     /// Clear space at the top and bottom of a pane.
     pub edge: f32,
-    /// How far small text moves down so its baseline meets the row's.
-    pub small_drop: f32,
-    /// Height of the font's glyph band (ascent + descent), which sits
-    /// centred in the line box: the cursor's height.
+    /// The font's glyph band (ascent + descent, centred in the line box
+    /// as text is), widened to whole px: the cursor covers it, so every
+    /// glyph under it, descenders included, is inside.
+    pub glyph_top: f32,
     pub glyph: f32,
     /// Width of the insert cursor (a bar), and its clearance from the
     /// glyph before it.
@@ -86,14 +88,13 @@ impl Metrics {
         let size = if size.is_finite() && size > 0. { size } else { 14. };
         let line = (size * LINE).round();
         let pad_y = (size * 0.2).round();
-        let small = (size * SMALL).round();
-        // Text is centred in its line box (gpui), so its baseline sits at
-        // `line / 2 + size * (ascent - descent) / 2`; small text in the same
-        // line box needs to move down by the difference.
-        let small_drop = (size - small) * (shape.ascent - shape.descent) / 2.;
+        // Text is centred in its line box (gpui): its glyph band runs from
+        // `(line - band) / 2` for `band` px. Widen it outward to whole px.
+        let band = size * (shape.ascent + shape.descent);
+        let top = ((line - band) / 2.).max(0.);
+        let (glyph_top, glyph_bottom) = (top.floor(), (top + band).ceil().min(line));
         Metrics {
             size,
-            small,
             cell: size * shape.cell,
             line,
             pad_y,
@@ -101,15 +102,10 @@ impl Metrics {
             gutter: (size * 6. / 7.).round(),
             gap: (size * 0.5).round(),
             edge: (size * 0.5).round(),
-            small_drop,
-            glyph: (size * (shape.ascent + shape.descent)).round().min(line),
+            glyph_top,
+            glyph: glyph_bottom - glyph_top,
             caret: (size / 7.).round().max(1.),
         }
-    }
-
-    /// Top of the glyph band inside a line box, in whole px.
-    pub fn glyph_top(&self) -> f32 {
-        ((self.line - self.glyph) / 2.).floor()
     }
 
     /// Where a message's text starts, from the pane's gutter: the time,
@@ -131,11 +127,13 @@ impl Metrics {
     }
 
     /// The window list's width for a window `window_width` wide: a fixed
-    /// number of cells, but never more than a share of the window (nor
-    /// fewer than a usable minimum).
+    /// number of cells, but never more than a share of the window, and in
+    /// a narrow window no more than leaves the messages `MESSAGE_CELLS`
+    /// (nor fewer than a usable minimum): the conversation gives way last.
     pub fn sidebar_width(&self, window_width: f32) -> f32 {
         let width = |cells| self.cells(cells) + 2. * self.gutter;
-        width(SIDEBAR_CELLS).min((window_width * SIDEBAR_MAX_SHARE).floor().max(width(SIDEBAR_MIN_CELLS)))
+        let room = (window_width * SIDEBAR_MAX_SHARE).min(window_width - width(MESSAGE_CELLS)).floor();
+        width(SIDEBAR_CELLS).min(room.max(width(SIDEBAR_MIN_CELLS)))
     }
 
     /// Width of the window-number column for `windows` windows: as many
@@ -151,7 +149,12 @@ impl Metrics {
 
     /// The most a network tag may take.
     pub fn tag_max(&self) -> f32 {
-        (self.cell * self.small / self.size * TAG_CELLS).ceil()
+        self.cells(TAG_CELLS)
+    }
+
+    /// The least a network tag keeps while its label is cut.
+    pub fn tag_min(&self) -> f32 {
+        self.cells(TAG_MIN_CELLS)
     }
 
     /// Exact width of `n` cells (unrounded), for columns that must stay on
@@ -198,7 +201,7 @@ mod tests {
     fn stacked_values_are_whole_pixels() {
         for size in [9., 11., 12.5, 13., 14., 15., 16., 18., 21., 24.] {
             let m = menlo(size);
-            for v in [m.line, m.pad_y, m.row, m.gutter, m.gap, m.edge, m.bar_pad(), m.small] {
+            for v in [m.line, m.pad_y, m.row, m.gutter, m.gap, m.edge, m.bar_pad(), m.glyph_top, m.glyph] {
                 assert_eq!(v, v.round(), "size {size}: {v} is fractional");
             }
             assert_eq!(m.row, m.line + 2. * m.pad_y);
@@ -215,15 +218,8 @@ mod tests {
     #[test]
     fn values_at_menlo_14() {
         let m = menlo(14.);
-        assert_eq!((m.line, m.pad_y, m.row, m.gutter, m.gap, m.edge, m.small), (21., 3., 27., 12., 7., 7., 12.));
+        assert_eq!((m.line, m.pad_y, m.row, m.gutter, m.gap, m.edge), (21., 3., 27., 12., 7., 7.));
         assert_eq!(m.bar_pad(), 10.);
-    }
-
-    #[test]
-    fn small_text_drops_to_the_row_baseline() {
-        let m = menlo(14.);
-        let baseline = |size: f32, drop: f32| m.line / 2. + size * (0.928 - 0.236) / 2. + drop;
-        assert!((baseline(m.size, 0.) - baseline(m.small, m.small_drop)).abs() < 1e-4);
     }
 
     #[test]
@@ -231,7 +227,10 @@ mod tests {
         let m = menlo(14.);
         let full = m.cells(SIDEBAR_CELLS) + 2. * m.gutter;
         assert_eq!(m.sidebar_width(1200.), full);
-        assert_eq!(m.sidebar_width(640.), 192.);
+        assert_eq!(m.sidebar_width(900.), full);
+        // Narrow: the share, unless the messages would get too few cells.
+        assert_eq!(m.sidebar_width(760.), 228.);
+        assert_eq!(m.sidebar_width(640.), m.cells(SIDEBAR_MIN_CELLS) + 2. * m.gutter);
         // Never below the minimum, however narrow the window.
         assert_eq!(m.sidebar_width(200.), m.cells(SIDEBAR_MIN_CELLS) + 2. * m.gutter);
     }
@@ -275,10 +274,16 @@ mod tests {
         for size in [9., 13., 14., 20.] {
             let m = menlo(size);
             assert!(m.glyph > m.size && m.glyph <= m.line, "{size}");
-            assert!(m.glyph_top() >= 0. && m.glyph_top() + m.glyph <= m.line);
+            assert!(m.glyph_top >= 0. && m.glyph_top + m.glyph <= m.line);
             assert!(m.caret >= 1. && m.caret == m.caret.round());
+            // The band holds the font's whole ascent-to-descent box.
+            let top = (m.line - size * (0.928 + 0.236)) / 2.;
+            assert!(m.glyph_top <= top + 1e-4 && m.glyph_top + m.glyph >= top + size * (0.928 + 0.236) - 1e-4, "{size}");
         }
-        assert_eq!((menlo(14.).glyph, menlo(14.).caret), (16., 2.));
+        let m = menlo(14.);
+        assert_eq!((m.glyph_top, m.glyph, m.caret), (2., 17., 2.));
+        // Centred: as much clear space below the band as above.
+        assert_eq!(m.line - m.glyph_top - m.glyph, m.glyph_top);
         assert!(menlo(28.).caret > menlo(14.).caret);
     }
 
