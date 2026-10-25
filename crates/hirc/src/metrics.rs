@@ -41,9 +41,10 @@ const MESSAGE_CELLS: f32 = 60.;
 /// Unread counts get this many cells; larger counts are abbreviated.
 pub const COUNT_CELLS: usize = 3;
 /// A network tag never takes more than this many cells, and gives up
-/// cells to the label down to `TAG_MIN_CELLS` (an ellipsis included).
+/// cells to the label down to `TAG_MIN_CELLS` (an ellipsis included),
+/// enough to tell networks apart.
 const TAG_CELLS: f32 = 8.;
-const TAG_MIN_CELLS: f32 = 5.;
+const TAG_MIN_CELLS: f32 = 7.;
 /// Message lines: the timestamp (`HH:MM`) and the nick column, in cells.
 pub const TIME_CELLS: usize = 5;
 const NICK_MIN_CELLS: usize = 3;

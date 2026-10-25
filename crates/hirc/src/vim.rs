@@ -68,6 +68,9 @@ pub enum Effect {
     Submit,
     /// Run the ex line (without the leading `:`).
     Ex(String),
+    /// Escape in Normal, where it has nothing else to do: put away a
+    /// notice (the config banner).
+    Dismiss,
 }
 
 /// What an ex line means. See [`ex`].
@@ -189,8 +192,9 @@ impl Vim {
             self.reset();
             return vec![Effect::Submit];
         }
+        // Escape cancels a pending prefix; with none, it puts a notice away.
         if key.named == Some(Named::Escape) {
-            return vec![];
+            return if pending == Pending::None { vec![Effect::Dismiss] } else { vec![] };
         }
         if key.ctrl {
             return match key.ch {
@@ -491,6 +495,14 @@ mod tests {
         assert_eq!(Sim::new("hello", 0).feed(esc()).state(), ("hello", 0, Mode::Normal));
         assert_eq!(Sim::new("", 0).feed(esc()).state(), ("", 0, Mode::Normal));
         assert_eq!(Sim::new("a🙂", 5).feed(esc()).state(), ("a🙂", 1, Mode::Normal));
+    }
+
+    #[test]
+    fn escape_in_normal_dismisses_a_notice() {
+        let mut s = Sim::normal("ab", 1);
+        s.feed(esc());
+        assert_eq!(s.effects, vec![Effect::Dismiss]);
+        assert_eq!(s.state(), ("ab", 1, Mode::Normal));
     }
 
     #[test]

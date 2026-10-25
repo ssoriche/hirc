@@ -18,97 +18,102 @@ use hirc_core::event::{ConnStatus, Target};
 use hirc_core::store::{Line, LineKind};
 use std::collections::HashMap;
 
-/// The title bar: the window's name, its network (as the window list tags
-/// it) or, for a server, its connection state, then the topic. Each part
-/// is cut to fit with an ellipsis that ends on the bar's padding, and the
-/// name never takes more than `NAME_SHARE` while there is a topic to show.
-/// `pane` is the width of the buffer pane.
+/// The title bar, one field rhythm for every window: the window's
+/// identity (its name, in bold, and the network tag as the window list
+/// shows it, a cell apart), then two cells on, its state when it is not
+/// simply usable (a mark and a word, then what to do about it), then two
+/// cells on, the topic (or, for a server, why it went down). A state reads
+/// the same in a channel as in its server buffer, and only the state is
+/// ever red. Each field is cut to fit with an ellipsis that ends on the
+/// bar's padding, and the name never takes more than `NAME_SHARE` while
+/// there is more to show. `pane` is the width of the buffer pane.
 pub fn title(app: &HircApp, window: &Window, pane: f32) -> impl IntoElement {
     let p = &app.palette;
     let m = &app.metrics;
-    // The last slot is the window's state (when it can't be used as it
-    // is) and then its topic, each in its own role.
-    let (name, tag, slot): (String, Option<Piece>, Vec<Piece>) = match app.current() {
-        Some((net, buf)) => {
-            let fault = net.status.is_fault();
-            match &buf.target {
-                Target::Server => {
-                    let (state, color, why) = match &net.status {
-                        ConnStatus::Connected { nick } => (format!("● connected as {nick}"), p.success, None),
-                        ConnStatus::Connecting | ConnStatus::Idle => ("● connecting".to_owned(), p.text_dim, None),
-                        ConnStatus::Disconnected { reason, retry } => {
-                            ("● disconnected".to_owned(), p.error, Some(format!("{reason} — reconnecting in {}s", retry.as_secs().max(1))))
-                        }
-                        ConnStatus::Failed { reason } => ("● failed".to_owned(), p.error, Some(format!("{reason} — /reconnect to try again"))),
-                        ConnStatus::Offline => ("○ offline".to_owned(), p.text_dim, Some("/reconnect to connect again".to_owned())),
-                    };
-                    (net.name.clone(), Some((state, color)), why.filter(|r| !r.is_empty()).map(|r| (r, p.topic)).into_iter().collect())
-                }
-                target => {
-                    let tag = (net.name.clone(), if fault { p.error } else { p.text_dim });
-                    let channel = matches!(target, Target::Channel(_));
-                    // One word for why the window can't be used: the network
-                    // is down (red only when something went wrong), or we
-                    // are not in the channel.
-                    let state = match () {
-                        _ if net.status.is_down() && fault => Some(("(disconnected)".to_owned(), p.error)),
-                        _ if net.status.is_down() => Some(("(offline)".to_owned(), p.text_dim)),
-                        _ if channel && !buf.joined => Some(("(not joined)".to_owned(), p.text_dim)),
-                        _ => None,
-                    };
-                    let topic = match &buf.topic {
-                        Some(t) if channel && !t.is_empty() => Some((t.clone(), p.topic)),
-                        _ if channel && state.is_none() => Some(("(no topic)".to_owned(), p.topic)),
-                        _ => None,
-                    };
-                    (target.name().unwrap_or_default().to_owned(), Some(tag), state.into_iter().chain(topic).collect())
-                }
+    let now = app.store.clock.unwrap_or_else(chrono::Utc::now);
+    let (name, tag, state, rest): (String, Option<Piece>, Vec<Piece>, Vec<Piece>) = match app.current() {
+        Some((net, buf)) => match &buf.target {
+            Target::Server => {
+                let state = match &net.status {
+                    ConnStatus::Connected { nick } => vec![(format!("● connected as {nick}"), p.success)],
+                    ConnStatus::Connecting | ConnStatus::Idle => vec![("● connecting".to_owned(), p.text_dim)],
+                    _ => network_state(p, net, now),
+                };
+                let reason = match &net.status {
+                    ConnStatus::Disconnected { reason, .. } | ConnStatus::Failed { reason } if !reason.is_empty() => vec![(reason.clone(), p.topic)],
+                    _ => vec![],
+                };
+                (net.name.clone(), None, state, reason)
             }
-        }
-        None => ("No servers configured".to_owned(), None, app.hint().map(|h| (h.to_owned(), p.topic)).into_iter().collect()),
+            target => {
+                let channel = matches!(target, Target::Channel(_));
+                let state = match () {
+                    _ if net.status.is_down() => network_state(p, net, now),
+                    _ if channel && !buf.joined => vec![("○ not joined".to_owned(), p.text_dim), (" — /join to rejoin".to_owned(), p.text_dim)],
+                    _ => vec![],
+                };
+                let topic = match &buf.topic {
+                    Some(t) if channel && !t.is_empty() => vec![(t.clone(), p.topic)],
+                    _ if channel && state.is_empty() => vec![("(no topic)".to_owned(), p.topic)],
+                    _ => vec![],
+                };
+                (target.name().unwrap_or_default().to_owned(), Some((net.name.clone(), p.text_dim)), state, topic)
+            }
+        },
+        None => ("No servers configured".to_owned(), None, vec![], app.hint().map(|h| (h.to_owned(), p.topic)).into_iter().collect()),
     };
-    let measure = |s: &str, size: f32| {
-        let run = TextRun { len: s.len(), font: app.font.clone(), color: p.text, background_color: None, underline: None, strikethrough: None };
-        let line = window.text_system().shape_line(s.to_owned().into(), px(size), &[run], None);
+    let bold = gpui::Font { weight: FontWeight::BOLD, ..app.font.clone() };
+    let measure = |s: &str, font: &gpui::Font| {
+        let run = TextRun { len: s.len(), font: font.clone(), color: p.text, background_color: None, underline: None, strikethrough: None };
+        let line = window.text_system().shape_line(s.to_owned().into(), px(m.size), &[run], None);
         move |i: usize| f32::from(line.x_for_index(i))
     };
-    let fit = |s: &str, size: f32, max: f32| -> (String, f32) {
-        let x = measure(s, size);
-        match cut(s, &x, max, measure("…", size)(3)) {
+    let fit = |s: &str, font: &gpui::Font, max: f32| -> (String, f32) {
+        let x = measure(s, font);
+        let ellipsis = measure("…", font)(3);
+        match cut(s, &x, max, ellipsis) {
             None => (s.to_owned(), x(s.len())),
             Some(i) => {
                 let head = s[..i].trim_end();
-                (format!("{head}…"), x(head.len()) + measure("…", size)(3))
+                (format!("{head}…"), x(head.len()) + ellipsis)
             }
         }
     };
     let inner = (pane - 2. * m.gutter).max(0.);
     // One cell inside the window's identity (name, network), two between
-    // it and what follows (state, topic), so the topic never reads as
-    // part of the tag.
+    // fields, so neither the state nor the topic reads as part of what
+    // comes before it.
     let gap = m.grid(1);
-    let slot_gap = m.grid(2);
+    let field_gap = m.grid(2);
     let (tag, tag_w) = match tag {
         Some((t, c)) => {
-            let (t, w) = fit(&t, m.size, (inner * TAG_SHARE).max(m.tag_max()));
+            let (t, w) = fit(&t, &app.font, (inner * TAG_SHARE).max(m.tag_max()));
             (Some((t, c)), w + gap)
         }
         None => (None, 0.),
     };
-    let name_max = if slot.is_empty() { inner - tag_w } else { inner * NAME_SHARE };
-    let (name, name_w) = fit(&name, m.size, name_max.max(0.));
-    // The slot's pieces, a space apart, cut as one line; each keeps its
-    // colour up to the cut, and the ellipsis takes the colour it ends.
-    let slot = (!slot.is_empty()).then(|| {
-        let text = slot.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join(" ");
-        let (shown, _) = fit(&text, m.size, (inner - name_w - tag_w - slot_gap).max(0.));
+    let more = !state.is_empty() || !rest.is_empty();
+    let name_max = if more { inner * NAME_SHARE } else { inner - tag_w };
+    let (name, name_w) = fit(&name, &bold, name_max.max(0.));
+    // A field's pieces, cut as one line: each keeps its colour up to the
+    // cut, and the ellipsis takes the colour it ends.
+    let field = |pieces: &[Piece], max: f32| -> Option<(StyledText, f32)> {
+        if pieces.is_empty() {
+            return None;
+        }
+        let text: String = pieces.iter().map(|(t, _)| t.as_str()).collect();
+        let (shown, w) = fit(&text, &app.font, max.max(0.));
         let head = if shown == text { text.len() } else { shown.len() - '…'.len_utf8() };
         let mut runs = Runs::default();
-        for (s, color) in clip_pieces(&slot, head) {
+        for (s, color) in clip_pieces(pieces, head) {
             runs.push(&s, color, false);
         }
-        runs.element()
-    });
+        Some((runs.element(), w))
+    };
+    let left = inner - name_w - tag_w;
+    let state = field(&state, left - field_gap);
+    let left = left - state.as_ref().map_or(0., |(_, w)| w + field_gap);
+    let rest = field(&rest, left - field_gap);
     let part = || div().flex_none().whitespace_nowrap().overflow_hidden();
     div()
         .flex()
@@ -117,19 +122,35 @@ pub fn title(app: &HircApp, window: &Window, pane: f32) -> impl IntoElement {
         .bg(p.title_bg)
         .border_b_1()
         .border_color(p.border)
-        .child(part().text_color(p.text).child(name))
+        .child(part().text_color(p.text).font_weight(FontWeight::BOLD).child(name))
         .children(tag.map(|(t, c)| part().ml(px(gap)).text_color(c).child(t)))
-        .children(slot.map(|t| part().flex_shrink(1.).min_w(px(0.)).ml(px(slot_gap)).child(t)))
+        .children(state.map(|(t, _)| part().ml(px(field_gap)).child(t)))
+        .children(rest.map(|(t, _)| part().flex_shrink(1.).min_w(px(0.)).ml(px(field_gap)).child(t)))
 }
 
-/// `pieces` joined by spaces and cut after byte `head` of the joined
-/// text: each piece keeps its colour up to the cut, and an ellipsis in the
-/// colour of the piece it cuts ends the line.
+/// A down network's state, as every header says it: a mark and a word
+/// (red only for a fault; a ring while there is no connection to wait
+/// on, a dot once hirc has given up), then what happens next or what to
+/// do, counting down to a retry.
+fn network_state(p: &Palette, net: &hirc_core::store::Network, now: chrono::DateTime<chrono::Utc>) -> Vec<Piece> {
+    let (mark, color, next) = match &net.status {
+        ConnStatus::Disconnected { .. } => match net.retry_in(now) {
+            Some(0) | None => ("○ disconnected", p.error, "reconnecting…".to_owned()),
+            Some(s) => ("○ disconnected", p.error, format!("reconnecting in {s}s")),
+        },
+        ConnStatus::Failed { .. } => ("● failed", p.error, "/reconnect to try again".to_owned()),
+        _ => ("○ offline", p.text_dim, "/reconnect".to_owned()),
+    };
+    vec![(mark.to_owned(), color), (format!(" — {next}"), p.text_dim)]
+}
+
+/// `pieces` joined and cut after byte `head` of the joined text: each
+/// piece keeps its colour up to the cut, and an ellipsis in the colour of
+/// the piece it cuts ends the line.
 fn clip_pieces<C: Copy>(pieces: &[(String, C)], head: usize) -> Vec<(String, C)> {
     let mut out = Vec::new();
     let mut at = 0;
-    for (i, (piece, color)) in pieces.iter().enumerate() {
-        let piece = if i == 0 { piece.clone() } else { format!(" {piece}") };
+    for (piece, color) in pieces {
         let end = head.min(at + piece.len()).saturating_sub(at);
         if end > 0 {
             out.push((piece[..end].to_owned(), *color));
@@ -162,7 +183,8 @@ fn cut(s: &str, x: impl Fn(usize) -> f32, max: f32, ellipsis: f32) -> Option<usi
 }
 
 /// A config that could not be used: a bar like the title bar, with the
-/// error marker message lines use (`=!=`), all in the error role.
+/// error marker message lines use (`=!=`), in the error role, and a quiet
+/// note on how to put it away (the server buffer keeps a copy).
 pub fn banner(app: &HircApp, message: String) -> impl IntoElement {
     let p = &app.palette;
     let m = &app.metrics;
@@ -175,7 +197,11 @@ pub fn banner(app: &HircApp, message: String) -> impl IntoElement {
         .border_color(p.border)
         .text_color(p.error)
         .child(div().flex_none().child(display::marker(LineKind::Error)))
-        .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).child(message))
+        .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).child({
+            let mut runs = Runs::default();
+            runs.push(&message, p.error, false).push(" (Esc in NORMAL mode to dismiss)", p.text_dim, false);
+            runs.element()
+        }))
 }
 
 /// `s` in at most `cells` characters, ending in an ellipsis when cut.
@@ -270,6 +296,12 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
             prefix.push(display::marker(line.kind), p.error, false);
             body.push(&line.text, p.error, false);
         }
+        // A change of connection state: status, so it reads above the
+        // server's own chatter (`--`, quiet text) but is not an error.
+        LineKind::Status => {
+            prefix.push(display::marker(line.kind), p.server, false);
+            body.push(&line.text, p.text, false);
+        }
         LineKind::Server | LineKind::Notice => {
             prefix.push(display::marker(line.kind), p.server, false);
             body.push(&line.text, p.text_dim, false);
@@ -318,6 +350,25 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
         .child(nick_column(app, cells, prefix, cut.map(|full| (full, line.seq))))
         .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).child(body.element()))
         .into_any_element()
+}
+
+/// `line` with the read marker above it: where the unread lines began
+/// when the window was entered (weechat's read marker). One row on the
+/// line grid: "new" in the unread colour on the nick column's right edge,
+/// as markers sit, and a hairline in the separators' colour across the
+/// text column.
+pub fn with_marker(app: &HircApp, line: AnyElement) -> AnyElement {
+    let p = &app.palette;
+    let m = &app.metrics;
+    let rule = div().flex_1().min_w(px(0.)).ml(px(m.cell)).h(px(m.line)).flex().items_center().child(div().w_full().h(px(1.)).bg(p.border));
+    let marker = div()
+        .flex()
+        .w_full()
+        .px(px(m.gutter))
+        .child(div().flex_none().w(px(m.grid(TIME_CELLS))))
+        .child(div().flex_none().flex().justify_end().w(px(m.grid(app.nick_cells()))).ml(px(m.cell)).text_color(p.unread).child("new"))
+        .child(rule);
+    div().flex().flex_col().w_full().child(marker).child(line).into_any_element()
 }
 
 /// Drawn over the top row when it is the wrapped tail of `line`: the
@@ -418,7 +469,7 @@ mod tests {
 
     #[test]
     fn slot_pieces_keep_their_colours_to_the_cut() {
-        let pieces = [("(not joined)".to_owned(), 1), ("a topic".to_owned(), 2)];
+        let pieces = [("(not joined)".to_owned(), 1), (" a topic".to_owned(), 2)];
         let whole = clip_pieces(&pieces, 20);
         assert_eq!(whole, [("(not joined)".to_owned(), 1), (" a topic".to_owned(), 2)]);
         // Cut inside the topic: the ellipsis takes the topic's colour.

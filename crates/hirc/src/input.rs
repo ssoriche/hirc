@@ -677,7 +677,7 @@ impl TextInput {
                     self.marked_range = None;
                 }
                 Effect::Submit => self.submit(cx),
-                Effect::Scroll(_) | Effect::Nav(_) | Effect::Ex(_) => cx.emit(VimEvent(effect)),
+                Effect::Scroll(_) | Effect::Nav(_) | Effect::Ex(_) | Effect::Dismiss => cx.emit(VimEvent(effect)),
             }
         }
         cx.notify();

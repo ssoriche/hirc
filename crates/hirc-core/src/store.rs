@@ -19,6 +19,9 @@ pub enum LineKind {
     Topic,
     Mode,
     Server,
+    /// A change of connection state the user chose (a quit): status, not
+    /// server chatter and not a fault.
+    Status,
     Error,
 }
 
@@ -67,16 +70,54 @@ impl Buffer {
         self.lines.insert(ix, line);
         Some(ix)
     }
+
+    /// Where the unread lines begin: the first of the last `unread`
+    /// lines that count as unread (see `counts`). `None` when nothing is
+    /// unread, or when every line is, since a marker above them all
+    /// would say nothing.
+    pub fn first_unread(&self) -> Option<usize> {
+        if self.unread == 0 {
+            return None;
+        }
+        let mut left = self.unread;
+        let ix = self.lines.iter().rposition(|l| {
+            if counts(l) {
+                left -= 1;
+            }
+            left == 0
+        })?;
+        (ix > 0).then_some(ix)
+    }
+}
+
+/// Whether `line` counts toward a window's unread lines: something someone
+/// else said.
+pub fn counts(line: &Line) -> bool {
+    !line.own && matches!(line.kind, LineKind::Privmsg | LineKind::Action | LineKind::Notice)
 }
 
 #[derive(Debug)]
 pub struct Network {
     pub name: String,
     pub status: ConnStatus,
+    /// When `status` last changed (by the store's clock): a retry's
+    /// countdown runs from here.
+    pub since: Option<DateTime<Utc>>,
     pub nick: Option<String>,
     /// `buffers[0]` is the server buffer. Buffers are never removed, so
     /// indexes stay valid.
     pub buffers: Vec<Buffer>,
+}
+
+impl Network {
+    /// Whole seconds until a dropped connection is retried, at `now`
+    /// (rounded up; 0 once the retry is due). `None` unless retrying.
+    pub fn retry_in(&self, now: DateTime<Utc>) -> Option<u64> {
+        let ConnStatus::Disconnected { retry, .. } = &self.status else { return None };
+        let since = self.since.unwrap_or(now);
+        let left = retry.as_millis() as i64 - (now - since).num_milliseconds();
+        Some((left.max(0) as u64).div_ceil(1000))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,7 +160,7 @@ impl Store {
         if let Some(i) = self.networks.iter().position(|n| n.name == name) {
             return i;
         }
-        self.networks.push(Network { name: name.to_owned(), status: ConnStatus::Idle, nick: None, buffers: vec![Buffer::new(Target::Server)] });
+        self.networks.push(Network { name: name.to_owned(), status: ConnStatus::Idle, since: None, nick: None, buffers: vec![Buffer::new(Target::Server)] });
         self.networks.len() - 1
     }
 
@@ -163,6 +204,7 @@ impl Store {
                     }
                 }
                 self.networks[n].status = status;
+                self.networks[n].since = Some(self.clock.unwrap_or_else(Utc::now));
                 match said {
                     Some((kind, text)) => Applied::Lines { network: n, at: to.into_iter().map(|b| (b, self.push_local(n, b, kind, text.clone()))).collect() },
                     None => Applied::Changed,
@@ -184,7 +226,7 @@ impl Store {
             Event::Line { network, target, line } => {
                 let n = self.network_ix(&network);
                 let b = self.buffer_ix(n, &target);
-                let counts = !line.own && matches!(line.kind, LineKind::Privmsg | LineKind::Action | LineKind::Notice);
+                let counts = counts(&line);
                 let net = &mut self.networks[n];
                 let me = net.nick.as_deref();
                 let mention = counts && (matches!(target, Target::Query(_)) || me.is_some_and(|me| crate::display::mentions(&line.text, me)));
@@ -222,7 +264,7 @@ pub fn status_line(network: &str, status: &ConnStatus) -> Option<(LineKind, Stri
             Some((LineKind::Error, format!("Disconnected from {network}: {reason}. Reconnecting in {}s — /reconnect to retry now", retry.as_secs().max(1))))
         }
         ConnStatus::Failed { reason } => Some((LineKind::Error, format!("Disconnected from {network}: {reason}. Not retrying — /reconnect to try again"))),
-        ConnStatus::Offline => Some((LineKind::Server, format!("Disconnected from {network} — /reconnect to connect again"))),
+        ConnStatus::Offline => Some((LineKind::Status, format!("{network} is offline — /reconnect"))),
         _ => None,
     }
 }
@@ -343,9 +385,40 @@ mod tests {
     }
 
     #[test]
+    fn unread_lines_begin_after_the_read_ones() {
+        let mut b = Buffer::new(Target::Channel("#a".into()));
+        for (i, text) in ["one", "two", "three", "four"].iter().enumerate() {
+            b.insert(line(i as u64, i as i64, None, text));
+        }
+        let mut own = line(9, 9, None, "mine");
+        own.own = true;
+        b.insert(own);
+        assert_eq!(b.first_unread(), None);
+        b.unread = 2;
+        // The last two counted lines ("three", "four"); our own line is not one.
+        assert_eq!(b.first_unread(), Some(2));
+        // Everything unread: no marker.
+        b.unread = 4;
+        assert_eq!(b.first_unread(), None);
+    }
+
+    #[test]
+    fn a_retry_counts_down_from_the_status_change() {
+        let mut s = Store::new(["net".to_string()]);
+        s.clock = Some(at(0));
+        s.apply(Event::Status { network: "net".into(), status: ConnStatus::Disconnected { reason: "x".into(), retry: std::time::Duration::from_secs(42) } });
+        let net = &s.networks[0];
+        assert_eq!(net.retry_in(at(0)), Some(42));
+        assert_eq!(net.retry_in(at(40)), Some(2));
+        assert_eq!(net.retry_in(at(60)), Some(0));
+        s.apply(Event::Status { network: "net".into(), status: ConnStatus::Offline });
+        assert_eq!(s.networks[0].retry_in(at(0)), None);
+    }
+
+    #[test]
     fn a_quit_is_not_an_error() {
         let (kind, text) = status_line("net", &ConnStatus::Offline).unwrap();
-        assert_eq!((kind, text.as_str()), (LineKind::Server, "Disconnected from net — /reconnect to connect again"));
+        assert_eq!((kind, text.as_str()), (LineKind::Status, "net is offline — /reconnect"));
         let (kind, _) = status_line("net", &ConnStatus::Failed { reason: "SASL failed".into() }).unwrap();
         assert_eq!(kind, LineKind::Error);
         assert_eq!(status_line("net", &ConnStatus::Connecting), None);

@@ -30,11 +30,11 @@ fn main() {
         Ok(c) => c,
         // No config is a first run, not an error: a quiet note, not a banner.
         Err(e) if e.is_missing() => {
-            hint = Some(config::tilde_home(&format!("No config at {}; using the built-in defaults.", path.display())));
+            hint = Some(config::tilde_home(&format!("No config at {}; using the built-in defaults", path.display())));
             config::Config::default()
         }
         Err(e) => {
-            banner = Some(config::tilde_home(&format!("{e} — using the built-in defaults.")));
+            banner = Some(config::tilde_home(&format!("{e} — using the built-in defaults")));
             config::Config::default()
         }
     };
@@ -42,7 +42,7 @@ fn main() {
     let mut theme = match config.theme.as_deref().map(|name| hirc_core::theme::load(&dir, name)) {
         Some(Ok(t)) => t,
         Some(Err(e)) => {
-            banner.get_or_insert(config::tilde_home(&format!("{e} — using the default theme.")));
+            banner.get_or_insert(config::tilde_home(&format!("{e} — using the default theme")));
             Default::default()
         }
         None => Default::default(),

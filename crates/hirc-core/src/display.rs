@@ -20,12 +20,14 @@ pub enum Part {
 }
 
 /// The marker an event line shows in the nick column (weechat style):
-/// arrivals, departures and everything else.
+/// arrivals, departures, errors, a change of connection state (irssi's
+/// `-!-`) and everything else.
 pub fn marker(kind: LineKind) -> &'static str {
     match kind {
         LineKind::Join => "-->",
         LineKind::Part | LineKind::Quit | LineKind::Kick => "<--",
         LineKind::Error => "=!=",
+        LineKind::Status => "-!-",
         _ => "--",
     }
 }

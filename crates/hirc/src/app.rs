@@ -73,6 +73,8 @@ pub struct HircApp {
     pub sidebar_scroll: ScrollHandle,
     /// The window list's width at the last render (it follows the window).
     sidebar_width: f32,
+    /// The window's height at the last render (the list's full height).
+    sidebar_height: f32,
     banner: Option<String>,
     /// Shown in the header when there is no buffer to put it in.
     hint: Option<String>,
@@ -91,6 +93,10 @@ pub struct HircApp {
     /// The channel a /join asked for, by network name: its window is
     /// focused when the server confirms the join.
     pending_join: Option<(String, String)>,
+    /// Where the unread lines began when this window was entered: the
+    /// window and the first unread line's seq (a "new" rule is drawn
+    /// above it until the window is left).
+    marker: Option<(usize, usize, u64)>,
     commands: UnboundedSender<Command>,
 }
 
@@ -138,6 +144,30 @@ impl HircApp {
         cx.subscribe(&input, |this, _, ev: &VimEvent, cx| this.vim_effect(&ev.0, cx)).detach();
         let handle = input.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
+        // The banner can be dismissed; keep what it said where errors go.
+        if let Some(banner) = &init.banner
+            && !store.networks.is_empty()
+        {
+            store.push_local(0, 0, LineKind::Error, banner.clone());
+        }
+        // A dropped network's header counts down to its retry: redraw each
+        // second while one waits (a fixed clock has nothing to count).
+        if init.clock.is_none() {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                    let alive = this.update(cx, |app, cx| {
+                        if app.store.networks.iter().any(|net| matches!(net.status, ConnStatus::Disconnected { .. })) {
+                            cx.notify();
+                        }
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         let mut events = init.events;
         cx.spawn(async move |this, cx| {
             while let Some(ev) = events.recv().await {
@@ -159,6 +189,7 @@ impl HircApp {
             metrics,
             sidebar_scroll: ScrollHandle::new(),
             sidebar_width: metrics.sidebar_width(f32::from(window.viewport_size().width)),
+            sidebar_height: f32::from(window.viewport_size().height),
             banner: init.banner,
             hint,
             input,
@@ -171,6 +202,7 @@ impl HircApp {
             nick_slots: HashMap::new(),
             fresh_below: false,
             pending_join: None,
+            marker: None,
             commands: init.commands,
         }
     }
@@ -190,6 +222,10 @@ impl HircApp {
             if let Some(old) = self.selected.filter(|_| !draft.is_empty()) {
                 self.drafts.insert(old, draft);
             }
+        }
+        if self.selected != Some((n, b)) {
+            let buf = &self.store.networks[n].buffers[b];
+            self.marker = buf.first_unread().map(|ix| (n, b, buf.lines[ix].seq));
         }
         self.selected = Some((n, b));
         let buf = &mut self.store.networks[n].buffers[b];
@@ -270,7 +306,8 @@ impl HircApp {
             let name = net.buffers[b].target.name().unwrap_or(&net.name);
             name.to_lowercase().contains(&want).then_some(row)
         })?;
-        let (x, y) = sidebar::row_centre(&self.metrics, self.sidebar_width, f32::from(self.sidebar_scroll.offset().y), row);
+        let count = self.window_count();
+        let (x, y) = sidebar::row_centre(&self.metrics, self.sidebar_width, self.sidebar_height, count, f32::from(self.sidebar_scroll.offset().y), row);
         let view = self.sidebar_scroll.bounds();
         let visible = view.size.height <= px(0.) || (px(y - self.metrics.row / 2.) >= view.top() && px(y + self.metrics.row / 2.) <= view.bottom());
         Some(if visible { Ok((x, y)) } else { Err(format!("row {} is scrolled out of view", row + 1)) })
@@ -363,6 +400,7 @@ impl HircApp {
                 Ex::Buffer(name) => self.goto_buffer(&name, cx),
                 Ex::Slash(s) => self.submit(s, cx),
             },
+            Effect::Dismiss => self.banner = None,
             Effect::Pass | Effect::Edit { .. } | Effect::Submit => {}
         }
         cx.notify();
@@ -504,7 +542,7 @@ impl HircApp {
         let Some((net, buf)) = self.current() else { return String::new() };
         let connected = matches!(net.status, ConnStatus::Connected { .. });
         match &buf.target {
-            _ if net.status.is_down() => not_connected(&net.name, &net.status),
+            _ if net.status.is_down() => down(&net.name, &net.status),
             Target::Channel(name) if connected && !buf.joined => format!("Not in {name} — /join to rejoin"),
             Target::Server => format!("Command for {}", net.name),
             target => format!("Message {}", target.name().unwrap_or_default()),
@@ -534,6 +572,11 @@ impl HircApp {
         self.nick_slots.insert((n, b), (buf.lines.len(), slots));
     }
 
+    /// The message view's nick column, in cells.
+    pub fn nick_cells(&self) -> usize {
+        self.nick_cells
+    }
+
     /// The note for the header when no server is configured.
     pub fn hint(&self) -> Option<&str> {
         self.hint.as_deref()
@@ -547,7 +590,11 @@ impl HircApp {
         match self.current().and_then(|(net, buf)| Some((net, buf, buf.lines.get(ix)?))) {
             Some((net, buf, line)) => {
                 let channel = matches!(buf.target, Target::Channel(_)).then(|| buf.target.name()).flatten();
-                buffer::line(self, line, &buffer::Context { me: net.nick.as_deref(), nick_cells: self.nick_cells, channel, slots })
+                let line_el = buffer::line(self, line, &buffer::Context { me: net.nick.as_deref(), nick_cells: self.nick_cells, channel, slots });
+                match self.marker {
+                    Some((n, b, seq)) if self.selected == Some((n, b)) && line.seq == seq => buffer::with_marker(self, line_el),
+                    _ => line_el,
+                }
             }
             None => div().into_any_element(),
         }
@@ -560,6 +607,7 @@ impl Render for HircApp {
         let m = self.metrics;
         let width = f32::from(window.viewport_size().width);
         self.sidebar_width = m.sidebar_width(width);
+        self.sidebar_height = f32::from(window.viewport_size().height);
         // The nick column follows the view's width; rows wrap against it,
         // so a change means measuring them again.
         let nick_cells = m.nick_cells(width - self.sidebar_width);
@@ -601,7 +649,7 @@ impl Render for HircApp {
             .text_size(px(m.size))
             .line_height(px(m.line))
             .when_some(self.font_family.clone(), |d, f| d.font_family(f))
-            .child(sidebar::render(self, self.sidebar_width, cx))
+            .child(sidebar::render(self, self.sidebar_width, self.sidebar_height, cx))
             .child(
                 div()
                     .flex()
@@ -638,12 +686,23 @@ fn font_for(window: &Window, family: Option<SharedString>) -> gpui::Font {
     style.font()
 }
 
-/// Why a line can't be sent to network `name`, and the way out.
+/// Why a line typed for network `name` was not sent. The header and the
+/// input's placeholder say what to do about it.
 fn not_connected(name: &str, status: &ConnStatus) -> String {
     match status {
-        ConnStatus::Offline => format!("Not connected to {name} — /reconnect to connect again"),
-        ConnStatus::Disconnected { .. } => format!("Not connected to {name} — /reconnect to retry now"),
-        _ => format!("Not connected to {name} — /reconnect to try again"),
+        ConnStatus::Offline => format!("Not sent — {name} is offline"),
+        _ => format!("Not sent — {name} is disconnected"),
+    }
+}
+
+/// The input's placeholder on a down network: its state, in the words the
+/// header uses (offline for a quit, disconnected for a fault), and the
+/// way out.
+fn down(name: &str, status: &ConnStatus) -> String {
+    match status {
+        ConnStatus::Offline => format!("{name} is offline — /reconnect"),
+        ConnStatus::Disconnected { .. } => format!("{name} is disconnected — /reconnect to retry now"),
+        _ => format!("{name} is disconnected — /reconnect to try again"),
     }
 }
 

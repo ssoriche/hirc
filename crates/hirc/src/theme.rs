@@ -20,7 +20,9 @@ pub struct Palette {
     pub title_bg: Hsla,
     /// A hovered sidebar row: a faint wash.
     pub hover: Hsla,
-    /// The selected sidebar row's fill, distinct from `background` (see `fill`).
+    /// The selected sidebar row's fill: distinct from `background` (see
+    /// `fill`) and from the mention fill (`highlight`), so "where I am"
+    /// and "someone said my name" never look alike (see `fill_apart`).
     pub selected: Hsla,
     /// Our own nick (`buffer.nickname`, in bold): no one else gets it.
     pub nickname: Hsla,
@@ -29,8 +31,6 @@ pub struct Palette {
     pub nicks: Vec<Hsla>,
     /// Background of a line that mentions us (`buffer.highlight`).
     pub highlight: Hsla,
-    /// The same role behind a window's count of mentions, in the list.
-    pub mention: Hsla,
     /// Selected text in the input (`buffer.selection`, by contrast).
     pub selection: Hsla,
     pub timestamp: Hsla,
@@ -73,6 +73,17 @@ fn fill(bg: Color, candidates: &[Color]) -> Color {
         .or_else(|| candidates.iter().filter(opaque).max_by(|a, b| contrast(**a, bg).total_cmp(&contrast(**b, bg))))
         .copied()
         .unwrap_or(candidates[0])
+}
+
+/// `fill`, but also standing apart (by `FILL_CONTRAST`) from `apart`, a
+/// fill with another meaning: the first candidate that does both, else
+/// what `fill` picks.
+fn fill_apart(bg: Color, apart: Color, candidates: &[Color]) -> Color {
+    candidates
+        .iter()
+        .find(|c| c.a == 255 && contrast(**c, bg) >= FILL_CONTRAST && contrast(**c, apart) >= FILL_CONTRAST)
+        .copied()
+        .unwrap_or_else(|| fill(bg, candidates))
 }
 
 /// How many hues nick colours are picked from (some are skipped).
@@ -211,6 +222,7 @@ impl Palette {
 }
 
 pub fn palette(t: &Theme) -> Palette {
+    let highlight = fill(t.buffer.background, &[t.buffer.highlight, t.buffer.selection, t.buffer.border_selected]);
     Palette {
         background: c(t.general.background),
         border: c(t.general.border),
@@ -224,15 +236,18 @@ pub fn palette(t: &Theme) -> Palette {
         input_bg: c(t.buffer.background_text_input),
         title_bg: c(t.buffer.background_title_bar),
         hover: c(t.buttons.primary.background_hover),
-        selected: c(fill(t.general.background, &[t.buttons.secondary.background_selected, t.buffer.border_selected, t.buffer.selection])),
+        selected: c(fill_apart(
+            t.general.background,
+            highlight,
+            &[t.buttons.secondary.background_selected, t.buffer.border_selected, t.buffer.selection, t.buttons.secondary.background_selected_hover],
+        )),
         nickname: c(t.buffer.nickname),
         nicks: nick_hues(t.buffer.nickname, t.buffer.background, &[t.buffer.action, t.buffer.server_messages.default, t.text.error])
             .into_iter()
             .skip(1)
             .map(c)
             .collect(),
-        highlight: c(fill(t.buffer.background, &[t.buffer.highlight, t.buffer.selection, t.buffer.border_selected])),
-        mention: c(fill(t.general.background, &[t.buffer.highlight, t.buffer.border_selected, t.buffer.selection])),
+        highlight: c(highlight),
         selection: c(fill(t.buffer.background_text_input, &[t.buffer.selection, t.buffer.border_selected, t.buffer.highlight])),
         timestamp: c(t.buffer.timestamp),
         action: c(t.buffer.action),
@@ -321,6 +336,17 @@ mod tests {
         // More nicks than slots: the rest share, from their hashed slot.
         assert_eq!(slots(nicks, 3).len(), nicks.len());
         assert!(slots(nicks, 0).is_empty());
+    }
+
+    #[test]
+    fn the_selected_fill_stands_apart_from_the_mention_fill() {
+        // Mocha: the selected role is the mention's hue at nearly its
+        // lightness; the next role that differs from both wins.
+        let (bg, mention) = (Color::rgb(0x11111b), Color::rgb(0x594c76));
+        let picked = fill_apart(bg, mention, &[Color::rgb(0x4c4163), Color::rgb(0x4c4163), Color::rgb(0x2c324a)]);
+        assert_eq!(picked, Color::rgb(0x2c324a));
+        // Nothing apart from both: as `fill` would pick.
+        assert_eq!(fill_apart(bg, Color::rgb(0x4c4163), &[Color::rgb(0x4c4163)]), Color::rgb(0x4c4163));
     }
 
     #[test]
