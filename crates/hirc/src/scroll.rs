@@ -41,11 +41,10 @@ pub fn whole_lines(height: f32, line: f32) -> (usize, f32) {
     (n as usize, (height - n * line).max(0.))
 }
 
-/// How many entries at the end of a list are not wholly in view: given
-/// each entry's bottom edge from the first in view on (`None` when it was
-/// never laid out, so is below), those that end past `view_bottom`.
-pub fn hidden_below(bottoms: &[Option<f32>], view_bottom: f32) -> usize {
-    bottoms.iter().rev().take_while(|b| b.is_none_or(|b| b > view_bottom + 0.5)).count()
+/// Lines of the grid below a view scrolled `cur` px of `max`: the unit
+/// `j` and `k` step (a message that wraps to three lines is three).
+pub fn lines_below(max: f32, cur: f32, line: f32) -> usize {
+    if line <= 0. { 0 } else { lines_in((max - cur).max(0.), line).round() as usize }
 }
 
 /// Feed a wheel movement of `px` (positive moves the content down, so the
@@ -129,16 +128,14 @@ mod tests {
     }
 
     #[test]
-    fn lines_below_count_entries_not_wholly_in_view() {
-        // Bottoms at 1, 2, 4 (two rows) and 5 lines; the view ends at 2.
-        let bottoms = [Some(L), Some(2. * L), Some(4. * L), Some(5. * L)];
-        assert_eq!(hidden_below(&bottoms, 2. * L), 2);
-        // A wrapped entry cut by the bottom edge counts once.
-        assert_eq!(hidden_below(&bottoms, 3. * L), 2);
-        assert_eq!(hidden_below(&bottoms, 5. * L), 0);
-        // Never laid out: below.
-        assert_eq!(hidden_below(&[Some(L), None, None], 2. * L), 2);
-        assert_eq!(hidden_below(&[], 0.), 0);
+    fn lines_below_are_the_lines_k_steps() {
+        assert_eq!(lines_below(30. * L, 26. * L, L), 4);
+        // Each `k` from there is one more.
+        let Pos::Offset(up) = target(Some(26. * L), 30. * L, -1, L) else { panic!() };
+        assert_eq!(lines_below(30. * L, up, L), 5);
+        assert_eq!(lines_below(30. * L, 30. * L, L), 0);
+        assert_eq!(lines_below(30. * L, 26. * L + 0.001, L), 4);
+        assert_eq!(lines_below(0., 5., L), 0);
     }
 
     #[test]

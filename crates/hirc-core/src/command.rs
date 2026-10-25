@@ -27,15 +27,39 @@ pub const COMMANDS: &[&str] =
 
 /// The command a line starts with (`/me waves` is `me`), if it is one.
 pub fn leading(input: &str) -> Option<&str> {
-    verb(input).and_then(|(cmd, known)| known.then_some(cmd))
+    verb(input).and_then(|(cmd, verb)| (verb == Verb::Known).then_some(cmd))
 }
 
-/// The `/verb` a line starts with, and whether it is a command hirc knows
-/// (`/jion` is not). `None` for chat, `//` (a literal slash) included.
-pub fn verb(input: &str) -> Option<(&str, bool)> {
+/// What a line's `/verb` is, as far as can be told while it is typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verb {
+    /// A command hirc knows, and not the start of a longer one still
+    /// being typed (`/me`, or `/j ` once a space ends it).
+    Known,
+    /// Not a command (`/jion `), or the start of none (`/xq`).
+    Unknown,
+    /// Still being typed, and the start of a command (`/jo`, or `/j`,
+    /// which `/join` begins): nothing to say yet.
+    Typing,
+}
+
+/// The `/verb` a line starts with, and what it is (`Verb`). `None` for
+/// chat, `//` (a literal slash) included.
+pub fn verb(input: &str) -> Option<(&str, Verb)> {
     let rest = input.strip_prefix('/').filter(|r| !r.starts_with('/'))?;
-    let cmd = rest.split(' ').next().unwrap_or(rest);
-    (!cmd.is_empty()).then(|| (cmd, COMMANDS.iter().any(|c| c.eq_ignore_ascii_case(cmd))))
+    let (cmd, ended) = rest.split_once(' ').map_or((rest, false), |(c, _)| (c, true));
+    if cmd.is_empty() {
+        return None;
+    }
+    let lower = cmd.to_ascii_lowercase();
+    let known = COMMANDS.contains(&lower.as_str());
+    let longer = COMMANDS.iter().any(|c| c.len() > lower.len() && c.starts_with(&lower));
+    let verb = match (ended || !longer, known) {
+        (false, _) => Verb::Typing,
+        (true, true) => Verb::Known,
+        (true, false) => Verb::Unknown,
+    };
+    Some((cmd, verb))
 }
 
 fn is_channel(s: &str) -> bool {
@@ -107,8 +131,18 @@ mod tests {
         assert_eq!(leading("/mw waves"), None);
         assert_eq!(leading("//me"), None);
         assert_eq!(leading("me"), None);
-        assert_eq!(verb("/jion #a"), Some(("jion", false)));
-        assert_eq!(verb("/join #a"), Some(("join", true)));
+        assert_eq!(verb("/jion #a"), Some(("jion", Verb::Unknown)));
+        assert_eq!(verb("/join #a"), Some(("join", Verb::Known)));
+        assert_eq!(verb("/JOIN"), Some(("JOIN", Verb::Known)));
+        // While a verb is typed, the start of a command is not yet wrong.
+        assert_eq!(verb("/jo"), Some(("jo", Verb::Typing)));
+        assert_eq!(verb("/j"), Some(("j", Verb::Typing)));
+        assert_eq!(verb("/j #a"), Some(("j", Verb::Known)));
+        assert_eq!(verb("/jo #a"), Some(("jo", Verb::Unknown)));
+        // The start of nothing hirc knows is wrong at once; a whole
+        // command that begins no other is right at once.
+        assert_eq!(verb("/xq"), Some(("xq", Verb::Unknown)));
+        assert_eq!(verb("/me"), Some(("me", Verb::Known)));
         assert_eq!(verb("/"), None);
         assert_eq!(verb("//me"), None);
     }

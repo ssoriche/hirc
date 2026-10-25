@@ -7,8 +7,8 @@
 //! The number column fits the widest window number; the network column
 //! is one width for every row (`tag_width`), so a network's tag reads the
 //! same, cut or not, on every row: as wide as the widest tag, giving way
-//! to long labels down to a few cells, and to a letter or two in a narrow
-//! list; the label takes the rest. The unread column is reserved on every
+//! to long labels down to a few cells, and left out of a list too narrow
+//! for those (the header names the network); the label takes the rest. The unread column is reserved on every
 //! row. All text is one size: the label is `text.primary` and the number
 //! and tag, metadata, are `text.secondary`.
 //!
@@ -70,23 +70,20 @@ fn list_top(m: &Metrics, overflow: bool) -> f32 {
 
 /// The opacity of a window that can't be used.
 const DIM: f32 = 0.5;
-/// The least a tag keeps before it is left out: a letter and an ellipsis.
-const TAG_LEAST_CELLS: f32 = 2.;
-
-/// The network column's width, the same on every row, or `None` when
-/// even a letter of a tag does not fit. `room` is what the label and tag
-/// share; the widest label and tag are in px. The tag is as wide as the
-/// widest tag (up to `tag_max`); long labels take it down to `tag_min`.
-/// In a list too narrow for that beside a label's minimum, labels come
-/// first and the tag keeps a letter and an ellipsis (`d…`), so every row
-/// still names its network.
+/// The network column's width, the same on every row, or `None` when the
+/// tags are left out. `room` is what the label and tag share; the widest
+/// label and tag are in px. The tag is as wide as the widest tag (up to
+/// `tag_max`); long labels take it down to `tag_min`, enough to tell
+/// networks apart. In a list too narrow for that beside a label's
+/// minimum, the tags go and the labels take their cells: a letter of a
+/// tag (`d…`) tells networks apart only by chance, and would cut both
+/// fields on one row. The header and the server rows still name each
+/// window's network.
 fn tag_width(m: &Metrics, room: f32, widest_label: f32, widest_tag: f32) -> Option<f32> {
     let most = widest_tag.min(m.tag_max());
     let least = m.tag_min().min(most);
-    let letter = m.cells(TAG_LEAST_CELLS).min(most);
     let spare = room - m.label_min();
-    let width = if spare >= least { (room - widest_label).clamp(least, most).min(spare) } else { (room - widest_label).clamp(letter, most).min(spare) };
-    (width >= letter && letter > 0.).then_some(width)
+    (spare >= least && least > 0.).then(|| (room - widest_label).clamp(least, most).min(spare))
 }
 
 pub fn render(app: &HircApp, width: f32, height: f32, cx: &mut Context<HircApp>) -> impl IntoElement {
@@ -250,6 +247,7 @@ fn row(app: &HircApp, cols: &Columns, pos: usize, n: usize, b: usize, cx: &mut C
     let label_color = match () {
         _ if buf.unread > 0 && !selected => p.unread,
         _ if parted && !selected => p.text_dim,
+        _ if selected => p.selected_text,
         _ => p.text,
     };
     // The network column: a server row's connection state, else the
@@ -268,7 +266,7 @@ fn row(app: &HircApp, cols: &Columns, pos: usize, n: usize, b: usize, cx: &mut C
             if fault {
                 p.error
             } else if selected && !net.status.is_down() {
-                p.text
+                p.selected_text
             } else {
                 p.text_dim
             },
@@ -287,7 +285,7 @@ fn row(app: &HircApp, cols: &Columns, pos: usize, n: usize, b: usize, cx: &mut C
                 .flex_none()
                 .w(px(cols.number))
                 .text_right()
-                .text_color(if selected { p.text } else { p.text_dim })
+                .text_color(if selected { p.selected_text } else { p.text_dim })
                 .when(dimmed, |d| d.opacity(DIM))
                 .child((pos + 1).to_string()),
         )
@@ -301,15 +299,18 @@ fn row(app: &HircApp, cols: &Columns, pos: usize, n: usize, b: usize, cx: &mut C
                 .when(dimmed, |d| d.opacity(DIM))
                 .child(label),
         )
-        .child(
-            // A server row's dot keeps the column's right edge, and its
-            // label (the network) has the rest.
-            tag_cell(cols, if is_server || cols.tags { network } else { SharedString::default() })
-                .when(is_server, |d| d.w(px(m.cell.ceil())))
-                .text_color(network_color)
-                // A fault stays red; otherwise the tag dims with its row.
-                .when(dimmed && !fault, |d| d.opacity(DIM)),
-        )
+        // A server row's dot keeps the column's right edge, and its label
+        // (the network) has the rest; with the tags left out, a window's
+        // label also takes the column.
+        .when(is_server || cols.tags, |d| {
+            d.child(
+                tag_cell(cols, network)
+                    .when(is_server, |d| d.w(px(m.cell.ceil())))
+                    .text_color(network_color)
+                    // A fault stays red; otherwise the tag dims with its row.
+                    .when(dimmed && !fault, |d| d.opacity(DIM)),
+            )
+        })
         .child(count_cell(app, count, buf.mentions > 0, dimmed))
         .on_click(cx.listener(move |this, _, _, cx| this.select(n, b, cx)))
 }
@@ -374,13 +375,15 @@ mod hidden_tests {
         assert_eq!(tag(40., 8., 20.), Some(m.tag_max()));
         // A long label takes the tag down to its floor, no further.
         assert_eq!(tag(20., 30., 20.), Some(m.tag_min()));
-        // A narrow list: a letter and an ellipsis, the label the rest.
-        let narrow = m.label_min() + m.cells(3.);
-        assert_eq!(super::tag_width(&m, narrow, m.cells(12.), m.cells(8.)), Some(m.cells(2.)));
-        // Short labels leave the tag more.
-        assert_eq!(super::tag_width(&m, narrow, m.cells(6.), m.cells(8.)), Some(m.cells(3.)));
-        // Not even a letter and an ellipsis: no tags.
-        assert_eq!(super::tag_width(&m, m.label_min() + m.cells(1.), m.cells(12.), m.cells(8.)), None);
+        // A list too narrow for the floor beside a label's minimum: no
+        // tags (never a letter and an ellipsis), whatever the labels.
+        let narrow = m.label_min() + m.tag_min() - 1.;
+        assert_eq!(super::tag_width(&m, narrow, m.cells(12.), m.cells(8.)), None);
+        assert_eq!(super::tag_width(&m, narrow, m.cells(3.), m.cells(8.)), None);
+        // Just room for the floor: tags, at the floor.
+        assert_eq!(super::tag_width(&m, m.label_min() + m.tag_min(), m.cells(12.), m.cells(8.)), Some(m.tag_min()));
+        // A short tag needs only its own width.
+        assert_eq!(super::tag_width(&m, m.label_min() + m.cells(4.), m.cells(12.), m.cells(4.)), Some(m.cells(4.)));
     }
 
     #[test]

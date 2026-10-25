@@ -75,13 +75,15 @@ pub fn event_parts(kind: LineKind, nick: Option<&str>, text: &str, channel: Opti
             push(Part::Nick, new);
         }
         LineKind::Kick => {
-            let after = rest.strip_prefix(" kicked ")?;
-            let (victim, reason) = after.split_once(' ').map_or((after, ""), |(v, r)| (v, r));
-            if !(reason.is_empty() || reason.starts_with('(') && reason.ends_with(')')) {
+            // "<victim> was kicked by <kicker> (reason)": the one who
+            // leaves first, as on a part.
+            let after = rest.strip_prefix(" was kicked by ")?;
+            let (by, reason) = after.split_once(' ').map_or((after, ""), |(v, r)| (v, r));
+            if by.is_empty() || !(reason.is_empty() || reason.starts_with('(') && reason.ends_with(')')) {
                 return None;
             }
-            push(Part::Verb, " kicked ");
-            push(Part::Nick, victim);
+            push(Part::Verb, " was kicked by ");
+            push(Part::Nick, by);
             push(Part::Free, &if reason.is_empty() { String::new() } else { format!(" {reason}") });
         }
         LineKind::Topic => {
@@ -152,10 +154,10 @@ mod tests {
     #[test]
     fn state_events() {
         assert_eq!(
-            parts(LineKind::Kick, "bob", "bob kicked dave_away (afk too long)", None),
-            [(Nick, "bob"), (Verb, " kicked "), (Nick, "dave_away"), (Free, " (afk too long)")]
+            parts(LineKind::Kick, "dave_away", "dave_away was kicked by bob (afk too long)", None),
+            [(Nick, "dave_away"), (Verb, " was kicked by "), (Nick, "bob"), (Free, " (afk too long)")]
         );
-        assert_eq!(parts(LineKind::Kick, "bob", "bob kicked dave", None), [(Nick, "bob"), (Verb, " kicked "), (Nick, "dave")]);
+        assert_eq!(parts(LineKind::Kick, "dave", "dave was kicked by bob", None), [(Nick, "dave"), (Verb, " was kicked by "), (Nick, "bob")]);
         assert_eq!(
             parts(LineKind::Topic, "bob", "bob changed the topic to: a (b) c", None),
             [(Nick, "bob"), (Verb, " changed the topic to: "), (Free, "a (b) c")]

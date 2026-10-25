@@ -407,9 +407,15 @@ impl Element for TextElement {
         let (code, wrong) = input.palette.as_ref().map_or((dim, dim), |p| (p.code, p.error));
         let mut over = Vec::new();
         if input.vim.mode != Mode::Ex
-            && let Some((cmd, known)) = command::verb(&shown)
+            && let Some((cmd, verb)) = command::verb(&shown)
         {
-            over.push((0..cmd.len() + 1, (if known { code } else { wrong }, false)));
+            // A verb still being typed that a command begins with stays
+            // plain text, so `/jo` on the way to `/join` never flashes red.
+            match verb {
+                command::Verb::Known => over.push((0..cmd.len() + 1, (code, false))),
+                command::Verb::Unknown => over.push((0..cmd.len() + 1, (wrong, false))),
+                command::Verb::Typing => {}
+            }
         }
         if let Some(marked) = &input.marked_range {
             over.push((shift(marked.start)..shift(marked.end), (text, true)));

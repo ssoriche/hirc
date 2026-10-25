@@ -67,6 +67,9 @@ pub struct HircApp {
     font_family: Option<SharedString>,
     /// The configured font, for measuring text that must fit (the header).
     pub font: gpui::Font,
+    /// Whether the font has a bold face (Monaco has none): where it does
+    /// not, hierarchy that bold carries falls to colour alone.
+    pub bold: bool,
     /// Every spacing value, from the configured font.
     pub metrics: Metrics,
     /// The window list's scroll position; selection scrolls it into view.
@@ -86,6 +89,9 @@ pub struct HircApp {
     nick_cells: usize,
     /// Wheel movement not yet a whole line.
     wheel: Rc<Cell<f32>>,
+    /// What is left of a line below the message view's whole lines, which
+    /// the input bar takes (see `viewport`), as the view last measured it.
+    spare: Rc<Cell<f32>>,
     /// Each buffer's nick colour slots, and its line count when handed out.
     nick_slots: HashMap<(usize, usize), (usize, HashMap<String, usize>)>,
     /// Lines arrived below while the view was scrolled up.
@@ -126,6 +132,12 @@ impl HircApp {
         }
         let font_family: Option<SharedString> = init.font_family.map(Into::into);
         let font = font_for(window, font_family.clone());
+        // A family with no bold face resolves a bold request to its
+        // regular face.
+        let bold = {
+            let ts = window.text_system();
+            ts.resolve_font(&gpui::Font { weight: gpui::FontWeight::BOLD, ..font.clone() }) != ts.resolve_font(&font)
+        };
         let metrics = Metrics::new(init.font_size, measure(window, &font, init.font_size));
         // No config yet: say so once, quietly, where server notices go.
         let mut hint = init.hint;
@@ -187,6 +199,7 @@ impl HircApp {
             palette,
             font_family,
             font,
+            bold,
             metrics,
             sidebar_scroll: ScrollHandle::new(),
             sidebar_width: metrics.sidebar_width(f32::from(window.viewport_size().width)),
@@ -200,6 +213,7 @@ impl HircApp {
             lines: ListState::new(0, ListAlignment::Bottom, px(400.)).measure_all(),
             nick_cells: 0,
             wheel: Rc::default(),
+            spare: Rc::default(),
             nick_slots: HashMap::new(),
             fresh_below: false,
             pending_join: None,
@@ -376,11 +390,11 @@ impl HircApp {
         }
     }
 
-    /// Lines (messages and events) below the view, or cut by its bottom.
+    /// Lines of the grid below the view: what `j` steps through.
     fn lines_below(&self) -> usize {
-        let top = self.lines.logical_scroll_top().item_ix;
-        let bottoms: Vec<Option<f32>> = (top..self.lines.item_count()).map(|ix| self.lines.bounds_for_item(ix).map(|b| f32::from(b.bottom()))).collect();
-        scroll::hidden_below(&bottoms, f32::from(self.lines.viewport_bounds().bottom()))
+        let max = f32::from(self.lines.max_offset_for_scrollbar().y);
+        let cur = -f32::from(self.lines.scroll_px_offset_for_scrollbar().y);
+        scroll::lines_below(max, cur, self.metrics.line)
     }
 
     /// While scrolled, the message whose wrapped tail is the top row (its
@@ -582,7 +596,7 @@ impl HircApp {
                 named.into_iter().filter(|nick| !nick.is_empty() && !me.is_some_and(|me| me.eq_ignore_ascii_case(nick))).collect()
             })
             .collect();
-        let slots = theme::slots(&lines, self.palette.nicks.len(), self.palette.nick_hues);
+        let slots = theme::slots(&lines, &self.palette.nick_hue);
         self.nick_slots.insert((n, b), (buf.lines.len(), slots));
     }
 
@@ -683,9 +697,30 @@ impl Render for HircApp {
                             .flex_col()
                             // The pane keeps the bars' own padding clear on
                             // both sides of their rules.
-                            .child(viewport::viewport(self.lines.clone(), lines.into_any_element(), m.line, m.bar_pad(), self.wheel.clone(), sticky, more)),
+                            .child(viewport::viewport(
+                                self.lines.clone(),
+                                lines.into_any_element(),
+                                viewport::Frame { line: m.line, pad: m.bar_pad(), spare: self.spare.clone() },
+                                self.wheel.clone(),
+                                sticky,
+                                more,
+                            )),
                     )
-                    .child(div().px(px(m.gutter)).py(px(m.bar_pad())).bg(p.input_bg).border_t_1().border_color(p.border).child(self.input.clone())),
+                    // The input bar takes what is left of a line under the
+                    // message view, split evenly about its text (on whole
+                    // device px), so the view is whole lines with the same
+                    // clear space above its oldest line and below its newest.
+                    .child({
+                        let (above, below) = viewport::split(self.spare.get(), window.scale_factor());
+                        div()
+                            .px(px(m.gutter))
+                            .pt(px(m.bar_pad() + above))
+                            .pb(px(m.bar_pad() + below))
+                            .bg(p.input_bg)
+                            .border_t_1()
+                            .border_color(p.border)
+                            .child(self.input.clone())
+                    }),
             )
     }
 }

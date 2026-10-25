@@ -1,11 +1,21 @@
 //! The message view's frame: it gives the line list a height of whole text
 //! lines, so no row is ever cut, with `pad` clear above, under the title
-//! bar, at every window height (as a terminal's rows start at its top),
-//! and at least `pad` below, where the part of a line that does not fit
-//! is left. It turns
-//! the wheel into whole-line steps on the same grid as the vim keys. An
-//! optional `sticky` row is drawn over the list's top row, and an optional
-//! `footer` takes the bottom row for itself (the list gives it up).
+//! bar, and `pad` clear below, over the input bar, at every window height
+//! and font. What is left of a line does not fit the grid; it goes to the
+//! input bar (`spare`), which centres its text in it.
+//!
+//! Why the input bar: the window list's first row shares the header's
+//! line, and its rows share the message rows' lines, so the header and
+//! everything above the newest message sit on one grid from the top of
+//! the window. Space left over can then only go below the view without
+//! moving some row off that grid; given to the header, it would part the
+//! header's line from the list's first row, and shared out above and
+//! below the view, it would part the list's rows from the messages'.
+//!
+//! It turns the wheel into whole-line steps on the same grid as the vim
+//! keys. An optional `sticky` row is drawn over the list's top row, and an
+//! optional `footer` takes the bottom row for itself (the list gives it
+//! up).
 
 use crate::scroll;
 use gpui::{
@@ -18,35 +28,44 @@ use std::rc::Rc;
 pub struct Viewport {
     list: ListState,
     child: AnyElement,
-    line: f32,
-    pad: f32,
+    frame: Frame,
     /// Wheel movement not yet a whole line.
     wheel: Rc<Cell<f32>>,
     sticky: Option<AnyElement>,
     footer: Option<AnyElement>,
 }
 
+/// The grid the view keeps: `line` px lines with `pad` px clear above and
+/// below, and `spare`, what is left of a line, which the input bar takes:
+/// the view sets it from its height (with what the bar took last), and
+/// asks for a redraw when it changes.
+pub struct Frame {
+    pub line: f32,
+    pub pad: f32,
+    pub spare: Rc<Cell<f32>>,
+}
+
 /// `child` is the list drawn from `list`; it must fill its parent
-/// (`size_full`). At least `pad` px stay clear above and below. `sticky`,
-/// one line tall, is drawn over the list's first visible row; `footer`,
-/// one line tall, below its last.
-pub fn viewport(
-    list: ListState,
-    child: AnyElement,
-    line: f32,
-    pad: f32,
-    wheel: Rc<Cell<f32>>,
-    sticky: Option<AnyElement>,
-    footer: Option<AnyElement>,
-) -> Viewport {
-    Viewport { list, child, line, pad, wheel, sticky, footer }
+/// (`size_full`). `sticky`, one line tall, is drawn over the list's first
+/// visible row; `footer`, one line tall, below its last.
+pub fn viewport(list: ListState, child: AnyElement, frame: Frame, wheel: Rc<Cell<f32>>, sticky: Option<AnyElement>, footer: Option<AnyElement>) -> Viewport {
+    Viewport { list, child, frame, wheel, sticky, footer }
 }
 
 /// Clear space above and below `lines` whole lines in `height`: `pad`
-/// above, always, and `pad` plus what is left of a line below.
+/// above, always, and `pad` plus what is left of a line below (none,
+/// once the input bar has taken it).
 pub fn margins(height: f32, line: f32, pad: f32) -> (usize, f32, f32) {
     let (lines, spare) = scroll::whole_lines(height - 2. * pad, line);
     (lines, pad, pad + spare)
+}
+
+/// `spare` split into what goes above and below a bar's text: halves, on
+/// whole device px (`scale` px a logical px), any odd px below.
+pub fn split(spare: f32, scale: f32) -> (f32, f32) {
+    let scale = if scale > 0. { scale } else { 1. };
+    let above = (spare * scale / 2.).floor() / scale;
+    (above, spare - above)
 }
 
 impl IntoElement for Viewport {
@@ -85,14 +104,23 @@ impl Element for Viewport {
         window: &mut Window,
         cx: &mut App,
     ) -> Hitbox {
-        let (lines, above, _) = margins(f32::from(bounds.size.height), self.line, self.pad);
+        let (line, pad) = (self.frame.line, self.frame.pad);
+        let height = f32::from(bounds.size.height);
+        // With what the input bar takes back, the view and the bar's share
+        // stay the same height, so this settles in one frame.
+        let spare = scroll::whole_lines(height + self.frame.spare.get() - 2. * pad, line).1;
+        if (spare - self.frame.spare.get()).abs() > 0.01 {
+            self.frame.spare.set(spare);
+            cx.notify(window.current_view());
+        }
+        let (lines, above, _) = margins(height, line, pad);
         let rows = lines.saturating_sub(usize::from(self.footer.is_some()));
-        let height = px(rows as f32 * self.line);
+        let height = px(rows as f32 * line);
         let available = size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::Definite(height));
         self.child.layout_as_root(available, window, cx);
         let origin = point(bounds.origin.x, bounds.origin.y + px(above));
         self.child.prepaint_at(origin, window, cx);
-        let row = size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::Definite(px(self.line)));
+        let row = size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::Definite(px(line)));
         if let Some(sticky) = &mut self.sticky {
             sticky.layout_as_root(row, window, cx);
             sticky.prepaint_at(origin, window, cx);
@@ -121,7 +149,7 @@ impl Element for Viewport {
         if let Some(footer) = &mut self.footer {
             footer.paint(window, cx);
         }
-        let (list, line, wheel, hitbox, view) = (self.list.clone(), self.line, self.wheel.clone(), hitbox.clone(), window.current_view());
+        let (list, line, wheel, hitbox, view) = (self.list.clone(), self.frame.line, self.wheel.clone(), hitbox.clone(), window.current_view());
         // Capture phase, so the list's own pixel scrolling never runs.
         window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
             if phase != DispatchPhase::Capture || !hitbox.should_handle_scroll(window) {
@@ -156,5 +184,22 @@ mod tests {
             let (_, above, below) = margins(h as f32, 21., 10.);
             assert!(above == 10. && (10. ..31.).contains(&below), "{h}");
         }
+    }
+
+    #[test]
+    fn the_input_bar_takes_the_spare_and_the_view_is_whole_lines() {
+        // Whatever the height, once the bar has taken what is left of a
+        // line, the view is whole lines with `pad` above and below.
+        for h in 300..400 {
+            let total = h as f32;
+            let spare = scroll::whole_lines(total - 20., 21.).1;
+            let (_, above, below) = margins(total - spare, 21., 10.);
+            assert_eq!((above, below), (10., 10.), "{h}");
+        }
+        // Halves on whole device px; an odd one goes below.
+        assert_eq!(split(3., 2.), (1.5, 1.5));
+        assert_eq!(split(3., 1.), (1., 2.));
+        assert_eq!(split(19., 2.), (9.5, 9.5));
+        assert_eq!(split(0., 2.), (0., 0.));
     }
 }

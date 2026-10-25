@@ -435,10 +435,12 @@ impl Session {
         let (chan, victim) = (chan.clone(), victim.clone());
         let by = msg.nick().unwrap_or("").to_owned();
         let text = match rest.first().filter(|r| !r.is_empty()) {
-            Some(r) => format!("{by} kicked {victim} ({r})"),
-            None => format!("{by} kicked {victim}"),
+            Some(r) => format!("{victim} was kicked by {by} ({r})"),
+            None => format!("{victim} was kicked by {by}"),
         };
-        let line = self.line(msg, now, LineKind::Kick, Some(&by), text, self.is_me(&by));
+        // Worded from the one who leaves, as a part or a quit is, so the
+        // `<--` always points at the first nick.
+        let line = self.line(msg, now, LineKind::Kick, Some(&victim), text, self.is_me(&victim));
         out.push(self.event_line(Target::Channel(chan.clone()), line));
         self.left(&chan, &victim, out);
     }
@@ -885,7 +887,8 @@ mod tests {
         assert!(out.contains(&Output::Event(Event::Topic { network: "net".into(), channel: "#test".into(), topic: Some("old topic".into()) })));
         assert_eq!(lines(&feed(&mut s, ":bob!b@h MODE #test +o carol"))[0].1.text, "bob set mode +o carol");
         let out = feed(&mut s, ":bob!b@h KICK #test alice :out");
-        assert_eq!(lines(&out)[0].1.text, "bob kicked alice (out)");
+        assert_eq!(lines(&out)[0].1.text, "alice was kicked by bob (out)");
+        assert_eq!(lines(&out)[0].1.nick.as_deref(), Some("alice"));
         assert!(out.contains(&Output::Event(Event::Parted { network: "net".into(), channel: "#test".into() })));
     }
 

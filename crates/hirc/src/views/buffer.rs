@@ -67,7 +67,10 @@ pub fn title(app: &HircApp, window: &Window, pane: f32) -> impl IntoElement {
                         None => vec![],
                     },
                 };
-                (target.name().unwrap_or_default().to_owned(), Some((net.name.clone(), p.text_dim)), state, topic)
+                // Without a bold face the name leads by colour alone: the
+                // tag steps down to the topic's role.
+                let tag = if app.bold { p.text_dim } else { p.topic };
+                (target.name().unwrap_or_default().to_owned(), Some((net.name.clone(), tag)), state, topic)
             }
         },
         None => ("No servers configured".to_owned(), None, vec![], app.hint().map(|h| (h.to_owned(), p.topic)).into_iter().collect()),
@@ -274,13 +277,15 @@ impl Runs {
     }
 }
 
-/// A nick, as the nick column or an event shows it: ours in the theme's
-/// nickname colour and bold, anyone else's in their own colour.
-fn nick_run(runs: &mut Runs, p: &Palette, nick: &str, cx: &Context) {
+/// A nick, as the nick column or an event shows it (`shown`, which may be
+/// cut to fit): ours in the theme's nickname colour and bold, anyone
+/// else's in their own colour, looked up by the whole `nick`, so a cut
+/// nick keeps its colour; on the mention fill when `band`.
+fn nick_run(runs: &mut Runs, p: &Palette, shown: &str, nick: &str, cx: &Context, band: bool) {
     if cx.me.is_some_and(|me| me.eq_ignore_ascii_case(nick)) {
-        runs.push(nick, p.nickname, true);
+        runs.push(shown, p.nickname, true);
     } else {
-        runs.push(nick, p.nick(nick, cx.slots), false);
+        runs.push(shown, p.nick(nick, cx.slots, band), false);
     }
 }
 
@@ -307,20 +312,20 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
         // Ours, not yet echoed by the server (or lost with the
         // connection): the text a step down until it is confirmed.
         LineKind::Privmsg => {
-            nick_run(&mut prefix, p, &fit_nick(cells), cx);
+            nick_run(&mut prefix, p, &fit_nick(cells), nick, cx, mention);
             body.push(&line.text, if line.delivery == Delivery::Sent { p.text } else { p.text_dim }, false);
         }
         // A notice: irssi's `-nick-`, the dashes in the event colour so
         // they read as a marker, and the text a step below conversation.
         LineKind::Notice if !nick.is_empty() => {
             prefix.push("-", p.server, false);
-            nick_run(&mut prefix, p, &fit_nick(cells.saturating_sub(2).max(1)), cx);
+            nick_run(&mut prefix, p, &fit_nick(cells.saturating_sub(2).max(1)), nick, cx, mention);
             prefix.push("-", p.server, false);
             body.push(&line.text, p.text_dim, false);
         }
         LineKind::Action => {
             prefix.push("*", p.action, false);
-            nick_run(&mut body, p, nick, cx);
+            nick_run(&mut body, p, nick, nick, cx, mention);
             let color = if line.delivery == Delivery::Sent { p.action } else { p.text_dim };
             body.push(" ", color, false).push(&line.text, color, false);
         }
@@ -354,7 +359,7 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
                 Some(parts) => {
                     for (part, s) in parts {
                         match part {
-                            Part::Nick => nick_run(&mut body, p, &s, cx),
+                            Part::Nick => nick_run(&mut body, p, &s, &s, cx, false),
                             Part::Verb | Part::Channel => _ = body.push(&s, verb, false),
                             Part::Free => _ = body.push(&s, free, false),
                         }
@@ -409,7 +414,8 @@ pub fn with_marker(app: &HircApp, line: AnyElement) -> AnyElement {
 
 /// Drawn over the top row when it is the wrapped tail of `line`: the
 /// time of the message it belongs to (in the time column's role), and
-/// its nick after a `…` that says the row goes on from above, in the
+/// its nick after an `↑` that says the row goes on from above (the arrow
+/// the window list's "more" rows use; `…` only ever means a cut), in the
 /// quiet role the scroll notes share, so the row says whose it is
 /// without reading as a new message.
 pub fn sticky(app: &HircApp, line: &Line, cells: usize) -> gpui::AnyElement {
@@ -417,7 +423,7 @@ pub fn sticky(app: &HircApp, line: &Line, cells: usize) -> gpui::AnyElement {
     let m = &app.metrics;
     let time = line.time.with_timezone(&chrono::Local).format("%H:%M").to_string();
     let nick = line.nick.as_deref().unwrap_or_default();
-    let room = cells.saturating_sub(1).max(1);
+    let room = cells.saturating_sub(2).max(1);
     let who = match line.kind {
         LineKind::Privmsg => fit(nick, room),
         LineKind::Notice if !nick.is_empty() => format!("-{}-", fit(nick, room.saturating_sub(2).max(1))),
@@ -425,7 +431,7 @@ pub fn sticky(app: &HircApp, line: &Line, cells: usize) -> gpui::AnyElement {
         kind => display::marker(kind).to_owned(),
     };
     let mut prefix = Runs::default();
-    prefix.push(&format!("…{who}"), p.quiet, false);
+    prefix.push(&format!("↑ {who}"), p.quiet, false);
     div()
         .flex()
         .w_full()
@@ -478,24 +484,23 @@ impl Render for Tip {
 }
 
 /// The bottom row while the view is scrolled away from the newest line,
-/// irssi's `-- more --`: how many lines (messages and events, however
-/// many rows they wrap to) are below, and, once the oldest line shows,
-/// that this is the top, after the count so the count never moves. In
-/// the quiet role the sticky head shares; the count takes the unread
-/// colour once new lines have arrived below. The viewport gives it a row
-/// of its own.
+/// irssi's `-- more --`: how many lines are below, in the unit `j` and
+/// `k` step (a line of the grid: a message that wraps to three is three),
+/// and, once the oldest line shows, that this is the top of the buffer,
+/// inside the note after the count, so the count never moves. In the
+/// quiet role the sticky head shares; the count takes the unread colour
+/// once new lines have arrived below. The viewport gives it a row of its
+/// own.
 pub fn more(app: &HircApp, below: usize, top: bool, fresh: bool) -> AnyElement {
     let p = &app.palette;
     let m = &app.metrics;
     let mut runs = Runs::default();
     runs.push("-- more: ", p.quiet, false).push(&below.to_string(), if fresh { p.unread } else { p.quiet }, fresh).push(
-        if below == 1 { " line below --" } else { " lines below --" },
+        if below == 1 { " line below" } else { " lines below" },
         p.quiet,
         false,
     );
-    if top {
-        runs.push(" (top of buffer)", p.quiet, false);
-    }
+    runs.push(if top { " · top of buffer --" } else { " --" }, p.quiet, false);
     div().w_full().h(px(m.line)).px(px(m.gutter)).child(runs.element()).into_any_element()
 }
 

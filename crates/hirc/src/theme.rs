@@ -24,13 +24,22 @@ pub struct Palette {
     /// `fill`) and from the mention fill (`highlight`), so "where I am"
     /// and "someone said my name" never look alike (see `fill_apart`).
     pub selected: Hsla,
+    /// The selected row's label: `text.primary`, kept legible on the
+    /// selected fill (see `lift`).
+    pub selected_text: Hsla,
     /// Our own nick (`buffer.nickname`, in bold): no one else gets it.
     pub nickname: Hsla,
     /// Other people's nicks: a few hues clear of ours and of the colours
-    /// that mean something (see `nick_hues`), then the same hues a tier
-    /// away; a buffer hands them out with `slots`.
+    /// that mean something (see `nick_hues`), then a second tier at
+    /// another contrast in the hues between; a buffer hands them out with
+    /// `slots`.
     pub nicks: Vec<Hsla>,
-    /// How many distinct hues `nicks` holds (slot `i` has hue `i % hues`).
+    /// The same slots on the mention fill, aimed at its contrast, so a
+    /// nick keeps its hue and stays legible on a line that names us.
+    pub nicks_band: Vec<Hsla>,
+    /// Each slot's OKLCH hue, for `slots` to keep near hues apart.
+    pub nick_hue: Vec<f32>,
+    /// How many slots are the first tier (a hashed nick takes one).
     pub nick_hues: usize,
     /// Background of a line that mentions us (`buffer.highlight`).
     pub highlight: Hsla,
@@ -103,6 +112,40 @@ fn legible(bg: Color, candidates: &[Color]) -> Color {
         .unwrap_or(bg)
 }
 
+/// Least contrast text that is read keeps (messages, states, labels):
+/// WCAG's 4.5:1.
+const TEXT_CONTRAST: f32 = 4.5;
+
+/// `c`, moved in OKLab lightness away from the backgrounds until it has
+/// `min` contrast on every one of `bgs`: the theme's own colour (its hue,
+/// and its chroma where sRGB can show it) made legible, unchanged when it
+/// already is. Some themes set a role too faint for the surface it is
+/// drawn on (Latte's timestamp and event colours are 2.3:1).
+fn lift(c: Color, bgs: &[Color], min: f32) -> Color {
+    let worst = |c: Color| bgs.iter().map(|b| contrast(c, *b)).fold(f32::INFINITY, f32::min);
+    if bgs.is_empty() || worst(c) >= min {
+        return c;
+    }
+    // Further the way it already stands from the surface: lighter on a
+    // darker one, darker on a lighter one.
+    let step = if luminance(c) >= luminance(bgs[0]) { 0.004 } else { -0.004 };
+    let [l, a, b] = oklab(c);
+    let mut best = c;
+    for k in 1..=250 {
+        let l = l + step * k as f32;
+        if !(0. ..=1.).contains(&l) {
+            break;
+        }
+        // Ease the chroma until sRGB can show it.
+        let Some(next) = (0..=20).map(|i| 1. - i as f32 / 20.).find_map(|s| from_oklab([l, a * s, b * s])) else { continue };
+        best = next;
+        if worst(next) >= min {
+            break;
+        }
+    }
+    best
+}
+
 /// `fill`, but also standing apart (by `FILL_CONTRAST`) from `apart`, a
 /// fill with another meaning: the first candidate that does both, else
 /// what `fill` picks.
@@ -156,6 +199,8 @@ const NICK_CONTRAST_MAX: f32 = 7.;
 /// The second tier (the same hues again, for a crowd bigger than the hues)
 /// is this much contrast away from the first.
 const NICK_TIER_STEP: f32 = 2.5;
+/// Nick colours on the mention fill: just past the floor.
+const NICK_CONTRAST_BAND: f32 = NICK_CONTRAST_MIN + 0.5;
 /// Nick colours are at least this saturated (OKLCH chroma), so a theme
 /// with a greyish nickname still gets hues that read as hues.
 const NICK_CHROMA_MIN: f32 = 0.1;
@@ -229,24 +274,31 @@ fn at_contrast(hue: f32, chroma: f32, bg: Color, aim: f32) -> Color {
         .unwrap_or(bg)
 }
 
-/// Hues for other people's nicks: as far as they can be from each other
-/// and from the hues that already mean something (`own`, our nick;
-/// `line`, colours with a meaning on a message line; `elsewhere`, colours
-/// with a meaning elsewhere), each placed in turn where it is furthest
-/// from all of those, until no hue is `NICK_SEPARATION` clear of the
-/// rest or there are `NICK_HUES_MAX`. A crowded wheel narrows the
-/// clearances until `NICK_HUES_MIN` fit. In order of placement, so the
-/// first few are the furthest apart.
-fn nick_hues(own: Color, line: &[Color], elsewhere: &[Color]) -> Vec<f32> {
-    let taken = |scale: f32| -> Vec<(f32, f32)> {
+/// Hues for other people's nicks, in two tiers. The first: as far as
+/// they can be from each other and from the hues that already mean
+/// something (`own`, our nick; `line`, colours with a meaning on a
+/// message line; `elsewhere`, colours with a meaning elsewhere), each
+/// placed in turn where it is furthest from all of those, until no hue is
+/// `NICK_SEPARATION` clear of the rest or there are `NICK_HUES_MAX`. A
+/// crowded wheel narrows the clearances until `NICK_HUES_MIN` fit. The
+/// second: as many again, placed the same way in the room the first
+/// leaves, half the separation apart, so a crowd bigger than the first
+/// tier still gets a hue each (where there is no room left, a first-tier
+/// hue repeats). In order of placement, so the first few are the
+/// furthest apart.
+fn nick_hues(own: Color, line: &[Color], elsewhere: &[Color]) -> (Vec<f32>, Vec<f32>) {
+    // `near`: how much of their clearance our own nick and the colours
+    // with a meaning elsewhere keep (a second-tier nick, darker or
+    // lighter than they are, may come closer to them; never closer to a
+    // meaning on the message line).
+    let taken = |scale: f32, near: f32| -> Vec<(f32, f32)> {
         let with =
             |cs: &[Color], clear: f32| cs.iter().map(|c| chroma_hue(*c)).filter(|(c, _)| *c > GREY).map(move |(_, h)| (h, clear * scale)).collect::<Vec<_>>();
-        [with(&[own], CLEAR_OWN), with(line, CLEAR_LINE), with(elsewhere, CLEAR_ELSEWHERE)].concat()
+        [with(&[own], CLEAR_OWN * near), with(line, CLEAR_LINE), with(elsewhere, CLEAR_ELSEWHERE * near)].concat()
     };
-    let place = |taken: &[(f32, f32)], separation: f32| {
+    let place = |taken: &[(f32, f32)], mut out: Vec<f32>, separation: f32, most: usize| {
         let free: Vec<f32> = (0..360).map(|d| d as f32).filter(|h| taken.iter().all(|(t, clear)| hue_gap(*h, *t) >= *clear)).collect();
-        let mut out: Vec<f32> = Vec::new();
-        while out.len() < NICK_HUES_MAX {
+        while out.len() < most {
             let room = |h: f32| out.iter().map(|o| hue_gap(h, *o)).chain(taken.iter().map(|(t, _)| hue_gap(h, *t))).fold(360., f32::min);
             let Some(best) = free.iter().copied().max_by(|a, b| room(*a).total_cmp(&room(*b))) else { break };
             if out.iter().any(|o| hue_gap(best, *o) < separation) {
@@ -256,51 +308,82 @@ fn nick_hues(own: Color, line: &[Color], elsewhere: &[Color]) -> Vec<f32> {
         }
         out
     };
-    (0..=10)
+    let Some((first, scale)) = (0..=10)
         .map(|i| 1. - i as f32 / 10.)
-        .map(|scale| place(&taken(scale), NICK_SEPARATION * scale.max(0.5)))
-        .find(|hues| hues.len() >= NICK_HUES_MIN)
-        .unwrap_or_default()
+        .map(|scale| (place(&taken(scale, 1.), vec![], NICK_SEPARATION * scale.max(0.5), NICK_HUES_MAX), scale))
+        .find(|(hues, _)| hues.len() >= NICK_HUES_MIN)
+    else {
+        return (vec![], vec![]);
+    };
+    let n = first.len();
+    let both = place(&taken(scale, 0.5), first.clone(), NICK_SEPARATION * scale.max(0.5) / 2., 2 * n);
+    let mut second = both[n..].to_vec();
+    second.extend(first.iter().skip(second.len()).take(n - second.len()));
+    (first, second)
 }
 
-/// Nick colours for the `hues`: each at the theme nickname's chroma (at
-/// least `NICK_CHROMA_MIN`) and its contrast against `bg` (kept between
-/// `NICK_CONTRAST_MIN` and `NICK_CONTRAST_MAX`), so every nick weighs the
-/// same; then the same hues again a tier away in contrast, for when a
-/// buffer has more people than hues.
-fn nick_colours(nickname: Color, bg: Color, hues: &[f32]) -> Vec<Color> {
+/// Nick colours for the two tiers of hues: each at the theme nickname's
+/// chroma (at least `NICK_CHROMA_MIN`) and, against `bg`, the first tier
+/// at the nickname's contrast (kept between `NICK_CONTRAST_MIN` and
+/// `NICK_CONTRAST_MAX`), the second a tier away in contrast, so every
+/// nick of a tier weighs the same.
+fn nick_colours(nickname: Color, bg: Color, first: &[f32], second: &[f32]) -> Vec<Color> {
+    let one = contrast(nickname, bg).clamp(NICK_CONTRAST_MIN, NICK_CONTRAST_MAX);
+    let two = if one >= NICK_CONTRAST_MIN + NICK_TIER_STEP { one - NICK_TIER_STEP } else { one + NICK_TIER_STEP };
+    [tier(nickname, bg, first, one), tier(nickname, bg, second, two)].concat()
+}
+
+/// The same hues on the mention fill: both tiers at `NICK_CONTRAST_BAND`,
+/// legible and still saturated enough to keep their hue (aimed at the
+/// first tier's contrast, a light fill's nicks wash out to near white).
+fn band_colours(nickname: Color, band: Color, first: &[f32], second: &[f32]) -> Vec<Color> {
+    [tier(nickname, band, first, NICK_CONTRAST_BAND), tier(nickname, band, second, NICK_CONTRAST_BAND)].concat()
+}
+
+/// `hues` at the nickname's chroma and `aim` contrast against `bg`, never
+/// short of the floor (where the nearest step falls just below).
+fn tier(nickname: Color, bg: Color, hues: &[f32], aim: f32) -> Vec<Color> {
     let chroma = chroma_hue(nickname).0.max(NICK_CHROMA_MIN);
-    let first = contrast(nickname, bg).clamp(NICK_CONTRAST_MIN, NICK_CONTRAST_MAX);
-    let second = if first >= NICK_CONTRAST_MIN + NICK_TIER_STEP { first - NICK_TIER_STEP } else { first + NICK_TIER_STEP };
-    [first, second].iter().flat_map(|aim| hues.iter().map(move |h| at_contrast(*h, chroma, bg, *aim))).collect()
+    hues.iter().map(|h| lift(at_contrast(*h, chroma, bg, aim), &[bg], NICK_CONTRAST_MIN)).collect()
 }
 
-/// Lines (by index) within this many of each other are neighbours: their
-/// nicks never share a colour while there is another to give.
-const NEAR: usize = 2;
+/// Lines (by index) within this many of each other are about a screen
+/// apart: their nicks keep different hues while there are others to
+/// give. A fixed count of lines, never the window's, so a nick's colour
+/// never changes as the window is resized.
+const SCREEN: usize = 30;
+
+/// Two slots whose hues are closer than this look alike at a glance: a
+/// little more than the least separation, as hues that close (Latte's
+/// teals, 24° apart) still read as one family.
+const ALIKE: f32 = 30.;
+
+fn alike(a: f32, b: f32) -> bool {
+    hue_gap(a, b) < ALIKE
+}
 
 /// Colour slots for the nicks of one buffer. `lines` holds, for each line
-/// in order, the (other people's) nicks it names; `colours` slots exist,
-/// the first `hues` of them distinct hues in placement order and the rest
-/// the same hues again (slot `i` has hue `i % hues`).
+/// in order, the (other people's) nicks it names; `hues` holds each
+/// slot's hue, the first tier first.
 ///
-/// People take slots in the order they first appear: an unused slot while
-/// there is one (the first hues first, as they are the furthest apart),
-/// and never the slot, nor if it can be helped the hue, of anyone on the
-/// line next to theirs anywhere in the buffer. Once every slot is used,
-/// the one last seen longest ago is shared. Keys are ASCII-lowercased, as
-/// IRC compares nicks.
-pub fn slots(lines: &[Vec<String>], colours: usize, hues: usize) -> HashMap<String, usize> {
+/// People take slots in the order they first appear, by these rules in
+/// turn: never the slot, nor if it can be helped a hue like it, of anyone
+/// on the line next to theirs anywhere in the buffer; not the slot, nor a
+/// hue like it, of anyone within a screen (`SCREEN`) of them; an unused
+/// slot (the first tier first, as its hues are the furthest apart); and
+/// last, the slot whose holder was seen longest ago. It depends only on
+/// the buffer's lines. Keys are ASCII-lowercased, as IRC compares nicks.
+pub fn slots(lines: &[Vec<String>], hues: &[f32]) -> HashMap<String, usize> {
     let mut out: HashMap<String, usize> = HashMap::new();
+    let colours = hues.len();
     if colours == 0 {
         return out;
     }
-    let hues = hues.clamp(1, colours);
     let lines: Vec<Vec<String>> = lines.iter().map(|l| l.iter().map(|n| n.to_ascii_lowercase()).collect()).collect();
     // How close (in lines) each pair of nicks ever comes.
     let mut near: HashMap<(&str, &str), usize> = HashMap::new();
     for (i, line) in lines.iter().enumerate() {
-        for (j, other) in lines.iter().enumerate().skip(i).take(NEAR + 1) {
+        for (j, other) in lines.iter().enumerate().skip(i).take(SCREEN + 1) {
             for a in line {
                 for b in other.iter().filter(|b| *b != a) {
                     let d = (j - i).max(1);
@@ -321,13 +404,13 @@ pub fn slots(lines: &[Vec<String>], colours: usize, hues: usize) -> HashMap<Stri
                 };
                 let pick = (0..colours).min_by_key(|&slot| {
                     let exact = |s: usize| s == slot;
-                    let hue = |s: usize| s % hues == slot % hues;
+                    let like = |s: usize| alike(hues[s], hues[slot]);
                     (
                         close(1, &exact),
-                        close(1, &hue),
-                        close(NEAR, &exact),
+                        close(1, &like),
+                        close(SCREEN, &exact),
+                        close(SCREEN, &like),
                         holders(slot).count(),
-                        close(NEAR, &hue),
                         holders(slot).filter_map(|n| seen.get(n)).max().copied(),
                         slot,
                     )
@@ -348,52 +431,72 @@ pub fn nick_slot(nick: &str, slots: usize) -> usize {
 }
 
 impl Palette {
-    /// The colour for someone else's nick: its slot in `slots` (see
-    /// `slots`), else its hashed slot.
-    pub fn nick(&self, nick: &str, slots: &HashMap<String, usize>) -> Hsla {
+    /// The colour for someone else's nick (the whole nick, however the
+    /// column shows it): its slot in `slots` (see `slots`), else its
+    /// hashed slot; on the mention fill when `band`.
+    pub fn nick(&self, nick: &str, slots: &HashMap<String, usize>, band: bool) -> Hsla {
         let slot = slots.get(&nick.to_ascii_lowercase()).copied().unwrap_or_else(|| nick_slot(nick, self.nick_hues));
-        self.nicks.get(slot).copied().unwrap_or(self.nickname)
+        let colours = if band { &self.nicks_band } else { &self.nicks };
+        colours.get(slot).copied().unwrap_or(self.nickname)
     }
 }
 
 pub fn palette(t: &Theme) -> Palette {
-    let hues = nick_hues(
+    let (first, second) = nick_hues(
         t.buffer.nickname,
         &[t.buffer.action, t.buffer.server_messages.default, t.text.error],
         &[t.text.success, t.buffer.url, t.general.unread_indicator],
     );
+    let (bg, title, input, side) = (t.buffer.background, t.buffer.background_title_bar, t.buffer.background_text_input, t.general.background);
     let quiet = [t.buffer.timestamp, t.buffer.topic, t.text.secondary];
-    let highlight = fill(t.buffer.background, &[t.buffer.highlight, t.buffer.selection, t.buffer.border_selected]);
+    let highlight = fill(bg, &[t.buffer.highlight, t.buffer.selection, t.buffer.border_selected]);
+    let selected = fill_apart(
+        side,
+        highlight,
+        &[t.buttons.secondary.background_selected, t.buffer.border_selected, t.buffer.selection, t.buttons.secondary.background_selected_hover],
+    );
+    // Every role at its floor on the surfaces it is drawn on: text that
+    // is read (messages, states, labels, markers) 4.5:1, secondary text
+    // (times, the topic, quiet wording) 3:1.
+    let read = |role: Color, on: &[Color]| c(lift(role, on, TEXT_CONTRAST));
+    let text = lift(t.text.primary, &[bg, title, input, side, highlight], TEXT_CONTRAST);
+    // A recognised command: the theme's code colour, or where that is a
+    // tint of body text (Mocha), the success colour (a command that will
+    // run), never the link colour, which would read as a link.
+    let code = apart_from(t.text.primary, &[t.buffer.code, t.text.success]);
+    let hues: Vec<f32> = [first.as_slice(), second.as_slice()].concat();
     Palette {
-        background: c(t.general.background),
+        background: c(side),
         border: c(t.general.border),
-        unread: c(t.general.unread_indicator),
-        text: c(t.text.primary),
-        text_dim: c(t.text.secondary),
-        tertiary: c(t.text.tertiary),
-        success: c(t.text.success),
-        error: c(t.text.error),
-        buffer_bg: c(t.buffer.background),
-        input_bg: c(t.buffer.background_text_input),
-        title_bg: c(t.buffer.background_title_bar),
+        unread: read(t.general.unread_indicator, &[side]),
+        text: c(text),
+        // Also a mention's time, on the mention fill.
+        text_dim: c(lift(lift(t.text.secondary, &[bg, title, input, side], TEXT_CONTRAST), &[highlight], QUIET_CONTRAST)),
+        tertiary: read(t.text.tertiary, &[input]),
+        // States are read in the header and the list, and marked by a dot
+        // or a tag on the selected row too.
+        success: c(lift(lift(t.text.success, &[title, side, bg], TEXT_CONTRAST), &[selected], QUIET_CONTRAST)),
+        error: c(lift(lift(t.text.error, &[title, side, bg, input], TEXT_CONTRAST), &[selected], QUIET_CONTRAST)),
+        buffer_bg: c(bg),
+        input_bg: c(input),
+        title_bg: c(title),
         hover: c(t.buttons.primary.background_hover),
-        selected: c(fill_apart(
-            t.general.background,
-            highlight,
-            &[t.buttons.secondary.background_selected, t.buffer.border_selected, t.buffer.selection, t.buttons.secondary.background_selected_hover],
-        )),
-        nickname: c(t.buffer.nickname),
-        nicks: nick_colours(t.buffer.nickname, t.buffer.background, &hues).into_iter().map(c).collect(),
-        nick_hues: hues.len(),
+        selected: c(selected),
+        selected_text: read(text, &[selected]),
+        nickname: read(t.buffer.nickname, &[bg]),
+        nicks: nick_colours(t.buffer.nickname, bg, &first, &second).into_iter().map(c).collect(),
+        nicks_band: band_colours(t.buffer.nickname, highlight, &first, &second).into_iter().map(c).collect(),
+        nick_hue: hues,
+        nick_hues: first.len(),
         highlight: c(highlight),
-        selection: c(fill(t.buffer.background_text_input, &[t.buffer.selection, t.buffer.border_selected, t.buffer.highlight])),
-        timestamp: c(t.buffer.timestamp),
-        quiet: c(legible(t.buffer.background, &quiet)),
-        hint: c(legible(t.buffer.background_text_input, &quiet)),
-        code: c(apart_from(t.text.primary, &[t.buffer.code, t.buffer.url])),
-        action: c(t.buffer.action),
-        server: c(t.buffer.server_messages.default),
-        topic: c(t.buffer.topic),
+        selection: c(fill(input, &[t.buffer.selection, t.buffer.border_selected, t.buffer.highlight])),
+        timestamp: c(lift(t.buffer.timestamp, &[bg], QUIET_CONTRAST)),
+        quiet: c(legible(bg, &quiet)),
+        hint: c(legible(input, &quiet)),
+        code: read(code, &[input]),
+        action: read(t.buffer.action, &[bg, highlight]),
+        server: read(t.buffer.server_messages.default, &[bg, highlight]),
+        topic: c(lift(t.buffer.topic, &[title, bg], QUIET_CONTRAST)),
     }
 }
 
@@ -411,9 +514,10 @@ mod tests {
 
     #[test]
     fn a_command_colour_stands_apart_from_text() {
-        let (text, code, url) = (Color::rgb(0xcdd6f4), Color::rgb(0xb7bdf8), Color::rgb(0x89b4fa));
-        // Mocha's code colour is a tint of its text; the link colour is not.
-        assert_eq!(apart_from(text, &[code, url]), url);
+        let (text, code, success) = (Color::rgb(0xcdd6f4), Color::rgb(0xb7bdf8), Color::rgb(0xa6e3a1));
+        // Mocha's code colour is a tint of its text; the success colour is
+        // not (and is no link colour).
+        assert_eq!(apart_from(text, &[code, success]), success);
         // Latte's is plainly apart.
         assert_eq!(apart_from(Color::rgb(0x4c4f69), &[Color::rgb(0x7287fd), Color::rgb(0x1e66f5)]), Color::rgb(0x7287fd));
     }
@@ -446,8 +550,14 @@ mod tests {
     fn nick_hues_are_apart_from_each_other_and_from_meanings() {
         for (own, _, line, elsewhere) in themes() {
             let (line, elsewhere) = (line.map(Color::rgb), elsewhere.map(Color::rgb));
-            let hues = nick_hues(Color::rgb(own), &line, &elsewhere);
+            let (hues, second) = nick_hues(Color::rgb(own), &line, &elsewhere);
             assert!((NICK_HUES_MIN..=NICK_HUES_MAX).contains(&hues.len()), "{own:06x}: {hues:?}");
+            // The second tier: as many again, in the room between.
+            assert_eq!(second.len(), hues.len());
+            for (i, a) in second.iter().enumerate() {
+                assert!(hues.iter().chain(&second[..i]).all(|b| a == b || hue_gap(*a, *b) >= NICK_SEPARATION / 4.), "{own:06x}: {second:?}");
+                assert!(hue_gap(*a, chroma_hue(Color::rgb(own)).1) >= CLEAR_OWN / 2., "{own:06x}: {a} is near our own");
+            }
             for (i, a) in hues.iter().enumerate() {
                 assert!(hues[i + 1..].iter().all(|b| hue_gap(*a, *b) >= NICK_SEPARATION), "{own:06x}: {hues:?}");
                 assert!(hue_gap(*a, chroma_hue(Color::rgb(own)).1) >= CLEAR_OWN, "{own:06x}: {a} is near our own");
@@ -462,20 +572,25 @@ mod tests {
         // Grey roles take no hue.
         let grey = [Color::rgb(0x808080)];
         assert_eq!(nick_hues(Color::rgb(0x89dceb), &grey, &grey), nick_hues(Color::rgb(0x89dceb), &[], &[]));
+        // Mocha: the second tier finds room for new hues (8 in all), and
+        // repeats first-tier hues only for the rest.
+        let (first, second) = nick_hues(Color::rgb(0x89dceb), &themes()[0].2.map(Color::rgb), &themes()[0].3.map(Color::rgb));
+        let new = second.iter().take_while(|h| !first.contains(h)).count();
+        assert!(new >= 3 && second[new..].iter().all(|h| first.contains(h)), "{first:?} {second:?}");
     }
 
     #[test]
     fn a_crowded_wheel_still_gives_the_fewest_hues() {
         let wheel: Vec<Color> = (0..12).map(|i| at_contrast(i as f32 * 30., 0.12, Color::rgb(0x181825), 7.)).collect();
-        assert!(nick_hues(Color::rgb(0x89dceb), &wheel, &[]).len() >= NICK_HUES_MIN);
+        assert!(nick_hues(Color::rgb(0x89dceb), &wheel, &[]).0.len() >= NICK_HUES_MIN);
     }
 
     #[test]
     fn nick_colours_are_legible_and_tiered() {
         for (own, bg, line, elsewhere) in themes() {
             let (own, bg) = (Color::rgb(own), Color::rgb(bg));
-            let hues = nick_hues(own, &line.map(Color::rgb), &elsewhere.map(Color::rgb));
-            let colours = nick_colours(own, bg, &hues);
+            let (hues, second) = nick_hues(own, &line.map(Color::rgb), &elsewhere.map(Color::rgb));
+            let colours = nick_colours(own, bg, &hues, &second);
             assert_eq!(colours.len(), 2 * hues.len());
             let (first, second) = colours.split_at(hues.len());
             let aim = contrast(own, bg).clamp(NICK_CONTRAST_MIN, NICK_CONTRAST_MAX);
@@ -493,16 +608,23 @@ mod tests {
         assert_eq!(nick_slot("anything", 0), 0);
     }
 
+    /// `n` slots over `distinct` evenly spaced hues (slot `i` has hue
+    /// `i % distinct`), or with `distinct == n / 2`, a second tier in the
+    /// hues between the first's.
+    fn hues(distinct: usize, n: usize) -> Vec<f32> {
+        (0..n).map(|i| (i % distinct) as f32 * 360. / distinct as f32).collect()
+    }
+
     fn lines(nicks: &[&str]) -> Vec<Vec<String>> {
         nicks.iter().map(|n| if n.is_empty() { vec![] } else { n.split(' ').map(str::to_owned).collect() }).collect()
     }
 
     #[test]
     fn a_buffer_hands_out_unused_slots_first_hues_first() {
-        let got = slots(&lines(&["alice", "bob", "carol", "alice"]), 8, 4);
+        let got = slots(&lines(&["alice", "bob", "carol", "alice"]), &hues(4, 8));
         assert_eq!((got["alice"], got["bob"], got["carol"]), (0, 1, 2));
-        assert_eq!(slots(&lines(&["Bob", "bob"]), 8, 4).len(), 1);
-        assert!(slots(&lines(&["alice"]), 0, 0).is_empty());
+        assert_eq!(slots(&lines(&["Bob", "bob"]), &hues(4, 8)).len(), 1);
+        assert!(slots(&lines(&["alice"]), &[]).is_empty());
     }
 
     #[test]
@@ -530,7 +652,7 @@ mod tests {
             "bob",
             "",
         ]);
-        let got = slots(&seq, 6, 3);
+        let got = slots(&seq, &hues(3, 6));
         for pair in seq.windows(2) {
             for a in &pair[0] {
                 for b in pair[1].iter().filter(|b| *b != a) {
@@ -541,7 +663,7 @@ mod tests {
         // Nicks named on one line (a kick) differ too.
         assert_ne!(got["bob"], got["dave_away"]);
         // With five hues (Mocha's), neighbours differ in hue as well.
-        let got = slots(&seq, 10, 5);
+        let got = slots(&seq, &hues(5, 10));
         for pair in seq.windows(2) {
             for a in &pair[0] {
                 for b in pair[1].iter().filter(|b| *b != a) {
@@ -554,8 +676,40 @@ mod tests {
     #[test]
     fn a_shared_slot_goes_to_whoever_spoke_longest_ago() {
         // Two slots; carol shares with alice (long gone), not bob.
-        let got = slots(&lines(&["alice", "", "", "", "bob", "", "", "", "carol"]), 2, 2);
+        let got = slots(&lines(&["alice", "", "", "", "bob", "", "", "", "carol"]), &hues(2, 2));
         assert_eq!(got["carol"], got["alice"]);
+    }
+
+    #[test]
+    fn people_on_one_screen_take_hues_of_their_own() {
+        // The review's #general: eight people on one screen, and ten slots
+        // with a hue each (Mocha's two tiers). No two share a slot, and
+        // the first tier goes first.
+        let seq =
+            lines(&["alice", "bob", "carol", "dave", "erin", "alice", "bob", "dave_away", "x", "a_really_long_nickname", "carol", "bob", "alice", "x", "erin"]);
+        let tiers: Vec<f32> = (0..5).map(|i| i as f32 * 72.).chain((0..5).map(|i| i as f32 * 72. + 36.)).collect();
+        let got = slots(&seq, &tiers);
+        let mut taken: Vec<usize> = got.values().copied().collect();
+        taken.sort();
+        taken.dedup();
+        assert_eq!(taken.len(), got.len(), "{got:?}");
+        assert_eq!((got["alice"], got["bob"], got["carol"], got["dave"], got["erin"]), (0, 1, 2, 3, 4));
+        // On one screen, a hue like someone's goes before their very
+        // colour; neighbours keep apart even in hue.
+        let got = slots(&lines(&["alice", "", "bob", "", "carol"]), &[0., 180., 10.]);
+        assert_eq!(got["carol"], 2);
+        let got = slots(&lines(&["alice", "bob", "carol"]), &[0., 180., 10., 90.]);
+        assert_eq!(got["carol"], 3);
+    }
+
+    #[test]
+    fn a_nick_keeps_its_slot_whatever_shows_of_it() {
+        // Slots come from the buffer's lines alone, and a nick the column
+        // cuts is looked up whole.
+        let seq = lines(&["bob", "a_really_long_nickname", "bob"]);
+        let got = slots(&seq, &hues(5, 10));
+        assert_ne!(got["bob"], got["a_really_long_nickname"]);
+        assert_eq!(slots(&seq, &hues(5, 10)), got);
     }
 
     #[test]
@@ -568,6 +722,154 @@ mod tests {
         assert_eq!(legible(Color::rgb(0x000000), &[Color::rgb(0x808080), Color::rgb(0xffffff)]), Color::rgb(0x808080));
         // Nothing reaches it: the most legible.
         assert_eq!(legible(Color::rgb(0x808080), &[Color::rgb(0x707070), Color::rgb(0x202020)]), Color::rgb(0x202020));
+    }
+
+    #[test]
+    fn lift_keeps_the_hue_and_reaches_the_floor() {
+        // Latte's timestamp and event colours on its buffer.
+        let bg = Color::rgb(0xeff1f5);
+        for (role, min) in [(0x9ca0b0, QUIET_CONTRAST), (0xdf8e1d, TEXT_CONTRAST), (0x40a02b, TEXT_CONTRAST)] {
+            let role = Color::rgb(role);
+            let lifted = lift(role, &[bg], min);
+            assert!(contrast(lifted, bg) >= min && contrast(lifted, bg) < min + 0.3, "{role:?} -> {lifted:?}");
+            // Darker on a light buffer, the same hue.
+            assert!(luminance(lifted) < luminance(role));
+            if chroma_hue(role).0 > GREY {
+                assert!(hue_gap(chroma_hue(lifted).1, chroma_hue(role).1) < 6., "{role:?} -> {lifted:?}");
+            }
+        }
+        // Legible already: unchanged.
+        assert_eq!(lift(Color::rgb(0xcdd6f4), &[Color::rgb(0x181825)], TEXT_CONTRAST), Color::rgb(0xcdd6f4));
+        // On a dark surface it lightens.
+        let lifted = lift(Color::rgb(0x585a6e), &[Color::rgb(0x181825)], QUIET_CONTRAST);
+        assert!(contrast(lifted, Color::rgb(0x181825)) >= QUIET_CONTRAST && luminance(lifted) > luminance(Color::rgb(0x585a6e)));
+    }
+
+    /// The review's two themes (public Catppuccin palettes), as Halloy
+    /// theme files.
+    const MOCHA: &str = r##"
+[general]
+background = "#11111B"
+border = "#6C7086"
+unread_indicator = "#CBA6F7"
+[text]
+primary = "#CDD6F4"
+secondary = "#A6ADC8"
+tertiary = "#CBA6F7"
+success = "#A6E3A1"
+error = "#F38BA8"
+[buffer]
+action = "#FAB387"
+background = "#181825"
+background_text_input = "#1E1E2E"
+background_title_bar = "#1E1E2E"
+border = "#11111B"
+border_selected = "#4C4163"
+code = "#B7BDF8"
+highlight = "#594C76"
+nickname = "#89DCEB"
+selection = "#2C324A"
+timestamp = "#585A6E"
+topic = "#7F849C"
+url = "#89B4FA"
+[buffer.server_messages]
+default = "#F9E2AF"
+[buttons.primary]
+background_hover = "#1A1A29"
+[buttons.secondary]
+background_selected = "#4C4163"
+background_selected_hover = "#685786"
+"##;
+    const LATTE: &str = r##"
+[general]
+background = "#DCE0E8"
+border = "#9CA0B0"
+unread_indicator = "#8839EF"
+[text]
+primary = "#4C4F69"
+secondary = "#6C6F85"
+tertiary = "#8839EF"
+success = "#40A02B"
+error = "#D20F39"
+[buffer]
+action = "#FE640B"
+background = "#EFF1F5"
+background_text_input = "#E6E9EF"
+background_title_bar = "#E6E9EF"
+border = "#DCE0E8"
+border_selected = "#BCC0CC"
+code = "#7287FD"
+highlight = "#DCE0E8"
+nickname = "#04A5E5"
+selection = "#CCD0DA"
+timestamp = "#9CA0B0"
+topic = "#7C7F93"
+url = "#1E66F5"
+[buffer.server_messages]
+default = "#DF8E1D"
+[buttons.primary]
+background_hover = "#E6E9EF"
+[buttons.secondary]
+background_selected = "#BCC0CC"
+background_selected_hover = "#ACB0BE"
+"##;
+
+    fn theme(name: &str, text: &str) -> Theme {
+        let dir = std::env::temp_dir().join(format!("hirc-theme-test-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(dir.join("themes")).unwrap();
+        std::fs::write(dir.join("themes").join(format!("{name}.toml")), text).unwrap();
+        let theme = hirc_core::theme::load(&dir, name).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        theme
+    }
+
+    fn rgb(h: Hsla) -> Color {
+        let c: gpui::Rgba = h.into();
+        let v = |f: f32| (f * 255.).round() as u8;
+        Color { r: v(c.r), g: v(c.g), b: v(c.b), a: 255 }
+    }
+
+    #[test]
+    fn every_role_is_legible_where_it_is_drawn() {
+        for (name, text) in [("Mocha", MOCHA), ("Latte", LATTE), ("defaults", "")] {
+            let p = palette(&theme(name, text));
+            let ratio = |fg: Hsla, bg: Hsla| contrast(rgb(fg), rgb(bg));
+            let read = TEXT_CONTRAST - 0.01;
+            let quiet = QUIET_CONTRAST - 0.01;
+            // Read text: messages, states, labels and markers.
+            for (what, fg, bgs) in [
+                ("text", p.text, vec![p.buffer_bg, p.title_bg, p.input_bg, p.background, p.highlight]),
+                ("selected label", p.selected_text, vec![p.selected]),
+                ("secondary", p.text_dim, vec![p.buffer_bg, p.title_bg, p.input_bg, p.background]),
+                ("success", p.success, vec![p.title_bg, p.background]),
+                ("error", p.error, vec![p.title_bg, p.background, p.buffer_bg]),
+                ("unread", p.unread, vec![p.background]),
+                ("mode label", p.tertiary, vec![p.input_bg]),
+                ("command", p.code, vec![p.input_bg]),
+                ("own nick", p.nickname, vec![p.buffer_bg]),
+                ("action", p.action, vec![p.buffer_bg, p.highlight]),
+                ("event marker", p.server, vec![p.buffer_bg, p.highlight]),
+            ] {
+                for bg in bgs {
+                    assert!(ratio(fg, bg) >= read, "{name} {what}: {:.2}", ratio(fg, bg));
+                }
+            }
+            for (i, (n, b)) in p.nicks.iter().zip(&p.nicks_band).enumerate() {
+                assert!(ratio(*n, p.buffer_bg) >= read && ratio(*b, p.highlight) >= read, "{name} nick {i}");
+            }
+            // Secondary text: times, the topic, quiet wording, hints.
+            for (what, fg, bg) in [
+                ("time", p.timestamp, p.buffer_bg),
+                ("time on a mention", p.text_dim, p.highlight),
+                ("quiet", p.quiet, p.buffer_bg),
+                ("hint", p.hint, p.input_bg),
+                ("topic", p.topic, p.title_bg),
+                ("dot on the selected row", p.success, p.selected),
+                ("fault on the selected row", p.error, p.selected),
+            ] {
+                assert!(ratio(fg, bg) >= quiet, "{name} {what}: {:.2}", ratio(fg, bg));
+            }
+        }
     }
 
     #[test]
