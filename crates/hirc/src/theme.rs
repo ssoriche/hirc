@@ -18,7 +18,8 @@ pub struct Palette {
     pub buffer_bg: Hsla,
     pub input_bg: Hsla,
     pub title_bg: Hsla,
-    /// A hovered sidebar row: a faint wash.
+    /// A hovered sidebar row: a quiet wash, visibly off the list's
+    /// background and well short of the selected fill (see `wash`).
     pub hover: Hsla,
     /// The selected sidebar row's fill: distinct from `background` (see
     /// `fill`) and from the mention fill (`highlight`), so "where I am"
@@ -157,6 +158,22 @@ fn fill_apart(bg: Color, apart: Color, candidates: &[Color]) -> Color {
         .unwrap_or_else(|| fill(bg, candidates))
 }
 
+/// Least contrast a hover wash keeps from the list's background (seen,
+/// though quiet), and from the selected fill (never read as selection).
+const HOVER_CONTRAST: f32 = 1.15;
+const HOVER_APART: f32 = 1.2;
+
+/// The hover wash: the first candidate `HOVER_CONTRAST` off `bg` and
+/// `HOVER_APART` from `selected`, else the first candidate, lifted off
+/// `bg` to `HOVER_CONTRAST` (its own hue, the way it already leans).
+fn wash(bg: Color, selected: Color, candidates: &[Color]) -> Color {
+    candidates
+        .iter()
+        .find(|c| c.a == 255 && contrast(**c, bg) >= HOVER_CONTRAST && contrast(**c, selected) >= HOVER_APART)
+        .copied()
+        .unwrap_or_else(|| lift(candidates[0], &[bg], HOVER_CONTRAST))
+}
+
 /// How far (OKLab distance) a colour that marks something in running
 /// text keeps from the text itself, so it reads as a different colour at
 /// a glance and not as a tint of it.
@@ -191,14 +208,13 @@ const CLEAR_LINE: f32 = 25.;
 const CLEAR_ELSEWHERE: f32 = 12.;
 /// Colours with less OKLCH chroma than this are greys: they take no hue.
 const GREY: f32 = 0.04;
-/// Nick colours sit at the theme nickname's contrast against the buffer,
-/// kept legible (WCAG's 4.5:1 for text) and short of near-white pastels
-/// that read as body text.
+/// Nick colours are legible (WCAG's 4.5:1 for text) and short of
+/// near-white pastels that read as body text: the two tiers sit at
+/// `NICK_CONTRAST_MIN` and `NICK_TIER` times that, apart from each other
+/// by `NICK_TIER` (a plain step in lightness, not a near-match), the
+/// tier nearer the theme nickname's own contrast first.
 const NICK_CONTRAST_MIN: f32 = 4.5;
-const NICK_CONTRAST_MAX: f32 = 7.;
-/// The second tier (the same hues again, for a crowd bigger than the hues)
-/// is this much contrast away from the first.
-const NICK_TIER_STEP: f32 = 2.5;
+const NICK_TIER: f32 = 1.75;
 /// Nick colours on the mention fill: just past the floor.
 const NICK_CONTRAST_BAND: f32 = NICK_CONTRAST_MIN + 0.5;
 /// Nick colours are at least this saturated (OKLCH chroma), so a theme
@@ -323,13 +339,13 @@ fn nick_hues(own: Color, line: &[Color], elsewhere: &[Color]) -> (Vec<f32>, Vec<
 }
 
 /// Nick colours for the two tiers of hues: each at the theme nickname's
-/// chroma (at least `NICK_CHROMA_MIN`) and, against `bg`, the first tier
-/// at the nickname's contrast (kept between `NICK_CONTRAST_MIN` and
-/// `NICK_CONTRAST_MAX`), the second a tier away in contrast, so every
-/// nick of a tier weighs the same.
+/// chroma (at least `NICK_CHROMA_MIN`) and, against `bg`, one tier at
+/// `NICK_CONTRAST_MIN` and the other `NICK_TIER` times that, the first
+/// tier the one nearer the nickname's own contrast, so every nick of a
+/// tier weighs the same and the tiers differ plainly in lightness.
 fn nick_colours(nickname: Color, bg: Color, first: &[f32], second: &[f32]) -> Vec<Color> {
-    let one = contrast(nickname, bg).clamp(NICK_CONTRAST_MIN, NICK_CONTRAST_MAX);
-    let two = if one >= NICK_CONTRAST_MIN + NICK_TIER_STEP { one - NICK_TIER_STEP } else { one + NICK_TIER_STEP };
+    let (lo, hi) = (NICK_CONTRAST_MIN, NICK_CONTRAST_MIN * NICK_TIER);
+    let (one, two) = if contrast(nickname, bg) >= (lo + hi) / 2. { (hi, lo) } else { (lo, hi) };
     [tier(nickname, bg, first, one), tier(nickname, bg, second, two)].concat()
 }
 
@@ -480,7 +496,7 @@ pub fn palette(t: &Theme) -> Palette {
         buffer_bg: c(bg),
         input_bg: c(input),
         title_bg: c(title),
-        hover: c(t.buttons.primary.background_hover),
+        hover: c(wash(side, selected, &[t.buttons.primary.background_hover, t.buttons.secondary.background_hover, title])),
         selected: c(selected),
         selected_text: read(text, &[selected]),
         nickname: read(t.buffer.nickname, &[bg]),
@@ -593,9 +609,13 @@ mod tests {
             let colours = nick_colours(own, bg, &hues, &second);
             assert_eq!(colours.len(), 2 * hues.len());
             let (first, second) = colours.split_at(hues.len());
-            let aim = contrast(own, bg).clamp(NICK_CONTRAST_MIN, NICK_CONTRAST_MAX);
+            // Each tier weighs the same, and a hue's two tiers are at least
+            // 1.5:1 apart (a step in lightness, not a near-match).
+            let aim = contrast(first[0], bg);
             assert!(first.iter().all(|c| (contrast(*c, bg) - aim).abs() < 0.2), "{first:?}");
-            assert!(second.iter().all(|c| (contrast(*c, bg) - aim).abs() > NICK_TIER_STEP - 0.2), "{second:?}");
+            for (a, b) in first.iter().zip(second) {
+                assert!(contrast(*a, *b) >= 1.5, "{a:?} {b:?}: {:.2}", contrast(*a, *b));
+            }
             assert!(colours.iter().all(|c| contrast(*c, bg) >= NICK_CONTRAST_MIN - 0.1), "{colours:?}");
         }
     }
@@ -870,6 +890,22 @@ background_selected_hover = "#ACB0BE"
                 assert!(ratio(fg, bg) >= quiet, "{name} {what}: {:.2}", ratio(fg, bg));
             }
         }
+    }
+
+    #[test]
+    fn the_hover_wash_is_seen_and_short_of_selection() {
+        // Mocha: the primary hover is 1.09:1 off the list, the secondary
+        // one nearly the selected fill; the title bar is lifted to show.
+        let (bg, selected) = (Color::rgb(0x11111b), Color::rgb(0x2c324a));
+        let hover = wash(bg, selected, &[Color::rgb(0x1a1a29), Color::rgb(0x2b2b42), Color::rgb(0x1e1e2e)]);
+        assert!(contrast(hover, bg) >= HOVER_CONTRAST - 0.01 && contrast(hover, selected) >= HOVER_APART, "{hover:?}");
+        // A usable role is taken as is.
+        assert_eq!(wash(bg, selected, &[Color::rgb(0x1a1a29), Color::rgb(0x202034)]), Color::rgb(0x202034));
+        // Latte: every role is at or above the list's own light; the first
+        // is lifted lighter still, away from the darker selected fill.
+        let (bg, selected) = (Color::rgb(0xdce0e8), Color::rgb(0xacb0be));
+        let hover = wash(bg, selected, &[Color::rgb(0xe6e9ef), Color::rgb(0xdce0e8)]);
+        assert!(contrast(hover, bg) >= HOVER_CONTRAST - 0.01 && luminance(hover) > luminance(bg), "{hover:?}");
     }
 
     #[test]

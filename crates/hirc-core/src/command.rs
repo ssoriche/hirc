@@ -94,6 +94,9 @@ pub fn parse(input: &str, network: &str, target: Option<&str>) -> Result<Input, 
         "me" if args.is_empty() => return Err("Usage: /me <text>".into()),
         "me" => Command::Action { network: net, target: here()?, text: args.to_owned() },
         "join" | "j" if !first.is_empty() => Command::Join { network: net, channel: first.to_owned(), key: opt(tail) },
+        // Bare, in a channel's window: back into that channel, as a bare
+        // /part leaves it (irssi).
+        "join" | "j" if target.is_some_and(is_channel) => Command::Join { network: net, channel: here()?, key: None },
         "part" | "leave" if is_channel(first) => Command::Part { network: net, channel: first.to_owned(), reason: opt(tail) },
         "part" | "leave" => Command::Part { network: net, channel: here()?, reason: opt(args) },
         "msg" | "privmsg" if !first.is_empty() && !tail.is_empty() => Command::Say { network: net, target: first.to_owned(), text: tail.to_owned() },
@@ -209,8 +212,17 @@ mod tests {
     }
 
     #[test]
+    fn bare_join_rejoins_the_channel_window() {
+        assert_eq!(send("/join"), Command::Join { network: "net".into(), channel: "#chan".into(), key: None });
+        assert_eq!(send("/J "), Command::Join { network: "net".into(), channel: "#chan".into(), key: None });
+        // Nowhere to rejoin: a query or the server window.
+        assert_eq!(parse("/join", "net", Some("bob")), Err("/join needs more arguments".to_owned()));
+        assert_eq!(parse("/j", "net", None), Err("/j needs more arguments".to_owned()));
+    }
+
+    #[test]
     fn errors() {
-        assert!(p("/join").is_err());
+        assert!(parse("/join", "net", Some("bob")).is_err());
         assert!(p("/msg bob").is_err());
         assert!(p("/frobnicate").unwrap_err().contains("/frobnicate"));
         assert!(parse("/part", "net", None).is_err());

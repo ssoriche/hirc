@@ -20,12 +20,14 @@ pub enum Part {
 }
 
 /// The marker an event line shows in the nick column (weechat style):
-/// arrivals, departures, errors, a change of connection state (irssi's
+/// arrivals, departures, removals, a change of connection state (irssi's
 /// `-!-`) and everything else.
 pub fn marker(kind: LineKind) -> &'static str {
     match kind {
         LineKind::Join => "-->",
-        LineKind::Part | LineKind::Quit | LineKind::Kick => "<--",
+        LineKind::Part | LineKind::Quit => "<--",
+        // Removed, not gone of their own accord: the arrow, struck.
+        LineKind::Kick => "<-x",
         LineKind::Error => "=!=",
         LineKind::Status => "-!-",
         _ => "--",
@@ -179,6 +181,8 @@ mod tests {
         assert_eq!(marker(LineKind::Join), "-->");
         assert_eq!(marker(LineKind::Quit), "<--");
         assert_eq!(marker(LineKind::Topic), "--");
+        // A kick never reads as someone leaving.
+        assert_ne!(marker(LineKind::Kick), marker(LineKind::Part));
     }
 
     #[test]

@@ -329,8 +329,13 @@ struct PrepaintState {
     line: Option<ShapedLine>,
     /// The placeholder, on the text column under the cursor.
     placeholder: Option<ShapedLine>,
-    /// The Normal-mode block, drawn under the text (its glyph is inverted).
+    /// The Normal-mode block, drawn over the text, and the text again in
+    /// the background colour (from where it is drawn), clipped to the
+    /// block: reverse video inside the cell, as a terminal splits a glyph
+    /// at a cell's edge, so ink past the cell (Menlo's `w`) keeps its own
+    /// colour beside the block instead of vanishing.
     block: Option<PaintQuad>,
+    reversed: Option<(ShapedLine, Point<Pixels>)>,
     /// The Insert/ex bar, drawn over the text.
     caret: Option<PaintQuad>,
     scroll_x: Pixels,
@@ -401,9 +406,8 @@ impl Element for TextElement {
 
         // Colours over the line: a `/command` hirc knows takes the command
         // colour, one it does not (a typo) the error colour, so either
-        // shows before Enter; marked (IME) text is underlined, and the
-        // Normal block's glyph is drawn in the background colour, as a
-        // terminal's reverse video.
+        // shows before Enter; marked (IME) text is underlined. The Normal
+        // block's glyph is drawn again over the block (`reversed`).
         let (code, wrong) = input.palette.as_ref().map_or((dim, dim), |p| (p.code, p.error));
         let mut over = Vec::new();
         if input.vim.mode != Mode::Ex
@@ -419,9 +423,6 @@ impl Element for TextElement {
         }
         if let Some(marked) = &input.marked_range {
             over.push((shift(marked.start)..shift(marked.end), (text, true)));
-        }
-        if normal && selected_range.is_empty() {
-            over.push((cursor..next_char_boundary(&shown, cursor), (bg, false)));
         }
         let runs: Vec<TextRun> = spans(shown.len(), (text, false), &over)
             .into_iter()
@@ -441,16 +442,8 @@ impl Element for TextElement {
         // The placeholder starts on the text column, where typing will:
         // the bar sits in the gap before it, as before any glyph, and under
         // the Normal block its first glyph is reversed, as typed text's is.
-        let under_block = normal && input.focus_handle.is_focused(window);
-        let placeholder = (input.content.is_empty() && !input.placeholder.is_empty()).then(|| {
-            let first = if under_block { next_char_boundary(&input.placeholder, 0) } else { 0 };
-            let runs: Vec<TextRun> = [(first, bg), (input.placeholder.len() - first, hint)]
-                .into_iter()
-                .filter(|(len, _)| *len > 0)
-                .map(|(len, color)| TextRun { len, font: style.font(), color, background_color: None, underline: None, strikethrough: None })
-                .collect();
-            window.text_system().shape_line(input.placeholder.clone(), font_size, &runs, None)
-        });
+        let empty = input.content.is_empty() && !input.placeholder.is_empty();
+        let placeholder = empty.then(|| shape(input.placeholder.clone(), hint));
         let line = window.text_system().shape_line(shown.clone(), font_size, &runs, None);
 
         // Keep the cursor two cells clear of each edge, so the `…` marks
@@ -465,7 +458,7 @@ impl Element for TextElement {
         let origin_x = bounds.left() - scroll_x;
         let cursor_pos = line.x_for_index(cursor);
         let glyph_top = bounds.top() + px(m.glyph_top);
-        let (mut block, mut caret, mut selection) = (None, None, None);
+        let (mut block, mut caret, mut selection, mut reversed) = (None, None, None, None);
         if !selected_range.is_empty() {
             selection = Some(fill(
                 Bounds::from_corners(
@@ -478,6 +471,8 @@ impl Element for TextElement {
             let end = line.x_for_index(next_char_boundary(&shown, cursor));
             let width = if end > cursor_pos { end - cursor_pos } else { px(m.cell) };
             block = Some(fill(Bounds::new(point(origin_x + cursor_pos, glyph_top), size(width, px(m.glyph))), text));
+            reversed =
+                Some(if empty { (shape(input.placeholder.clone(), bg), bounds.origin) } else { (shape(shown.clone(), bg), point(origin_x, bounds.top())) });
         } else {
             // A bar's width clear of the glyph beside it: after the glyph
             // before it, or, at the start of an Insert line (where there is
@@ -503,7 +498,7 @@ impl Element for TextElement {
         let marks =
             marks.into_iter().map(|(x, w)| (fill(Bounds::new(point(x, bounds.top()), size(w, bounds.size.height)), bg), x, shape("…".into(), dim))).collect();
         self.input.update(cx, |input, _cx| input.scroll_x = scroll_x);
-        PrepaintState { line: Some(line), placeholder, block, caret, scroll_x, selection, marks }
+        PrepaintState { line: Some(line), placeholder, block, reversed, caret, scroll_x, selection, marks }
     }
 
     fn paint(
@@ -528,7 +523,7 @@ impl Element for TextElement {
         let line_height = window.line_height();
         // The line is scrolled, so keep everything inside the input's bounds.
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            for quad in [prepaint.selection.take(), block].into_iter().flatten() {
+            if let Some(quad) = prepaint.selection.take() {
                 window.paint_quad(quad);
             }
             if let Err(e) = line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx) {
@@ -538,6 +533,17 @@ impl Element for TextElement {
                 && let Err(e) = placeholder.paint(bounds.origin, line_height, gpui::TextAlign::Left, None, window, cx)
             {
                 tracing::debug!("input paint failed: {e}");
+            }
+            if let Some(block) = block {
+                let cell = block.bounds;
+                window.paint_quad(block);
+                if let Some((text, at)) = prepaint.reversed.take() {
+                    window.with_content_mask(Some(ContentMask { bounds: cell }), |window| {
+                        if let Err(e) = text.paint(at, line_height, gpui::TextAlign::Left, None, window, cx) {
+                            tracing::debug!("input paint failed: {e}");
+                        }
+                    });
+                }
             }
             for (quad, x, mark) in prepaint.marks.drain(..) {
                 window.paint_quad(quad);

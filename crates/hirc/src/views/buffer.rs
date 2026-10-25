@@ -3,14 +3,17 @@
 //!
 //! A message line is four columns on the monospace grid: the time, a nick
 //! column (nicks right-aligned against the text, irssi/weechat style), and
-//! the text, which wraps with a hanging indent on its own column. The nick
+//! the text, which wraps with a hanging indent on its own column. A nick
+//! too long for the column shows whole and pushes its own line's text on
+//! (irssi), so no one is ever known by a prefix; every other line keeps
+//! the shared column. In a narrow view the time column goes first. The nick
 //! column says what kind of line it is without relying on colour: a nick
 //! for a message, `-nick-` for a notice, `*` for an action, and a marker
-//! for events (`-->` joins, `<--` parts and quits, `--` the rest, `=!=`
+//! for events (`-->` joins, `<--` parts and quits, `<-x` kicks, `--` the rest, `=!=`
 //! errors).
 
 use crate::app::HircApp;
-use crate::metrics::{Metrics, TIME_CELLS};
+use crate::metrics::{Columns, Metrics};
 use crate::theme::Palette;
 use gpui::{AnyElement, FontWeight, HighlightStyle, Hsla, IntoElement, SharedString, StyledText, TextRun, Window, div, prelude::*, px};
 use hirc_core::display::{self, Part};
@@ -67,10 +70,10 @@ pub fn title(app: &HircApp, window: &Window, pane: f32) -> impl IntoElement {
                         None => vec![],
                     },
                 };
-                // Without a bold face the name leads by colour alone: the
-                // tag steps down to the topic's role.
-                let tag = if app.bold { p.text_dim } else { p.topic };
-                (target.name().unwrap_or_default().to_owned(), Some((net.name.clone(), tag)), state, topic)
+                // The tag in the window list's role whatever the font: with
+                // no bold face the name still leads by colour (primary
+                // against secondary), and spacing groups the tag with it.
+                (target.name().unwrap_or_default().to_owned(), Some((net.name.clone(), p.text_dim)), state, topic)
             }
         },
         None => ("No servers configured".to_owned(), None, vec![], app.hint().map(|h| (h.to_owned(), p.topic)).into_iter().collect()),
@@ -128,10 +131,14 @@ pub fn title(app: &HircApp, window: &Window, pane: f32) -> impl IntoElement {
     let left = left - state.as_ref().map_or(0., |(_, w)| w + field_gap);
     let rest = field(&rest, left - field_gap);
     let part = || div().flex_none().whitespace_nowrap().overflow_hidden();
+    // What is left of a line beside the message view, half above the
+    // text and half below, as the input bar takes it (see `viewport`).
+    let (above, below) = app.bar_extra;
     div()
         .flex()
         .px(px(m.gutter))
-        .py(px(m.bar_pad()))
+        .pt(px(m.bar_pad() + above))
+        .pb(px(m.bar_pad() + below))
         .bg(p.title_bg)
         .border_b_1()
         .border_color(p.border)
@@ -212,14 +219,19 @@ fn cut(s: &str, x: impl Fn(usize) -> f32, max: f32, ellipsis: f32) -> Option<usi
 
 /// A config that could not be used: a bar like the title bar, with the
 /// error marker message lines use (`=!=`), in the error role, and a quiet
-/// note on how to put it away (the server buffer keeps a copy).
+/// note on how to put it away (the server buffer keeps a copy). Its first
+/// line sits on the window list's first row (as the header's does without
+/// it), and it stays whole lines tall, so the header under it keeps the
+/// grid too.
 pub fn banner(app: &HircApp, message: String) -> impl IntoElement {
     let p = &app.palette;
     let m = &app.metrics;
+    let (above, _) = app.bar_extra;
     div()
         .flex()
         .px(px(m.gutter))
-        .py(px(m.bar_pad()))
+        .pt(px(m.bar_pad() + above))
+        .pb(px(m.bar_pad() - above))
         .bg(p.title_bg)
         .border_b_1()
         .border_color(p.border)
@@ -248,10 +260,8 @@ pub fn fit(s: &str, cells: usize) -> String {
 pub struct Context<'a> {
     /// Our nick on this network.
     pub me: Option<&'a str>,
-    /// Width of the nick column, in cells.
-    pub nick_cells: usize,
-    /// The channel, in a channel's buffer (join and part lines name it).
-    pub channel: Option<&'a str>,
+    /// The time and nick columns, in cells.
+    pub cols: Columns,
     /// Each nick's colour slot in this buffer (`theme::slots`).
     pub slots: &'a HashMap<String, usize>,
 }
@@ -294,39 +304,53 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
     let m = &app.metrics;
     let time = line.time.with_timezone(&chrono::Local).format("%H:%M").to_string();
     let nick = line.nick.as_deref().unwrap_or_default();
-    let cells = cx.nick_cells;
+    let cols = cx.cols;
     let own = line.own || cx.me.is_some_and(|me| me.eq_ignore_ascii_case(nick));
     let mention =
         !own && matches!(line.kind, LineKind::Privmsg | LineKind::Action | LineKind::Notice) && cx.me.is_some_and(|me| display::mentions(&line.text, me));
     let (mut prefix, mut body) = (Runs::default(), Runs::default());
-    // A nick cut to fit the column; the whole of it shows on hover.
+    // In a narrow view there is no time cell: a line that never went out
+    // says so before the nick.
+    if cols.time == 0 && line.delivery == Delivery::Unsent {
+        prefix.push("✕ ", p.error, false);
+    }
+    // A nick longer than the column shows whole, its line's text pushed
+    // on; only past what leaves that text room does it end in `…` (its
+    // whole shows on hover). `room` is what the nick has beside its
+    // marks; the column takes the nick's width plus `marks`.
+    let marks = prefix.text.chars().count();
     let mut cut = None;
-    let mut fit_nick = |cells: usize| {
-        let shown = fit(nick, cells);
+    let mut wide = cols.nick;
+    let mut fit_nick = |extra: usize| {
+        let room = cols.nick.saturating_sub(extra + marks).max(1);
+        let most = cols.nick_overflow().saturating_sub(extra + marks).max(1);
+        let shown = if nick.chars().count() <= room { nick.to_owned() } else { fit(nick, most) };
         if shown != nick {
             cut = Some(nick.to_owned());
         }
+        wide = wide.max(shown.chars().count() + extra + marks);
         shown
     };
+    // Ours, not yet echoed by the server: the text in the quiet role
+    // until it is confirmed (a notice's text is a step above it).
+    let pending = line.delivery != Delivery::Sent;
     match line.kind {
-        // Ours, not yet echoed by the server (or lost with the
-        // connection): the text a step down until it is confirmed.
         LineKind::Privmsg => {
-            nick_run(&mut prefix, p, &fit_nick(cells), nick, cx, mention);
-            body.push(&line.text, if line.delivery == Delivery::Sent { p.text } else { p.text_dim }, false);
+            nick_run(&mut prefix, p, &fit_nick(0), nick, cx, mention);
+            body.push(&line.text, if pending { p.quiet } else { p.text }, false);
         }
         // A notice: irssi's `-nick-`, the dashes in the event colour so
         // they read as a marker, and the text a step below conversation.
         LineKind::Notice if !nick.is_empty() => {
             prefix.push("-", p.server, false);
-            nick_run(&mut prefix, p, &fit_nick(cells.saturating_sub(2).max(1)), nick, cx, mention);
+            nick_run(&mut prefix, p, &fit_nick(2), nick, cx, mention);
             prefix.push("-", p.server, false);
             body.push(&line.text, p.text_dim, false);
         }
         LineKind::Action => {
             prefix.push("*", p.action, false);
             nick_run(&mut body, p, nick, nick, cx, mention);
-            let color = if line.delivery == Delivery::Sent { p.action } else { p.text_dim };
+            let color = if pending { p.quiet } else { p.action };
             body.push(" ", color, false).push(&line.text, color, false);
         }
         // The marker carries the error, as arrows carry joins; the
@@ -352,10 +376,12 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
             // colour, then the nicks (nick-coloured), then what someone
             // typed (a reason, a new topic, mode arguments) in
             // text.secondary, and last the client's own wording ("joined",
-            // "kicked", the channel) in the quietest legible role, so what
-            // changed always reads before how hirc says it.
+            // "kicked") in the quietest legible role, so what changed
+            // always reads before how hirc says it. A join or part is
+            // shown in its own channel's window, which the title names, so
+            // the line leaves the channel out.
             let (verb, free) = (p.quiet, p.text_dim);
-            match display::event_parts(kind, line.nick.as_deref(), &line.text, cx.channel) {
+            match display::event_parts(kind, line.nick.as_deref(), &line.text, None) {
                 Some(parts) => {
                     for (part, s) in parts {
                         match part {
@@ -370,11 +396,12 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
         }
     }
     // The time cell says where a line we sent stands until the server
-    // has it: `…` while it waits for the echo, `✕` once the connection
-    // dropped first (it may never have gone out).
+    // has it: an empty clock (`··:··`, the time it will show) while it
+    // waits for the echo, `✕` once the connection dropped first (it may
+    // never have gone out). `…` only ever means a cut.
     let (time, time_color) = match line.delivery {
         Delivery::Sent => (time, if mention { p.text_dim } else { p.timestamp }),
-        Delivery::Pending => ("…".to_owned(), p.timestamp),
+        Delivery::Pending => ("··:··".to_owned(), p.timestamp),
         Delivery::Unsent => ("✕".to_owned(), p.error),
     };
     // `w_full`: gpui's list measures each row as a root with a definite width,
@@ -387,8 +414,8 @@ pub fn line(app: &HircApp, line: &Line, cx: &Context) -> AnyElement {
         .min_w(px(0.))
         .px(px(m.gutter))
         .when(mention, |d| d.bg(p.highlight))
-        .child(div().flex_none().w(px(m.grid(TIME_CELLS))).whitespace_nowrap().text_color(time_color).child(time))
-        .child(nick_column(app, cells, prefix, cut.map(|full| (full, line.seq))))
+        .when(cols.time > 0, |d| d.child(div().flex_none().w(px(m.grid(cols.time))).whitespace_nowrap().text_color(time_color).child(time)))
+        .child(nick_column(app, cols, wide, prefix, cut.map(|full| (full, line.seq))))
         .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).child(body.element()))
         .into_any_element()
 }
@@ -402,12 +429,13 @@ pub fn with_marker(app: &HircApp, line: AnyElement) -> AnyElement {
     let p = &app.palette;
     let m = &app.metrics;
     let rule = div().flex_1().min_w(px(0.)).ml(px(m.cell)).h(px(m.line)).flex().items_center().child(div().w_full().h(px(1.)).bg(p.border));
+    let cols = app.cols();
     let marker = div()
         .flex()
         .w_full()
         .px(px(m.gutter))
-        .child(div().flex_none().w(px(m.grid(TIME_CELLS))))
-        .child(div().flex_none().flex().justify_end().w(px(m.grid(app.nick_cells()))).ml(px(m.cell)).text_color(p.unread).child("new"))
+        .when(cols.time > 0, |d| d.child(div().flex_none().w(px(m.grid(cols.time)))))
+        .child(div().flex_none().flex().justify_end().w(px(m.grid(cols.nick))).when(cols.time > 0, |d| d.ml(px(m.cell))).text_color(p.unread).child("new"))
         .child(rule);
     div().flex().flex_col().w_full().child(marker).child(line).into_any_element()
 }
@@ -418,12 +446,12 @@ pub fn with_marker(app: &HircApp, line: AnyElement) -> AnyElement {
 /// the window list's "more" rows use; `…` only ever means a cut), in the
 /// quiet role the scroll notes share, so the row says whose it is
 /// without reading as a new message.
-pub fn sticky(app: &HircApp, line: &Line, cells: usize) -> gpui::AnyElement {
+pub fn sticky(app: &HircApp, line: &Line, cols: Columns) -> gpui::AnyElement {
     let p = &app.palette;
     let m = &app.metrics;
     let time = line.time.with_timezone(&chrono::Local).format("%H:%M").to_string();
     let nick = line.nick.as_deref().unwrap_or_default();
-    let room = cells.saturating_sub(2).max(1);
+    let room = cols.nick.saturating_sub(2).max(1);
     let who = match line.kind {
         LineKind::Privmsg => fit(nick, room),
         LineKind::Notice if !nick.is_empty() => format!("-{}-", fit(nick, room.saturating_sub(2).max(1))),
@@ -437,17 +465,27 @@ pub fn sticky(app: &HircApp, line: &Line, cells: usize) -> gpui::AnyElement {
         .w_full()
         .px(px(m.gutter))
         .text_color(p.timestamp)
-        .child(div().flex_none().w(px(m.grid(TIME_CELLS))).whitespace_nowrap().child(time))
-        .child(nick_column(app, cells, prefix, None))
+        .when(cols.time > 0, |d| d.child(div().flex_none().w(px(m.grid(cols.time))).whitespace_nowrap().child(time)))
+        .child(nick_column(app, cols, cols.nick, prefix, None))
         .into_any_element()
 }
 
-/// The nick column, `cells` wide, nicks right-aligned against the text.
-/// `cut` is the whole of a nick the column shortened (and the line's
-/// seq, for a stable id): hovering the column shows it.
-fn nick_column(app: &HircApp, cells: usize, prefix: Runs, cut: Option<(String, u64)>) -> AnyElement {
+/// The nick column, `cells` wide (the column's own width, or more on a
+/// line whose nick overflows it), nicks right-aligned against the text,
+/// a space after the time column when there is one. `cut` is the whole
+/// of a nick shortened even so (and the line's seq, for a stable id):
+/// hovering the column shows it.
+fn nick_column(app: &HircApp, cols: Columns, cells: usize, prefix: Runs, cut: Option<(String, u64)>) -> AnyElement {
     let m = &app.metrics;
-    let column = div().flex_none().flex().justify_end().overflow_hidden().whitespace_nowrap().w(px(m.grid(cells))).ml(px(m.cell)).child(prefix.element());
+    let column = div()
+        .flex_none()
+        .flex()
+        .justify_end()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .w(px(m.grid(cells)))
+        .when(cols.time > 0, |d| d.ml(px(m.cell)))
+        .child(prefix.element());
     match cut {
         None => column.into_any_element(),
         Some((full, seq)) => {

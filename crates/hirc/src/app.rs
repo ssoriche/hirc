@@ -2,7 +2,7 @@
 //! apply them to the `Store` and redraw. Input goes back as `Command`s.
 
 use crate::input::{Submit, TextInput, VimEvent};
-use crate::metrics::{Metrics, Shape};
+use crate::metrics::{Columns, Metrics, Shape};
 use crate::scroll::{self, Pos};
 use crate::theme::{self, Palette, palette};
 use crate::views::{buffer, sidebar, viewport};
@@ -67,9 +67,6 @@ pub struct HircApp {
     font_family: Option<SharedString>,
     /// The configured font, for measuring text that must fit (the header).
     pub font: gpui::Font,
-    /// Whether the font has a bold face (Monaco has none): where it does
-    /// not, hierarchy that bold carries falls to colour alone.
-    pub bold: bool,
     /// Every spacing value, from the configured font.
     pub metrics: Metrics,
     /// The window list's scroll position; selection scrolls it into view.
@@ -85,13 +82,19 @@ pub struct HircApp {
     /// Each window's unsent line, kept while another window is shown.
     drafts: HashMap<(usize, usize), String>,
     lines: ListState,
-    /// The message view's nick column, in cells (sized to the buffer).
-    nick_cells: usize,
+    /// The message view's time and nick columns, in cells (sized to the
+    /// view).
+    cols: Columns,
     /// Wheel movement not yet a whole line.
     wheel: Rc<Cell<f32>>,
-    /// What is left of a line below the message view's whole lines, which
-    /// the input bar takes (see `viewport`), as the view last measured it.
-    spare: Rc<Cell<f32>>,
+    /// What is left of a line beside the message view's whole lines,
+    /// which the header and the input bar each take (see `viewport`), as
+    /// the view last measured it.
+    extra: Rc<Cell<f32>>,
+    /// That, split above and below a bar's text on whole device px, at
+    /// the last render: the window list starts the part above further
+    /// down, so its first row stays on the header's line.
+    pub bar_extra: (f32, f32),
     /// Each buffer's nick colour slots, and its line count when handed out.
     nick_slots: HashMap<(usize, usize), (usize, HashMap<String, usize>)>,
     /// Lines arrived below while the view was scrolled up.
@@ -132,12 +135,6 @@ impl HircApp {
         }
         let font_family: Option<SharedString> = init.font_family.map(Into::into);
         let font = font_for(window, font_family.clone());
-        // A family with no bold face resolves a bold request to its
-        // regular face.
-        let bold = {
-            let ts = window.text_system();
-            ts.resolve_font(&gpui::Font { weight: gpui::FontWeight::BOLD, ..font.clone() }) != ts.resolve_font(&font)
-        };
         let metrics = Metrics::new(init.font_size, measure(window, &font, init.font_size));
         // No config yet: say so once, quietly, where server notices go.
         let mut hint = init.hint;
@@ -199,7 +196,6 @@ impl HircApp {
             palette,
             font_family,
             font,
-            bold,
             metrics,
             sidebar_scroll: ScrollHandle::new(),
             sidebar_width: metrics.sidebar_width(f32::from(window.viewport_size().width)),
@@ -211,9 +207,10 @@ impl HircApp {
             // Measure every line, so scroll offsets and the count of lines
             // below the view are exact (lines are cached once measured).
             lines: ListState::new(0, ListAlignment::Bottom, px(400.)).measure_all(),
-            nick_cells: 0,
+            cols: Columns::default(),
             wheel: Rc::default(),
-            spare: Rc::default(),
+            extra: Rc::default(),
+            bar_extra: (0., 0.),
             nick_slots: HashMap::new(),
             fresh_below: false,
             pending_join: None,
@@ -322,7 +319,15 @@ impl HircApp {
             name.to_lowercase().contains(&want).then_some(row)
         })?;
         let count = self.window_count();
-        let (x, y) = sidebar::row_centre(&self.metrics, self.sidebar_width, self.sidebar_height, count, f32::from(self.sidebar_scroll.offset().y), row);
+        let (x, y) = sidebar::row_centre(
+            &self.metrics,
+            self.bar_extra.0,
+            self.sidebar_width,
+            self.sidebar_height,
+            count,
+            f32::from(self.sidebar_scroll.offset().y),
+            row,
+        );
         let view = self.sidebar_scroll.bounds();
         let visible = view.size.height <= px(0.) || (px(y - self.metrics.row / 2.) >= view.top() && px(y + self.metrics.row / 2.) <= view.bottom());
         Some(if visible { Ok((x, y)) } else { Err(format!("row {} is scrolled out of view", row + 1)) })
@@ -526,7 +531,8 @@ impl HircApp {
             }
             // A down network drops everything but /reconnect.
             Ok(Input::Send(_)) if status.is_down() => self.local_error(n, b, not_connected(&name, &status)),
-            Ok(Input::Send(Command::Part { channel, .. })) if !self.in_channel(n, &channel) => self.local_error(n, b, format!("Not joined to {channel}")),
+            // Nothing to leave: hirc's own answer, not a fault.
+            Ok(Input::Send(Command::Part { channel, .. })) if !self.in_channel(n, &channel) => self.local_note(n, b, format!("Not in {channel}")),
             Ok(Input::Send(Command::Join { channel, .. })) if self.in_channel(n, &channel) => {
                 let j = self.store.buffer_ix(n, &Target::Channel(channel));
                 self.select(n, j, cx);
@@ -561,13 +567,13 @@ impl HircApp {
     }
 
     /// The empty input's hint: where a line typed now will go, or, when it
-    /// can't go anywhere, why and the way out.
+    /// can't go anywhere, the way out (the header says why).
     fn placeholder(&self) -> String {
         let Some((net, buf)) = self.current() else { return String::new() };
         let connected = matches!(net.status, ConnStatus::Connected { .. });
         match &buf.target {
-            _ if net.status.is_down() => down(&net.name, &net.status),
-            Target::Channel(_) if connected && !buf.joined => "Not joined — /join to rejoin".to_owned(),
+            _ if net.status.is_down() => way_out(&net.status).to_owned(),
+            Target::Channel(_) if connected && !buf.joined => "/join to rejoin".to_owned(),
             Target::Server => format!("Command for {}", net.name),
             target => format!("Message {}", target.name().unwrap_or_default()),
         }
@@ -583,13 +589,12 @@ impl HircApp {
             return;
         }
         let me = self.store.networks[n].nick.as_deref();
-        let channel = buf.target.name();
         // The other people each line names, in order.
         let lines: Vec<Vec<String>> = buf
             .lines
             .iter()
             .map(|line| {
-                let named: Vec<String> = match display::event_parts(line.kind, line.nick.as_deref(), &line.text, channel) {
+                let named: Vec<String> = match display::event_parts(line.kind, line.nick.as_deref(), &line.text, None) {
                     Some(parts) => parts.into_iter().filter(|(part, _)| *part == display::Part::Nick).map(|(_, s)| s).collect(),
                     None => line.nick.iter().cloned().collect(),
                 };
@@ -600,9 +605,9 @@ impl HircApp {
         self.nick_slots.insert((n, b), (buf.lines.len(), slots));
     }
 
-    /// The message view's nick column, in cells.
-    pub fn nick_cells(&self) -> usize {
-        self.nick_cells
+    /// The message view's columns, in cells.
+    pub fn cols(&self) -> Columns {
+        self.cols
     }
 
     /// The note for the header when no server is configured.
@@ -615,10 +620,9 @@ impl HircApp {
         let slots = self.selected.and_then(|key| self.nick_slots.get(&key)).map(|(_, s)| s);
         let empty = HashMap::new();
         let slots = slots.unwrap_or(&empty);
-        match self.current().and_then(|(net, buf)| Some((net, buf, buf.lines.get(ix)?))) {
-            Some((net, buf, line)) => {
-                let channel = matches!(buf.target, Target::Channel(_)).then(|| buf.target.name()).flatten();
-                let line_el = buffer::line(self, line, &buffer::Context { me: net.nick.as_deref(), nick_cells: self.nick_cells, channel, slots });
+        match self.current().and_then(|(net, buf)| Some((net, buf.lines.get(ix)?))) {
+            Some((net, line)) => {
+                let line_el = buffer::line(self, line, &buffer::Context { me: net.nick.as_deref(), cols: self.cols, slots });
                 match self.marker {
                     Some((n, b, seq)) if self.selected == Some((n, b)) && line.seq == seq => buffer::with_marker(self, line_el),
                     _ => line_el,
@@ -636,11 +640,12 @@ impl Render for HircApp {
         let width = f32::from(window.viewport_size().width);
         self.sidebar_width = m.sidebar_width(width);
         self.sidebar_height = f32::from(window.viewport_size().height);
-        // The nick column follows the view's width; rows wrap against it,
-        // so a change means measuring them again.
-        let nick_cells = m.nick_cells(width - self.sidebar_width);
-        if nick_cells != self.nick_cells {
-            self.nick_cells = nick_cells;
+        self.bar_extra = viewport::halves(self.extra.get(), window.scale_factor());
+        // The time and nick columns follow the view's width; rows wrap
+        // against them, so a change means measuring them again.
+        let cols = m.columns(width - self.sidebar_width);
+        if cols != self.cols {
+            self.cols = cols;
             self.lines.remeasure();
         }
         let following = scroll::following(&self.lines);
@@ -648,7 +653,7 @@ impl Render for HircApp {
             self.fresh_below = false;
         }
         // The input types on the message text column, and names its target.
-        let column = m.text_column(nick_cells);
+        let column = m.text_column(cols);
         let placeholder = self.placeholder();
         self.input.update(cx, |input, _| {
             input.column = column;
@@ -662,7 +667,7 @@ impl Render for HircApp {
         let sticky = (!following)
             .then(|| self.cut_head())
             .flatten()
-            .and_then(|ix| self.current().and_then(|(_, buf)| buf.lines.get(ix)).map(|line| buffer::sticky(self, line, nick_cells)));
+            .and_then(|ix| self.current().and_then(|(_, buf)| buf.lines.get(ix)).map(|line| buffer::sticky(self, line, cols)));
         let lines = list(self.lines.clone(), cx.processor(|this, ix: usize, _window, _cx| this.line_element(ix))).size_full();
         let mut root = div().size_full();
         macro_rules! window_keys {
@@ -700,18 +705,17 @@ impl Render for HircApp {
                             .child(viewport::viewport(
                                 self.lines.clone(),
                                 lines.into_any_element(),
-                                viewport::Frame { line: m.line, pad: m.bar_pad(), spare: self.spare.clone() },
+                                viewport::Frame { line: m.line, pad: m.bar_pad(), scale: window.scale_factor(), extra: self.extra.clone() },
                                 self.wheel.clone(),
                                 sticky,
                                 more,
                             )),
                     )
-                    // The input bar takes what is left of a line under the
-                    // message view, split evenly about its text (on whole
-                    // device px), so the view is whole lines with the same
-                    // clear space above its oldest line and below its newest.
+                    // The input bar takes what the header does of what is
+                    // left of a line (see `viewport`), split evenly about
+                    // its text, so the two bars are always one height.
                     .child({
-                        let (above, below) = viewport::split(self.spare.get(), window.scale_factor());
+                        let (above, below) = self.bar_extra;
                         div()
                             .px(px(m.gutter))
                             .pt(px(m.bar_pad() + above))
@@ -735,20 +739,21 @@ fn font_for(window: &Window, family: Option<SharedString>) -> gpui::Font {
     style.font()
 }
 
-/// Why a line typed for network `name` was not sent, and the way out: the
-/// line stays in the input, so the placeholder that says it is hidden.
+/// Why a line typed for network `name` was not sent, in the words the
+/// header uses (offline for a quit, disconnected for a fault), and the
+/// way out: the line stays in the input, so the placeholder is hidden.
 fn not_connected(name: &str, status: &ConnStatus) -> String {
-    format!("Not sent — {}", down(name, status))
+    let state = if matches!(status, ConnStatus::Offline) { "offline" } else { "disconnected" };
+    format!("Not sent: {name} is {state} — {}", way_out(status))
 }
 
-/// The input's placeholder on a down network: its state, in the words the
-/// header uses (offline for a quit, disconnected for a fault), and the
-/// way out.
-fn down(name: &str, status: &ConnStatus) -> String {
+/// The way back on a down network: the input's placeholder (the header
+/// owns the state, the log the reason).
+fn way_out(status: &ConnStatus) -> &'static str {
     match status {
-        ConnStatus::Offline => format!("{name} is offline — /reconnect"),
-        ConnStatus::Disconnected { .. } => format!("{name} is disconnected — /reconnect to retry now"),
-        _ => format!("{name} is disconnected — /reconnect to try again"),
+        ConnStatus::Offline => "/reconnect to connect again",
+        ConnStatus::Disconnected { .. } => "/reconnect to retry now",
+        _ => "/reconnect to try again",
     }
 }
 

@@ -1,16 +1,18 @@
 //! The message view's frame: it gives the line list a height of whole text
-//! lines, so no row is ever cut, with `pad` clear above, under the title
-//! bar, and `pad` clear below, over the input bar, at every window height
-//! and font. What is left of a line does not fit the grid; it goes to the
-//! input bar (`spare`), which centres its text in it.
+//! lines, so no row is ever cut, at every window height and font.
 //!
-//! Why the input bar: the window list's first row shares the header's
-//! line, and its rows share the message rows' lines, so the header and
-//! everything above the newest message sit on one grid from the top of
-//! the window. Space left over can then only go below the view without
-//! moving some row off that grid; given to the header, it would part the
-//! header's line from the list's first row, and shared out above and
-//! below the view, it would part the list's rows from the messages'.
+//! What is left of a line (`extra`) is shared by the two bars that frame
+//! the view, so the header and the input bar are always the same height
+//! and centre their text: each takes `extra` (half above its text, half
+//! below), and the view gives back half of it at each end, so its clear
+//! space above the oldest line and below the newest stays equal. That is
+//! the one way to also keep the window list on the same grid: its first
+//! row on the header's line, and every row on a message row (the list
+//! starts half of `extra` further down, as the header's text does).
+//! `extra` is what is left of a line, or that less a line when more than
+//! half is left (one more line shows), so the bars stay within a quarter
+//! line of two lines tall, and the view's ends within a quarter line of
+//! `pad`.
 //!
 //! It turns the wheel into whole-line steps on the same grid as the vim
 //! keys. An optional `sticky` row is drawn over the list's top row, and an
@@ -36,13 +38,14 @@ pub struct Viewport {
 }
 
 /// The grid the view keeps: `line` px lines with `pad` px clear above and
-/// below, and `spare`, what is left of a line, which the input bar takes:
-/// the view sets it from its height (with what the bar took last), and
-/// asks for a redraw when it changes.
+/// below, less what the bars take of `extra` (see the module docs): the
+/// view sets `extra` from its height (with what the bars took last), and
+/// asks for a redraw when it changes. `scale` is device px a logical px.
 pub struct Frame {
     pub line: f32,
     pub pad: f32,
-    pub spare: Rc<Cell<f32>>,
+    pub scale: f32,
+    pub extra: Rc<Cell<f32>>,
 }
 
 /// `child` is the list drawn from `list`; it must fill its parent
@@ -52,20 +55,30 @@ pub fn viewport(list: ListState, child: AnyElement, frame: Frame, wheel: Rc<Cell
     Viewport { list, child, frame, wheel, sticky, footer }
 }
 
-/// Clear space above and below `lines` whole lines in `height`: `pad`
-/// above, always, and `pad` plus what is left of a line below (none,
-/// once the input bar has taken it).
-pub fn margins(height: f32, line: f32, pad: f32) -> (usize, f32, f32) {
-    let (lines, spare) = scroll::whole_lines(height - 2. * pad, line);
-    (lines, pad, pad + spare)
+/// What the bars share for a view that would be `base` tall if they took
+/// none: what is left of a line once `pad` clears each end, or that less
+/// a line when more than half a line is left.
+pub fn extra(base: f32, line: f32, pad: f32) -> f32 {
+    let spare = scroll::whole_lines(base - 2. * pad, line).1;
+    if 2. * spare <= line { spare } else { spare - line }
 }
 
-/// `spare` split into what goes above and below a bar's text: halves, on
+/// `extra` split into what goes above and below a bar's text: halves, on
 /// whole device px (`scale` px a logical px), any odd px below.
-pub fn split(spare: f32, scale: f32) -> (f32, f32) {
+pub fn halves(extra: f32, scale: f32) -> (f32, f32) {
     let scale = if scale > 0. { scale } else { 1. };
-    let above = (spare * scale / 2.).floor() / scale;
-    (above, spare - above)
+    let above = (extra * scale / 2.).floor() / scale;
+    (above, extra - above)
+}
+
+/// Whole lines in a view `height` tall once the bars have `extra`, and the
+/// clear space above them: `pad`, less what the header took below its
+/// text (and below them, `pad` less what the input bar took above its
+/// text), so the oldest line sits on the window list's grid.
+pub fn margins(height: f32, line: f32, pad: f32, extra: f32, scale: f32) -> (usize, f32) {
+    let (above, below) = halves(extra, scale);
+    let top = pad - below;
+    (scroll::whole_lines(height - top - (pad - above), line).0, top)
 }
 
 impl IntoElement for Viewport {
@@ -104,16 +117,16 @@ impl Element for Viewport {
         window: &mut Window,
         cx: &mut App,
     ) -> Hitbox {
-        let (line, pad) = (self.frame.line, self.frame.pad);
+        let (line, pad, scale) = (self.frame.line, self.frame.pad, self.frame.scale);
         let height = f32::from(bounds.size.height);
-        // With what the input bar takes back, the view and the bar's share
-        // stay the same height, so this settles in one frame.
-        let spare = scroll::whole_lines(height + self.frame.spare.get() - 2. * pad, line).1;
-        if (spare - self.frame.spare.get()).abs() > 0.01 {
-            self.frame.spare.set(spare);
+        // With what the bars take back, the view and the bars' share stay
+        // the same height, so this settles in one frame.
+        let extra = extra(height + 2. * self.frame.extra.get(), line, pad);
+        if (extra - self.frame.extra.get()).abs() > 0.01 {
+            self.frame.extra.set(extra);
             cx.notify(window.current_view());
         }
-        let (lines, above, _) = margins(height, line, pad);
+        let (lines, above) = margins(height, line, pad, self.frame.extra.get(), scale);
         let rows = lines.saturating_sub(usize::from(self.footer.is_some()));
         let height = px(rows as f32 * line);
         let available = size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::Definite(height));
@@ -174,32 +187,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_top_margin_never_changes_and_the_rest_goes_below() {
-        // 3 px over 10 whole lines of 21: all of it below.
-        assert_eq!(margins(10. * 21. + 20. + 3., 21., 10.), (10, 10., 13.));
-        // An exact fit leaves just the pad.
-        assert_eq!(margins(10. * 21. + 20., 21., 10.), (10, 10., 10.));
-        // Every height: the pad above, and less than a line more below.
-        for h in 300..400 {
-            let (_, above, below) = margins(h as f32, 21., 10.);
-            assert!(above == 10. && (10. ..31.).contains(&below), "{h}");
-        }
+    fn the_bars_share_what_is_left_and_stay_one_height() {
+        // 3 px over whole lines: each bar takes 3, the view gives back 1.5
+        // at each end.
+        assert_eq!(extra(10. * 21. + 20. + 3., 21., 10.), 3.);
+        // An exact fit: nothing.
+        assert_eq!(extra(10. * 21. + 20., 21., 10.), 0.);
+        // More than half a line left: one more line, and the bars give.
+        assert_eq!(extra(10. * 21. + 20. + 19., 21., 10.), -2.);
+        // Halves on whole device px; an odd one goes below.
+        assert_eq!(halves(3., 2.), (1.5, 1.5));
+        assert_eq!(halves(3., 1.), (1., 2.));
+        assert_eq!(halves(-3., 1.), (-2., -1.));
+        assert_eq!(halves(0., 2.), (0., 0.));
     }
 
     #[test]
-    fn the_input_bar_takes_the_spare_and_the_view_is_whole_lines() {
-        // Whatever the height, once the bar has taken what is left of a
-        // line, the view is whole lines with `pad` above and below.
-        for h in 300..400 {
+    fn every_height_keeps_the_grid_and_equal_ends() {
+        let (line, pad, bar) = (21., 10., 42.);
+        for h in 300..500 {
+            // The window: header and input bar (two lines, plus `extra`
+            // each) around the view.
             let total = h as f32;
-            let spare = scroll::whole_lines(total - 20., 21.).1;
-            let (_, above, below) = margins(total - spare, 21., 10.);
-            assert_eq!((above, below), (10., 10.), "{h}");
+            let e = extra(total - 2. * bar, line, pad);
+            assert!(e.abs() <= line / 2., "{h}: {e}");
+            let view = total - 2. * (bar + e);
+            let (lines, top) = margins(view, line, pad, e, 2.);
+            let bottom = view - top - lines as f32 * line;
+            // Equal clear space at both ends, a quarter line from `pad`.
+            assert!((top - bottom).abs() < 1e-3 && (top - pad).abs() <= line / 4. + 1e-3, "{h}: {top} {bottom}");
+            // The header's text (`pad` plus half of `e` down) and the first
+            // message line sit on one grid: the window list's.
+            let (above, _) = halves(e, 2.);
+            let first = bar + e + top;
+            let grid = pad + above;
+            let k = (first - grid) / line;
+            assert!((k - k.round()).abs() < 1e-3, "{h}: {first} vs {grid}");
         }
-        // Halves on whole device px; an odd one goes below.
-        assert_eq!(split(3., 2.), (1.5, 1.5));
-        assert_eq!(split(3., 1.), (1., 2.));
-        assert_eq!(split(19., 2.), (9.5, 9.5));
-        assert_eq!(split(0., 2.), (0., 0.));
     }
 }

@@ -36,6 +36,11 @@ const LINE: f32 = 1.5;
 /// The window list's width in cells, and its limits.
 const SIDEBAR_CELLS: f32 = 26.;
 const SIDEBAR_MIN_CELLS: f32 = 16.;
+/// The list's width that keeps network tags at their floor beside a
+/// label's minimum (`LABEL_MIN_CELLS` + `TAG_MIN_CELLS`, the number,
+/// count and gaps): in a narrow window the messages give up their time
+/// column and narrow their nicks before the list loses its tags.
+const SIDEBAR_TAGS_CELLS: f32 = 21.;
 /// The most of the window the list may take.
 const SIDEBAR_MAX_SHARE: f32 = 0.3;
 /// Cells the message view keeps before the list takes more than its
@@ -55,9 +60,17 @@ const NICK_MAX_CELLS: usize = 12;
 /// The nick column never takes more than this share of the message view.
 const NICK_MAX_SHARE: f32 = 0.2;
 /// Cells the text keeps before the nick column gives up its own, down to
-/// `NICK_NARROW_CELLS` (most nicks still fit; longer ones end in `…`).
+/// `NICK_NARROW_CELLS` (most nicks still fit; longer ones overflow).
 const TEXT_MIN_CELLS: usize = 40;
 const NICK_NARROW_CELLS: usize = 8;
+/// With the time column gone, the nick column's own floor.
+const NICK_COMPACT_CELLS: usize = 6;
+/// The least the messages keep in a narrow window before the list gives
+/// up its tags: no time, narrow nicks and `TEXT_MIN_CELLS` of text.
+const MESSAGE_MIN_CELLS: f32 = (NICK_NARROW_CELLS + 1 + TEXT_MIN_CELLS) as f32;
+/// The text a line keeps beside a nick too long for the column: such a
+/// nick shows whole and pushes its own line's text on, up to this.
+const OVERFLOW_TEXT_CELLS: usize = 16;
 
 /// A label always keeps at least this many cells before tags give way.
 const LABEL_MIN_CELLS: f32 = 6.;
@@ -109,11 +122,12 @@ impl Metrics {
         }
     }
 
-    /// Where a message's text starts, from the pane's gutter: the time,
-    /// a space, a nick column `nick_cells` wide, a space. The input line's
-    /// text starts here too, so what is typed lines up with what is said.
-    pub fn text_column(&self, nick_cells: usize) -> f32 {
-        self.grid(TIME_CELLS + 1 + nick_cells + 1)
+    /// Where a message's text starts, from the pane's gutter: the time
+    /// and a space (when shown), the nick column, a space. The input
+    /// line's text starts here too, so what is typed lines up with what is
+    /// said.
+    pub fn text_column(&self, cols: Columns) -> f32 {
+        self.grid(cols.lead() + cols.nick + 1)
     }
 
     /// Width of `n` digit cells, rounded up to a whole px.
@@ -132,10 +146,15 @@ impl Metrics {
     /// number of cells, but never more than a share of the window, and in
     /// a narrow window no more than leaves the messages `MESSAGE_CELLS`
     /// (nor fewer than a usable minimum): the conversation gives way last.
+    ///
+    /// Its floor keeps the network tags (`SIDEBAR_TAGS_CELLS`) while the
+    /// messages can still keep their own least (`MESSAGE_MIN_CELLS`, no
+    /// time column): network identity is the last thing to go.
     pub fn sidebar_width(&self, window_width: f32) -> f32 {
         let width = |cells| self.cells(cells) + 2. * self.gutter;
         let room = (window_width * SIDEBAR_MAX_SHARE).min(window_width - width(MESSAGE_CELLS)).floor();
-        width(SIDEBAR_CELLS).min(room.max(width(SIDEBAR_MIN_CELLS)))
+        let floor = width(SIDEBAR_MIN_CELLS).max(width(SIDEBAR_TAGS_CELLS).min((window_width - width(MESSAGE_MIN_CELLS)).floor()));
+        width(SIDEBAR_CELLS).min(room.max(floor))
     }
 
     /// Width of the window-number column for `windows` windows: as many
@@ -165,22 +184,53 @@ impl Metrics {
         self.cell * n as f32
     }
 
-    /// Cells in the message view's nick column for a view `view_width`
-    /// wide. The same in every buffer (longer nicks end in an ellipsis), so
-    /// the text column and the input line never move when you switch
-    /// windows; narrower in a narrow window, where the text keeps
-    /// `TEXT_MIN_CELLS` while the nicks can give way (to
-    /// `NICK_NARROW_CELLS`), and never more than a share of the view.
-    pub fn nick_cells(&self, view_width: f32) -> usize {
+    /// The message view's columns for a view `view_width` wide. The same
+    /// in every buffer (a longer nick shows whole on its own line and
+    /// pushes that line's text on), so the text column and the input line
+    /// never move when you switch windows. As the view narrows, the nick
+    /// column gives way first (to `NICK_NARROW_CELLS`) so the text keeps
+    /// `TEXT_MIN_CELLS`, then the time column goes, then the nicks narrow
+    /// to `NICK_COMPACT_CELLS`; the nicks never take more than a share of
+    /// the view.
+    pub fn columns(&self, view_width: f32) -> Columns {
         let share = ((view_width * NICK_MAX_SHARE) / self.cell).floor() as usize;
         let cells = ((view_width - 2. * self.gutter) / self.cell).floor().max(0.) as usize;
-        let room = cells.saturating_sub(TIME_CELLS + 2 + TEXT_MIN_CELLS);
-        NICK_MAX_CELLS.min(room.max(NICK_NARROW_CELLS)).min(share.max(NICK_MIN_CELLS))
+        let time = if cells >= TIME_CELLS + 1 + NICK_NARROW_CELLS + 1 + TEXT_MIN_CELLS { TIME_CELLS } else { 0 };
+        let lead = if time > 0 { time + 1 } else { 0 };
+        let room = cells.saturating_sub(lead + 1 + TEXT_MIN_CELLS);
+        let (floor, most) = if time > 0 { (NICK_NARROW_CELLS, NICK_MAX_CELLS) } else { (NICK_COMPACT_CELLS, NICK_NARROW_CELLS) };
+        let nick = most.min(room.max(floor)).min(share.max(NICK_MIN_CELLS));
+        Columns { time, nick, view: cells }
     }
 
     /// The least a row label keeps when space runs out.
     pub fn label_min(&self) -> f32 {
         self.cells(LABEL_MIN_CELLS)
+    }
+}
+
+/// The message view's columns, in cells (see `Metrics::columns`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Columns {
+    /// The time column: `TIME_CELLS`, or 0 in a narrow view.
+    pub time: usize,
+    /// The nick column.
+    pub nick: usize,
+    /// The whole view, inside its gutters.
+    pub view: usize,
+}
+
+impl Columns {
+    /// Cells before the nick column: the time and its space, if shown.
+    pub fn lead(&self) -> usize {
+        if self.time > 0 { self.time + 1 } else { 0 }
+    }
+
+    /// The most a nick too long for the column may take on its own line,
+    /// shown whole, before it too ends in `…`: what leaves the line's text
+    /// `OVERFLOW_TEXT_CELLS`.
+    pub fn nick_overflow(&self) -> usize {
+        self.view.saturating_sub(self.lead() + 1 + OVERFLOW_TEXT_CELLS).max(self.nick)
     }
 }
 
@@ -248,7 +298,13 @@ mod tests {
         assert_eq!(m.sidebar_width(900.), full);
         // Narrow: the share, unless the messages would get too few cells.
         assert_eq!(m.sidebar_width(760.), 228.);
-        assert_eq!(m.sidebar_width(640.), m.cells(SIDEBAR_MIN_CELLS) + 2. * m.gutter);
+        // Narrower: the floor that keeps the tags, while the messages can
+        // keep their own least.
+        let tags = m.cells(SIDEBAR_TAGS_CELLS) + 2. * m.gutter;
+        assert_eq!(m.sidebar_width(640.), tags);
+        assert_eq!(m.sidebar_width(700.), tags);
+        let view = 640. - tags;
+        assert!(((view - 2. * m.gutter) / m.cell).floor() >= MESSAGE_MIN_CELLS);
         // Never below the minimum, however narrow the window.
         assert_eq!(m.sidebar_width(200.), m.cells(SIDEBAR_MIN_CELLS) + 2. * m.gutter);
     }
@@ -271,20 +327,38 @@ mod tests {
     }
 
     #[test]
-    fn nick_column_fits_within_limits() {
+    fn message_columns_give_way_in_order() {
         let m = menlo(14.);
-        assert_eq!(m.nick_cells(1000.), NICK_MAX_CELLS);
+        let at = |w: f32| m.columns(w);
+        assert_eq!((at(1000.).time, at(1000.).nick), (TIME_CELLS, NICK_MAX_CELLS));
+        assert_eq!(at(657.).nick, NICK_MAX_CELLS);
+        // Narrower: the nicks give way so the text keeps about 40 cells,
+        // but no further than 8, with the time still shown.
+        let narrow = at(495.);
+        assert_eq!((narrow.time, narrow.nick), (TIME_CELLS, NICK_NARROW_CELLS));
+        // The review's 640 window (a 439px view): the time goes, the nicks
+        // keep 8, and the text 40.
+        let small = at(640. - m.sidebar_width(640.));
+        assert_eq!((small.time, small.nick), (0, NICK_NARROW_CELLS));
+        assert!(small.view - small.lead() - small.nick > TEXT_MIN_CELLS, "{small:?}");
+        // Narrower still: the nicks go down to their compact floor.
+        let tight = at(400.);
+        assert_eq!((tight.time, tight.nick), (0, NICK_COMPACT_CELLS));
         // A very narrow view gives the nick at most a fifth of its width.
-        assert_eq!(m.nick_cells(200.), (200. * NICK_MAX_SHARE / m.cell) as usize);
-        assert_eq!(m.nick_cells(10.), NICK_MIN_CELLS);
-        // The review's 640 window (a 481px view): the nicks give way so
-        // the text keeps about 40 cells, but no further than 8.
-        let narrow = m.nick_cells(481.);
-        assert_eq!(narrow, NICK_NARROW_CELLS);
-        let text = ((481. - 2. * m.gutter) / m.cell).floor() as usize - TIME_CELLS - 2 - narrow;
-        assert!(text >= TEXT_MIN_CELLS - 1, "{text}");
-        // Room to spare: the full column.
-        assert_eq!(m.nick_cells(657.), NICK_MAX_CELLS);
+        assert_eq!(at(200.).nick, (200. * NICK_MAX_SHARE / m.cell) as usize);
+        assert_eq!(at(10.).nick, NICK_MIN_CELLS);
+    }
+
+    #[test]
+    fn a_long_nick_may_overflow_its_column_but_leaves_the_text_room() {
+        let m = menlo(14.);
+        let wide = m.columns(957.);
+        assert!(wide.nick_overflow() >= 32 && wide.view - wide.lead() - wide.nick_overflow() > OVERFLOW_TEXT_CELLS);
+        // At 640 an IRC nick of 32 still shows whole.
+        assert!(m.columns(640. - m.sidebar_width(640.)).nick_overflow() >= 31);
+        // Never less than the column itself.
+        let tiny = m.columns(100.);
+        assert_eq!(tiny.nick_overflow(), tiny.nick);
     }
 
     #[test]
@@ -317,7 +391,9 @@ mod tests {
     fn input_text_starts_on_the_message_text_column() {
         let m = menlo(14.);
         let buffer = m.grid(TIME_CELLS) + m.cell + m.grid(7) + m.cell;
-        assert!((m.text_column(7) - buffer).abs() < 1e-3);
+        assert!((m.text_column(Columns { time: TIME_CELLS, nick: 7, view: 80 }) - buffer).abs() < 1e-3);
+        // Without the time column, the nicks start on the gutter.
+        assert!((m.text_column(Columns { time: 0, nick: 8, view: 49 }) - m.grid(9)).abs() < 1e-3);
     }
 
     #[test]
