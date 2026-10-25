@@ -4,10 +4,11 @@
 //! A message line is four columns on the monospace grid: the time, a nick
 //! column (nicks right-aligned against the text, irssi/weechat style), and
 //! the text, which wraps with a hanging indent on its own column (breaking
-//! by `wrap`, so punctuation stays with its word). A buffer's nick column
-//! is as wide as its longest nick (weechat), up to a most; a longer nick
-//! ends in `…` (its whole shows on hover), so the text column is one edge
-//! for every line. In a narrow view the time column goes first. The nick
+//! by `wrap`, so punctuation stays with its word). The nick column is one
+//! width in every buffer (it follows the view alone), so the text column
+//! and the input never move when you switch windows; a longer nick ends
+//! in `…` (its whole shows on hover), so the text column is one edge for
+//! every line. In a narrow view the time column goes first. The nick
 //! column says what kind of line it is without relying on colour: a nick
 //! for a message, `-nick-` for a notice, `*` for an action, and a marker
 //! for events (`-->` joins, `<--` parts and quits, `<-x` kicks, `--` the rest, `=!=`

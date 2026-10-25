@@ -61,7 +61,7 @@ const NICK_MAX_CELLS: usize = 12;
 /// The nick column never takes more than this share of the message view.
 const NICK_MAX_SHARE: f32 = 0.2;
 /// Cells the text keeps before the nick column gives up its own, down to
-/// `NICK_NARROW_CELLS` (most nicks still fit; longer ones overflow).
+/// `NICK_NARROW_CELLS` (most nicks still fit; longer ones end in `…`).
 const TEXT_MIN_CELLS: usize = 40;
 const NICK_NARROW_CELLS: usize = 8;
 /// With the time column gone, the nick column's own floor.
@@ -69,9 +69,6 @@ const NICK_COMPACT_CELLS: usize = 6;
 /// The least the messages keep in a narrow window before the list gives
 /// up its tags: no time, narrow nicks and `TEXT_MIN_CELLS` of text.
 const MESSAGE_MIN_CELLS: f32 = (NICK_NARROW_CELLS + 1 + TEXT_MIN_CELLS) as f32;
-/// The input's mode label (`INSERT`, `NORMAL`) sits where nicks do, so
-/// the time and nick columns together never take fewer cells.
-const MODE_LABEL_CELLS: usize = 6;
 
 /// A label always keeps at least this many cells before tags give way.
 const LABEL_MIN_CELLS: f32 = 6.;
@@ -185,8 +182,9 @@ impl Metrics {
         self.cell * n as f32
     }
 
-    /// The message view's columns for a view `view_width` wide (a buffer
-    /// then narrows its nicks to its own, `Columns::fit`). As the view narrows, the nick
+    /// The message view's columns for a view `view_width` wide. The same
+    /// in every buffer (a longer nick ends in `…`), so the text column and
+    /// the input line never move when you switch windows. As the view narrows, the nick
     /// column gives way first (to `NICK_NARROW_CELLS`) so the text keeps
     /// `TEXT_MIN_CELLS`, then the time column goes, then the nicks narrow
     /// to `NICK_COMPACT_CELLS`; the nicks never take more than a share of
@@ -223,17 +221,6 @@ impl Columns {
     /// Cells before the nick column: the time and its space, if shown.
     pub fn lead(&self) -> usize {
         if self.time > 0 { self.time + 1 } else { 0 }
-    }
-
-    /// The columns for a buffer whose nick column needs `widest` cells
-    /// (its longest nick, notice or marker, and our own nick): as narrow
-    /// as that, so text sits tight to the time as in weechat, but never
-    /// wider than the view allows (a longer nick ends in `…`), and wide
-    /// enough for the input's mode label. The text column is then one
-    /// edge for every line of the buffer.
-    pub fn fit(self, widest: usize) -> Columns {
-        let floor = NICK_MIN_CELLS.max(MODE_LABEL_CELLS.saturating_sub(self.lead()));
-        Columns { nick: widest.max(floor).min(self.nick), ..self }
     }
 }
 
@@ -353,19 +340,13 @@ mod tests {
     }
 
     #[test]
-    fn a_buffer_sizes_its_nick_column_to_its_nicks() {
+    fn every_buffer_shares_one_nick_column() {
         let m = menlo(14.);
-        let wide = m.columns(957.);
-        // A query of `carol` and `me`: five cells, tight to the time.
-        assert_eq!(wide.fit(5).nick, 5);
-        // A long nick: the view's most, no more (it ends in `…`).
-        assert_eq!(wide.fit(22).nick, NICK_MAX_CELLS);
-        // Never below the fewest, nor too narrow for the mode label.
-        assert_eq!(wide.fit(1).nick, NICK_MIN_CELLS);
-        let compact = m.columns(400.);
-        assert_eq!(compact.time, 0);
-        assert_eq!(compact.fit(2).nick, MODE_LABEL_CELLS);
-        assert!(compact.lead() + compact.fit(2).nick >= MODE_LABEL_CELLS);
+        // The columns depend on the view alone: one width whatever a
+        // buffer's nicks, and the time and nicks hold `INSERT` at 640.
+        assert_eq!(m.columns(957.).nick, NICK_MAX_CELLS);
+        let small = m.columns(640. - m.sidebar_width(640.));
+        assert!(small.lead() + small.nick >= "INSERT".len(), "{small:?}");
     }
 
     #[test]

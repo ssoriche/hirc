@@ -83,14 +83,11 @@ pub struct HircApp {
     drafts: HashMap<(usize, usize), String>,
     lines: ListState,
     /// The message view's time and nick columns, in cells (sized to the
-    /// view, the nicks to the selected buffer's).
+    /// view, the same in every buffer).
     cols: Columns,
     /// The message view's width at the last render: text is broken onto
     /// lines against it (see `wrap`).
     pane: f32,
-    /// Each buffer's widest nick column entry (see `widest_nick`), and its
-    /// line count when measured.
-    nick_widths: HashMap<(usize, usize), (usize, usize)>,
     /// Wheel movement not yet a whole line.
     wheel: Rc<Cell<f32>>,
     /// What is left of a line beside the message view's whole lines,
@@ -215,7 +212,6 @@ impl HircApp {
             lines: ListState::new(0, ListAlignment::Bottom, px(400.)).measure_all(),
             cols: Columns::default(),
             pane: 0.,
-            nick_widths: HashMap::new(),
             wheel: Rc::default(),
             extra: Rc::default(),
             bar_extra: (0., 0.),
@@ -639,35 +635,6 @@ impl HircApp {
         self.pane
     }
 
-    /// Cells the selected buffer's nick column needs: its longest nick,
-    /// `-notice-` or event marker, and our own nick (which any line we
-    /// send will show).
-    fn widest_nick(&mut self) -> usize {
-        let Some((n, b)) = self.selected else { return 0 };
-        let Some(net) = self.store.networks.get(n) else { return 0 };
-        let Some(buf) = net.buffers.get(b) else { return 0 };
-        if let Some((len, widest)) = self.nick_widths.get(&(n, b))
-            && *len == buf.lines.len()
-        {
-            return *widest;
-        }
-        let cells = |s: &str| s.chars().count();
-        let widest = buf
-            .lines
-            .iter()
-            .map(|line| match (line.kind, line.nick.as_deref()) {
-                (LineKind::Privmsg, Some(nick)) => cells(nick),
-                (LineKind::Notice, Some(nick)) if !nick.is_empty() => cells(nick) + 2,
-                (LineKind::Action, _) => 1,
-                (kind, _) => cells(display::marker(kind)),
-            })
-            .chain(net.nick.as_deref().map(cells))
-            .max()
-            .unwrap_or(0);
-        self.nick_widths.insert((n, b), (buf.lines.len(), widest));
-        widest
-    }
-
     /// The note for the header when no server is configured.
     pub fn hint(&self) -> Option<&str> {
         self.hint.as_deref()
@@ -703,11 +670,12 @@ impl Render for HircApp {
         self.sidebar_width = m.sidebar_width(width);
         self.sidebar_height = f32::from(window.viewport_size().height);
         self.bar_extra = viewport::halves(self.extra.get(), window.scale_factor());
-        // The time and nick columns follow the view's width and the
-        // buffer's nicks; rows wrap against them and the width, so a
-        // change means measuring them again.
+        // The time and nick columns follow the view's width alone, so the
+        // text column and the input line never move when you switch
+        // windows; rows wrap against them and the width, so a change
+        // means measuring them again.
         let pane = width - self.sidebar_width;
-        let cols = m.columns(pane).fit(self.widest_nick());
+        let cols = m.columns(pane);
         if cols != self.cols || pane != self.pane {
             self.cols = cols;
             self.pane = pane;
