@@ -15,12 +15,20 @@ pub fn is_bridge(bridges: &[String], nick: &str) -> bool {
     bridges.iter().any(|b| b.eq_ignore_ascii_case(nick))
 }
 
+/// IRC formatting toggles that take no argument: bold, reset, monospace,
+/// reverse, italics, strikethrough and underline.
+const FORMAT_TOGGLES: [char; 7] = ['\x02', '\x0f', '\x11', '\x16', '\x1d', '\x1e', '\x1f'];
+
 /// A bridge's line `text` as the relayed person's: `<name> rest` is a
 /// message from `name`, `* name rest` an action. `None` for anything else
-/// (the bot's own words, a malformed prefix), which stays the bot's.
+/// (the bot's own words, a malformed prefix), which stays the bot's. Many
+/// bridges bold or colour the name (`\x02<name>\x02`, `<\x0312name\x03>`),
+/// so formatting codes around and inside the name are ignored.
 pub fn unwrap(text: &str) -> Option<(LineKind, String, &str)> {
+    let text = skip_formatting(text);
     if let Some(after) = text.strip_prefix('<') {
         let (name, rest) = after.split_once('>')?;
+        let rest = skip_formatting(rest);
         let rest = if rest.is_empty() { rest } else { rest.strip_prefix(' ')? };
         let name = clean(name).filter(|n| !n.contains('<'))?;
         return Some((LineKind::Privmsg, name, rest));
@@ -30,10 +38,59 @@ pub fn unwrap(text: &str) -> Option<(LineKind, String, &str)> {
     Some((LineKind::Action, clean(name)?, rest))
 }
 
-/// `name` without its zero-width characters, if anything nameable is left.
+/// `name` without its zero-width characters and formatting codes, if
+/// anything nameable is left.
 fn clean(name: &str) -> Option<String> {
-    let name: String = name.chars().filter(|c| !ZERO_WIDTH.contains(c)).collect();
+    let name: String = strip_formatting(name).chars().filter(|c| !ZERO_WIDTH.contains(c)).collect();
     (!name.is_empty() && !name.contains(char::is_whitespace)).then_some(name)
+}
+
+/// The byte length of the formatting code at the start of `s`, if any: a
+/// toggle, or `\x03` with an optional `NN[,NN]` colour pair.
+fn code_len(s: &str) -> Option<usize> {
+    let mut chars = s.chars();
+    match chars.next()? {
+        c if FORMAT_TOGGLES.contains(&c) => Some(1),
+        '\x03' => {
+            let b = s.as_bytes();
+            let digits = |from: usize| b[from..].iter().take(2).take_while(|d| d.is_ascii_digit()).count();
+            let mut len = 1;
+            let fg = digits(len);
+            len += fg;
+            if fg > 0 && b.get(len) == Some(&b',') {
+                let bg = digits(len + 1);
+                if bg > 0 {
+                    len += 1 + bg;
+                }
+            }
+            Some(len)
+        }
+        _ => None,
+    }
+}
+
+/// `s` past any formatting codes at its start.
+fn skip_formatting(mut s: &str) -> &str {
+    while let Some(len) = code_len(s) {
+        s = &s[len..];
+    }
+    s
+}
+
+/// `s` with every formatting code removed.
+fn strip_formatting(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        match code_len(rest) {
+            Some(len) => rest = &rest[len..],
+            None => {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -66,6 +123,35 @@ mod tests {
         {
             assert_eq!(unwrap(text), None, "{text:?}");
         }
+    }
+
+    #[test]
+    fn a_formatted_name_still_unwraps() {
+        for text in [
+            "<\x02hacker\x02> hi",
+            "<\x0312hacker\x03> hi",
+            "\x02<hacker>\x02 hi",
+            "<\x034,12hacker\x0f> hi",
+            "<\x1d\x1fha\x16ck\x11er\x1e\x1f> hi",
+            "\x0307<ha\u{200B}cker>\x03 hi",
+        ] {
+            assert_eq!(unwrap(text), Some((LineKind::Privmsg, "hacker".into(), "hi")), "{text:?}");
+        }
+        assert_eq!(unwrap("* \x02hacker\x02 waves"), Some((LineKind::Action, "hacker".into(), "waves")));
+        assert_eq!(unwrap("\x02<hacker>\x02"), Some((LineKind::Privmsg, "hacker".into(), "")));
+        // Formatting inside the relayed words is the words' own.
+        assert_eq!(unwrap("<\x02hacker\x02> \x02loud\x02"), Some((LineKind::Privmsg, "hacker".into(), "\x02loud\x02")));
+    }
+
+    #[test]
+    fn colour_codes_take_at_most_two_digits_and_a_background() {
+        // `\x03` then `1` `2`: the third digit is the name's.
+        assert_eq!(unwrap("<\x031234> hi"), Some((LineKind::Privmsg, "34".into(), "hi")));
+        // A comma with no digit after it is the name's.
+        assert_eq!(unwrap("<\x034,x> hi"), Some((LineKind::Privmsg, ",x".into(), "hi")));
+        // Nothing but formatting: no name.
+        assert_eq!(unwrap("<\x02\x03> hi"), None);
+        assert_eq!(unwrap("\x02Bridge restarted"), None);
     }
 
     #[test]
