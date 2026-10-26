@@ -30,6 +30,12 @@ fn alice(ergo: &Ergo, password_command: &str) -> Config {
     config
 }
 
+/// hirc's network side with no history cache.
+fn net(config: Config) -> (tokio::sync::mpsc::UnboundedSender<Command>, UnboundedReceiver<Event>) {
+    let (tx, rx, _) = hirc_core::conn::spawn(config, None);
+    (tx, rx)
+}
+
 async fn next_matching<T>(rx: &mut UnboundedReceiver<Event>, mut f: impl FnMut(&Event) -> Option<T>) -> T {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -58,7 +64,7 @@ async fn sasl_join_send_and_receive() {
     bob.send("JOIN #test").await;
     bob.expect("JOIN").await;
 
-    let (tx, mut rx) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"));
+    let (tx, mut rx) = net(alice(&ergo, "printf hunter22"));
     next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
 
     tx.send(Command::Say { network: "test".into(), target: "#test".into(), text: "hello from hirc".into() }).unwrap();
@@ -112,7 +118,7 @@ fn carol(ergo: &Ergo) -> Config {
 async fn multiline_round_trip() {
     let ergo = Ergo::start();
     register_account(ergo.plain_port, "alice", "hunter22").await;
-    let (tx, mut rx) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"));
+    let (tx, mut rx) = net(alice(&ergo, "printf hunter22"));
     let limits = next_matching(&mut rx, |e| match e {
         Event::Multiline { limits, .. } => Some(*limits),
         _ => None,
@@ -121,7 +127,7 @@ async fn multiline_round_trip() {
     // The harness's own limits, read from its CAP LS.
     assert_eq!(limits, Some(hirc_core::multiline::Limits { max_bytes: 4096, max_lines: Some(100) }));
     next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
-    let (_ctx, mut crx) = hirc_core::conn::spawn(carol(&ergo));
+    let (_ctx, mut crx) = net(carol(&ergo));
     next_matching(&mut crx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
 
     tx.send(Command::Say { network: "test".into(), target: "#test".into(), text: "one\ntwo\nthree".into() }).unwrap();
@@ -139,7 +145,7 @@ async fn multiline_round_trip() {
 async fn bad_sasl_password_stops_without_retrying() {
     let ergo = Ergo::start();
     register_account(ergo.plain_port, "alice", "hunter22").await;
-    let (_tx, mut rx) = hirc_core::conn::spawn(alice(&ergo, "printf wrong"));
+    let (_tx, mut rx) = net(alice(&ergo, "printf wrong"));
     let reason = next_matching(&mut rx, |e| match e {
         Event::Status { status: ConnStatus::Failed { reason }, .. } => Some(reason.clone()),
         _ => None,
@@ -155,7 +161,7 @@ async fn bad_sasl_password_stops_without_retrying() {
 #[tokio::test(flavor = "multi_thread")]
 async fn failing_password_command_stops() {
     let ergo = Ergo::start();
-    let (_tx, mut rx) = hirc_core::conn::spawn(alice(&ergo, "exit 1"));
+    let (_tx, mut rx) = net(alice(&ergo, "exit 1"));
     next_matching(&mut rx, |e| matches!(e, Event::Status { status: ConnStatus::Failed { .. }, .. }).then_some(())).await;
 }
 
@@ -179,7 +185,7 @@ async fn a_reconnect_fills_the_gap_without_duplicates_or_news() {
     let mut bob = Raw::connect(ergo.plain_port, "bob").await;
     bob.send("JOIN #test").await;
     bob.expect("JOIN").await;
-    let (tx, mut rx) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"));
+    let (tx, mut rx) = net(alice(&ergo, "printf hunter22"));
     next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
     bob.send("PRIVMSG #test :before the drop").await;
     next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "before the drop")).await;
@@ -229,7 +235,7 @@ async fn history_pages_both_ways_at_the_servers_limit() {
     // A page bigger than the server's limit is asked for as the limit.
     let mut config = alice(&ergo, "printf hunter22");
     config.servers.get_mut("test").unwrap().history_page_size = Some(10_000);
-    let (tx, mut rx) = hirc_core::conn::spawn(config);
+    let (tx, mut rx) = net(config);
     let mut seen: Vec<String> = Vec::new();
     let mut ids = std::collections::HashSet::new();
     let mut take = |lines: &[Line], seen: &mut Vec<String>| {
@@ -296,12 +302,12 @@ async fn replayed_joins_parts_and_nicks_are_event_lines() {
     erin.send("PART #test :bye").await;
     erin.expect("PART").await;
     // carol's multiline message, from history, is one line.
-    let (ctx, mut crx) = hirc_core::conn::spawn(carol(&ergo));
+    let (ctx, mut crx) = net(carol(&ergo));
     next_matching(&mut crx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
     ctx.send(Command::Say { network: "test".into(), target: "#test".into(), text: "one\ntwo".into() }).unwrap();
     bob.expect("PRIVMSG #test").await;
 
-    let (_tx, mut rx) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"));
+    let (_tx, mut rx) = net(alice(&ergo, "printf hunter22"));
     let mut before = Vec::new();
     let (lines, _) = next_matching(&mut rx, |e| {
         before.push(e.clone());
@@ -326,7 +332,7 @@ async fn replayed_joins_parts_and_nicks_are_event_lines() {
 async fn targets_open_a_query_from_while_we_were_away() {
     let ergo = Ergo::start();
     register_always_on(ergo.plain_port, "alice", "hunter22").await;
-    let (tx, mut rx) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"));
+    let (tx, mut rx) = net(alice(&ergo, "printf hunter22"));
     next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
     // Something to anchor the next TARGETS on.
     let mut bob = Raw::connect(ergo.plain_port, "bob").await;
@@ -350,7 +356,7 @@ async fn targets_open_a_query_from_while_we_were_away() {
 async fn the_read_marker_survives_a_restart() {
     let ergo = Ergo::start();
     register_always_on(ergo.plain_port, "alice", "hunter22").await;
-    let (tx, mut rx) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"));
+    let (tx, mut rx) = net(alice(&ergo, "printf hunter22"));
     next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
     let mut bob = Raw::connect(ergo.plain_port, "bob").await;
     bob.send("JOIN #test").await;
@@ -376,7 +382,7 @@ async fn the_read_marker_survives_a_restart() {
     next_matching(&mut rx, |e| matches!(e, Event::Status { status: ConnStatus::Offline, .. }).then_some(())).await;
 
     // A fresh hirc: its store learns the marker and the history, in either order.
-    let (_tx2, mut rx2) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"));
+    let (_tx2, mut rx2) = net(alice(&ergo, "printf hunter22"));
     let mut store = hirc_core::store::Store::new(["test".to_string()]);
     let (mut marker, mut third) = (false, false);
     while !(marker && third) {
@@ -390,4 +396,45 @@ async fn the_read_marker_survives_a_restart() {
     let ix = buf.first_unread().expect("something unread");
     assert_eq!(buf.lines[ix].text, "third");
     assert_eq!(buf.unread, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_shows_the_cache_first_and_fetches_only_the_gap() {
+    let ergo = Ergo::start();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    register_account(ergo.plain_port, "alice", "hunter22").await;
+    let mut bob = Raw::connect(ergo.plain_port, "bob").await;
+    bob.send("JOIN #test").await;
+    bob.expect("JOIN").await;
+    let (tx, mut rx, flush) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"), Some(db.clone()));
+    next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
+    for t in ["m1", "m2", "m3"] {
+        bob.send(&format!("PRIVMSG #test :{t}")).await;
+    }
+    next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "m3")).await;
+    tx.send(Command::Disconnect { network: "test".into(), reason: None }).unwrap();
+    next_matching(&mut rx, |e| matches!(e, Event::Status { status: ConnStatus::Offline, .. }).then_some(())).await;
+    bob.expect("QUIT").await;
+    bob.send("PRIVMSG #test :m4").await;
+    bob.send("PING :sent").await;
+    bob.expect("PONG").await;
+    // Everything shown is written; then the first hirc goes away.
+    assert!(tokio::task::spawn_blocking(move || flush.wait()).await.unwrap());
+    drop(tx);
+
+    let (_tx2, mut rx2, _flush2) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"), Some(db.clone()));
+    // Before any connection: the cached page.
+    let first = next_matching(&mut rx2, |e| Some(e.clone())).await;
+    let Event::History { target: Target::Channel(c), lines, .. } = &first else { panic!("first event {first:?}") };
+    assert_eq!(c, "#test");
+    assert_eq!(said(lines), ["m1", "m2", "m3"]);
+    assert!(lines.iter().all(|l| l.replayed), "cached lines are history, not news: {lines:?}");
+    // Then the server's pages: only what came after.
+    let mut gap = Vec::new();
+    while !gap.iter().any(|t| t == "m4") {
+        let (lines, _) = page(&mut rx2, "#test").await;
+        gap.extend(said(&lines));
+    }
+    assert_eq!(gap, ["m4"]);
 }

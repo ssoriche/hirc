@@ -2,20 +2,24 @@
 //! task connects, feeds lines through its `Session`, sends events to the
 //! UI, and reconnects with backoff. The UI never waits on any of it.
 
+use crate::cache::Shared;
 use crate::config::{self, Config, ConfigError, Sasl, Server};
-use crate::event::{Command, ConnStatus, Event};
-use crate::history::Book;
+use crate::event::{Command, ConnStatus, Event, Target};
+use crate::history::{self, Anchor, Book};
+use crate::isupport::Isupport;
 use crate::proto::Message;
+use crate::services;
 use crate::session::{Output, SaslPlain, Session, SessionConfig};
+use crate::store::{Delivery, Line, LineKind};
 use crate::wire::LineReader;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rustls::ClientConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls_platform_verifier::ConfigVerifierExt;
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -35,13 +39,43 @@ const IDLE_DEAD: Duration = Duration::from_secs(300);
 trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
+/// The history cache's writer, for the app to wait on as it quits.
+#[derive(Clone)]
+pub struct Flush(Arc<OnceLock<Option<Shared>>>);
+
+impl Flush {
+    /// Wait until every line queued for the cache so far is written. True
+    /// if all went in, or there is no cache. It blocks on the disk (and on
+    /// the cache opening): never call it on the UI thread.
+    pub fn wait(&self) -> bool {
+        self.0.wait().as_ref().is_none_or(Shared::flush)
+    }
+}
+
 /// Starts the network thread. Send `Command`s in; `Event`s come out.
-pub fn spawn(config: Config) -> (UnboundedSender<Command>, UnboundedReceiver<Event>) {
+/// `cache` is where the history cache lives (`cache::path()`); `None` runs
+/// without one. `Flush` is for writing out what is queued, at quit.
+pub fn spawn(config: Config, cache: Option<PathBuf>) -> (UnboundedSender<Command>, UnboundedReceiver<Event>, Flush) {
     let (cmd_tx, mut cmd_rx) = unbounded_channel::<Command>();
     let (ev_tx, ev_rx) = unbounded_channel::<Event>();
+    let flush = Flush(Arc::new(OnceLock::new()));
+    let opened = flush.0.clone();
     std::thread::Builder::new()
         .name("hirc-net".into())
         .spawn(move || {
+            // Opened here, never on the caller's (the UI's) thread.
+            let shared = match cache.as_deref().map(|p| (p, Shared::open(p))) {
+                Some((_, Ok(shared))) => Some(shared),
+                Some((path, Err(e))) => {
+                    let text = format!("No history cache ({}): {e}", path.display());
+                    for name in config.servers.keys() {
+                        let _ = ev_tx.send(Event::Line { network: name.clone(), target: Target::Server, line: note(text.clone()) });
+                    }
+                    None
+                }
+                None => None,
+            };
+            let _ = opened.set(shared.clone());
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -54,7 +88,7 @@ pub fn spawn(config: Config) -> (UnboundedSender<Command>, UnboundedReceiver<Eve
                 for (name, server) in config.servers {
                     let (tx, rx) = unbounded_channel();
                     routes.insert(name.clone(), tx);
-                    tokio::spawn(run_server(name, server, rx, ev_tx.clone()));
+                    tokio::spawn(run_server(name, server, rx, ev_tx.clone(), shared.clone()));
                 }
                 while let Some(cmd) = cmd_rx.recv().await {
                     if let Some(tx) = routes.get(cmd.network()) {
@@ -64,7 +98,7 @@ pub fn spawn(config: Config) -> (UnboundedSender<Command>, UnboundedReceiver<Eve
             });
         })
         .expect("spawn network thread");
-    (cmd_tx, ev_rx)
+    (cmd_tx, ev_rx, flush)
 }
 
 enum End {
@@ -83,6 +117,13 @@ struct Carry {
     rejoin: Vec<String>,
     /// What history each target holds, so a reconnect asks only for the gap.
     book: Book,
+    /// The history cache, when there is one.
+    cache: Option<Shared>,
+    /// The book's discovery time as last written to the cache.
+    discovered: Option<DateTime<Utc>>,
+    /// The last registered connection's ISUPPORT: which names are channels
+    /// while offline.
+    isupport: Isupport,
 }
 
 /// The delay before the next attempt and the backoff to carry forward. A
@@ -93,7 +134,107 @@ pub fn retry_delay(backoff: Duration, registered: bool) -> (Duration, Duration) 
     (delay, (delay * 2).min(MAX_BACKOFF))
 }
 
-async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Command>, events: UnboundedSender<Event>) {
+/// hirc's own error line, for the server buffer.
+fn note(text: String) -> Line {
+    Line {
+        seq: 0,
+        time: Utc::now(),
+        msgid: None,
+        kind: LineKind::Error,
+        nick: None,
+        text,
+        own: true,
+        delivery: Delivery::Sent,
+        boundary: false,
+        replayed: false,
+    }
+}
+
+/// The cache's latest page of each window worth opening on it, before the
+/// first connection: every query (but services'), and the configured
+/// channels (one joined last time but not configured isn't rejoined, so its
+/// window would stay dead). The book learns what they hold, both ends, so
+/// the server is asked only for what is newer; and where discovery got to.
+fn seed(name: &str, server: &Server, cache: &Shared, book: &mut Book) -> Vec<Event> {
+    match cache.read(|c| c.discovered(name)) {
+        Ok(Some(t)) => book.set_discovered(t),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("{name}: history cache: {e}"),
+    }
+    let page = history::page_size(server.history_page_size, None);
+    let configured = |t: &str| server.channels.iter().any(|c| c.split(' ').next().is_some_and(|c| c.eq_ignore_ascii_case(t)));
+    let targets = match cache.read(|c| c.targets(name)) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("{name}: history cache: {e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for (target, query) in targets.into_iter().filter(|(t, q)| if *q { !services::is_service(t) } else { configured(t) }) {
+        let lines = match cache.read(|c| c.latest(name, &target, page)) {
+            Ok(lines) if !lines.is_empty() => lines,
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!("{name}: history cache: {e}");
+                continue;
+            }
+        };
+        // The page's ends, not `note`: lines in one millisecond are told
+        // apart by order only, and the last is the newest.
+        book.reach(&target, query, lines.first().map(Anchor::of).as_ref(), lines.last().map(Anchor::of).as_ref());
+        let target = if query { Target::Query(target) } else { Target::Channel(target) };
+        out.push(Event::History { network: name.to_owned(), target, lines, start: false });
+    }
+    out
+}
+
+/// Older lines for a window: the cache's while it has lines older than the
+/// oldest shown that follow on from it, then the server's. Where the cache
+/// stops at a break, or runs short, the server is asked for what is before
+/// the cache's oldest at once: the lines between are never skipped.
+fn older(session: &mut Session, cache: Option<&Shared>, network: &str, cmd: Command) -> Vec<Output> {
+    if let (Some(cache), Command::Older { target, .. }) = (cache, &cmd)
+        && let Some(anchor) = session.book().oldest(target).and_then(|a| a.msgid.clone())
+    {
+        let page = session.page();
+        match cache.read(|c| c.before(network, target, &anchor, page)) {
+            Ok(older) if !older.lines.is_empty() => {
+                let more = older.broke || older.lines.len() < page;
+                let mut out = session.cached(target, older.lines);
+                if more {
+                    out.extend(session.command(cmd, Utc::now()));
+                }
+                return out;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("{network}: history cache: {e}"),
+        }
+    }
+    session.command(cmd, Utc::now())
+}
+
+/// What the session says to keep goes to the cache's writer.
+fn keep(cache: Option<&Shared>, session: &mut Session) {
+    if let Some(cache) = cache {
+        for entry in session.kept() {
+            cache.write(entry);
+        }
+    }
+}
+
+/// Where discovery got to goes to the cache whenever it moves, so a
+/// restart's TARGETS starts there too.
+fn keep_discovered(cache: &Shared, network: &str, book: &Book, said: &mut Option<DateTime<Utc>>) {
+    if let Some(t) = book.discovered()
+        && *said != Some(t)
+    {
+        cache.write_discovered(network, t);
+        *said = Some(t);
+    }
+}
+
+async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Command>, events: UnboundedSender<Event>, cache: Option<Shared>) {
     let status = |status| {
         let _ = events.send(Event::Status { network: name.clone(), status });
     };
@@ -101,7 +242,28 @@ async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Co
     // Resolved secrets live for the process so reconnects don't re-run
     // `password_command` (each run can prompt). A Stop clears them.
     let mut cached: Option<SessionConfig> = None;
-    let mut carry = Carry::default();
+    let mut carry = Carry { cache, ..Carry::default() };
+    if let Some(cache) = carry.cache.clone() {
+        // Reads the disk: off this runtime's thread, so another network's
+        // connect isn't held up.
+        let (n, s) = (name.clone(), server.clone());
+        match tokio::task::spawn_blocking(move || {
+            let mut book = Book::default();
+            let events = seed(&n, &s, &cache, &mut book);
+            (book, events)
+        })
+        .await
+        {
+            Ok((book, seeded)) => {
+                carry.book = book;
+                for ev in seeded {
+                    let _ = events.send(ev);
+                }
+            }
+            Err(e) => tracing::warn!("{name}: history cache: {e}"),
+        }
+        carry.discovered = carry.book.discovered();
+    }
     loop {
         status(ConnStatus::Connecting);
         let mut registered = false;
@@ -112,7 +274,7 @@ async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Co
                     End::Stopped(reason) => ConnStatus::Failed { reason },
                     _ => ConnStatus::Offline,
                 });
-                if wait_reconnect(&mut cmds, &mut carry.book).await.is_none() {
+                if wait_reconnect(&mut cmds, &mut carry.book, &carry.isupport).await.is_none() {
                     return;
                 }
                 backoff = MIN_BACKOFF;
@@ -126,7 +288,7 @@ async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Co
         status(ConnStatus::Disconnected { reason, retry: delay });
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
-            r = wait_reconnect(&mut cmds, &mut carry.book) => {
+            r = wait_reconnect(&mut cmds, &mut carry.book, &carry.isupport) => {
                 if r.is_none() {
                     return;
                 }
@@ -138,11 +300,12 @@ async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Co
 /// Waits for /reconnect, dropping other commands (there's nowhere to send
 /// them). A window opened meanwhile is kept, for the next connection to
 /// backfill. `None` when the app is shutting down.
-async fn wait_reconnect(cmds: &mut UnboundedReceiver<Command>, book: &mut Book) -> Option<()> {
+/// `isupport` (the last connection's) says which names are channels.
+async fn wait_reconnect(cmds: &mut UnboundedReceiver<Command>, book: &mut Book, isupport: &Isupport) -> Option<()> {
     loop {
         match cmds.recv().await? {
             Command::Reconnect { .. } => return Some(()),
-            Command::Open { target, .. } => book.open(&target, !target.starts_with(['#', '&'])),
+            Command::Open { target, .. } => book.open(&target, !isupport.is_channel(&target)),
             _ => continue,
         }
     }
@@ -257,6 +420,9 @@ async fn connect_once(
     let mut cfg = cfg;
     cfg.channels = merge_channels(&cfg.channels, &carry.rejoin);
     let mut session = Session::new(name, cfg).with_book(std::mem::take(&mut carry.book));
+    if carry.cache.is_some() {
+        session = session.keeping();
+    }
     let mut outs = session.start();
     let mut last_rx = Instant::now();
     let mut pinged = false;
@@ -292,6 +458,10 @@ async fn connect_once(
                     }
                 }
             }
+            keep(carry.cache.as_ref(), &mut session);
+            if let Some(cache) = &carry.cache {
+                keep_discovered(cache, name, session.book(), &mut carry.discovered);
+            }
             w.flush().await?;
             tokio::select! {
                 line = reader.next_line() => {
@@ -310,6 +480,7 @@ async fn connect_once(
                         let _ = w.flush().await;
                         return Ok(End::Closed(None));
                     }
+                    Some(c @ Command::Older { .. }) => outs = older(&mut session, carry.cache.as_ref(), name, c),
                     Some(c) => outs = session.command(c, Utc::now()),
                 },
                 _ = tick.tick() => {
@@ -332,13 +503,342 @@ async fn connect_once(
             let _ = events.send(e);
         }
     }
+    keep(carry.cache.as_ref(), &mut session);
     carry.book = session.take_book();
+    if let Some(cache) = &carry.cache {
+        keep_discovered(cache, name, &carry.book, &mut carry.discovered);
+    }
+    if *registered {
+        carry.isupport = session.isupport().clone();
+    }
     end
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::{Above, Below, Cache, Entry};
+    use crate::session::tests::{asked, feed, historied, histories, now};
+
+    fn line(id: &str, secs: i64) -> Line {
+        Line {
+            seq: 0,
+            time: DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap(),
+            msgid: Some(id.into()),
+            kind: LineKind::Privmsg,
+            nick: Some("bob".into()),
+            text: id.into(),
+            own: false,
+            delivery: Delivery::Sent,
+            boundary: false,
+            replayed: false,
+        }
+    }
+
+    fn cache_with(dir: &tempfile::TempDir, entries: Vec<(Target, Vec<Line>)>) -> Shared {
+        let cache = Shared::open(&dir.path().join("history.db")).unwrap();
+        for (target, lines) in entries {
+            cache.write(Entry { network: "net".into(), target, lines, below: Below::Breaks, above: Above::Leave });
+        }
+        assert!(cache.flush());
+        cache
+    }
+
+    #[test]
+    fn the_cache_seeds_queries_and_configured_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with(
+            &dir,
+            vec![
+                (Target::Channel("#a".into()), vec![line("a1", 1), line("a2", 2)]),
+                (Target::Channel("#gone".into()), vec![line("g1", 1)]),
+                (Target::Query("bob".into()), vec![line("q1", 3)]),
+            ],
+        );
+        let server = Server { channels: vec!["#A key".into()], history_page_size: Some(1), ..Server::default() };
+        let mut book = Book::default();
+        let got: Vec<(Target, Vec<String>)> = seed("net", &server, &cache, &mut book)
+            .into_iter()
+            .map(|e| match e {
+                Event::History { target, lines, start: false, .. } => (target, lines.into_iter().map(|l| l.text).collect()),
+                e => panic!("{e:?}"),
+            })
+            .collect();
+        assert_eq!(got, [(Target::Channel("#a".into()), vec!["a2".to_owned()]), (Target::Query("bob".into()), vec!["q1".to_owned()])]);
+        assert_eq!(book.newest("#a").and_then(|a| a.msgid.as_deref()), Some("a2"));
+        assert_eq!(book.queries(), ["bob"]);
+        assert_eq!(book.discovered(), None);
+    }
+
+    #[test]
+    fn a_seeded_page_in_one_second_is_held_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with(&dir, vec![(Target::Channel("#a".into()), vec![line("a1", 1), line("a2", 1), line("a3", 1)])]);
+        let server = Server { channels: vec!["#a".into()], ..Server::default() };
+        let mut book = Book::default();
+        seed("net", &server, &cache, &mut book);
+        // The gap is asked for after the last line, not one tied with it.
+        assert_eq!(book.newest("#a").and_then(|a| a.msgid.as_deref()), Some("a3"));
+        assert_eq!(book.oldest("#a").and_then(|a| a.msgid.as_deref()), Some("a1"));
+    }
+
+    #[test]
+    fn discovery_is_kept_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with(&dir, Vec::new());
+        let at = |s: i64| DateTime::from_timestamp(1_800_000_000 + s, 0).unwrap();
+        cache.write_discovered("net", at(5));
+        assert!(cache.flush());
+        let mut book = Book::default();
+        seed("net", &Server::default(), &cache, &mut book);
+        assert_eq!(book.discovered(), Some(at(5)));
+        // It is written through only when it moves.
+        let mut said = book.discovered();
+        keep_discovered(&cache, "net", &book, &mut said);
+        book.set_discovered(at(9));
+        keep_discovered(&cache, "net", &book, &mut said);
+        assert_eq!(said, Some(at(9)));
+        assert!(cache.flush());
+        assert_eq!(cache.read(|c| c.discovered("net")).unwrap(), Some(at(9)));
+    }
+
+    #[test]
+    fn older_lines_come_from_the_cache_while_it_has_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with(&dir, vec![(Target::Channel("#a".into()), vec![line("c1", 1), line("c2", 2)])]);
+        let mut book = Book::default();
+        book.note("#a", false, &[line("c2", 2)]);
+        // History is off for this session, so the server's answer is "the start".
+        let mut session = Session::new("net", SessionConfig::default()).with_book(book);
+        let cmd = || Command::Older { network: "net".into(), target: "#a".into() };
+        let out = older(&mut session, Some(&cache), "net", cmd());
+        // c1 is where the cache's run begins: the server is asked on at once.
+        let got: Vec<(Vec<String>, bool)> = histories(&out).into_iter().map(|(_, l, start)| (l.into_iter().map(|l| l.text).collect(), start)).collect();
+        assert_eq!(got, [(vec!["c1".to_owned()], false), (vec![], true)]);
+        let out = older(&mut session, Some(&cache), "net", cmd());
+        assert!(matches!(out.as_slice(), [Output::Event(Event::History { lines, start: true, .. })] if lines.is_empty()), "{out:?}");
+    }
+
+    /// A page of `items` (msgid, minutes past 09:00) for `target` as batch
+    /// `r`, answering `label` (none: nobody asked for it).
+    fn batch(s: &mut Session, label: Option<&str>, r: &str, target: &str, items: &[(&str, u32)]) -> Vec<Output> {
+        let tag = label.map_or(String::new(), |l| format!("@label={l} "));
+        feed(s, &format!("{tag}:srv BATCH +{r} chathistory {target}"));
+        for (id, min) in items {
+            feed(s, &format!("@batch={r};time=2026-10-22T09:{min:02}:00.000Z;msgid={id} :bob!b@h PRIVMSG {target} :{id}"));
+        }
+        feed(s, &format!(":srv BATCH -{r}"))
+    }
+
+    fn live(s: &mut Session, target: &str, id: &str, min: u32) -> Vec<Output> {
+        feed(s, &format!("@time=2026-10-22T11:{min:02}:00.000Z;msgid={id} :bob!b@h PRIVMSG {target} :{id}"))
+    }
+
+    /// Everything the session said to keep, written. True if it all went in.
+    fn written(s: &mut Session, cache: &Shared) -> bool {
+        keep(Some(cache), s);
+        cache.flush()
+    }
+
+    fn older_of(s: &mut Session, cache: &Shared, target: &str) -> Vec<Output> {
+        older(s, Some(cache), "net", Command::Older { network: "net".into(), target: target.into() })
+    }
+
+    /// A fresh hirc on `cache`, configured for `channels`: seeded, then
+    /// connected and registered.
+    fn restart(cache: &Shared, channels: &[&str]) -> Session {
+        let server = Server { channels: channels.iter().map(|c| (*c).to_owned()).collect(), ..Server::default() };
+        let mut book = Book::default();
+        seed("net", &server, cache, &mut book);
+        historied("", 3, book).keeping()
+    }
+
+    /// `#test` joined, with its latest page o7..o9 in the cache.
+    fn joined(cache: &Shared) -> Session {
+        let mut s = historied("", 3, Book::default()).keeping();
+        let (_, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        batch(&mut s, Some(&label), "l", "#test", &[("o7", 7), ("o8", 8), ("o9", 9)]);
+        assert!(written(&mut s, cache));
+        s
+    }
+
+    /// Older: nothing comes from the cache, and the server is asked for
+    /// what is before `msgid`.
+    fn asks_the_server_before(s: &mut Session, cache: &Shared, target: &str, msgid: &str) {
+        let out = older_of(s, cache, target);
+        assert!(histories(&out).is_empty(), "nothing from across the hole: {out:?}");
+        assert_eq!(asked(&out).0, format!("CHATHISTORY BEFORE {target} msgid={msgid} 3"));
+    }
+
+    fn kept_ids(s: &mut Session) -> Vec<(Vec<String>, Below)> {
+        s.kept().into_iter().map(|e| (e.lines.into_iter().filter_map(|l| l.msgid).collect(), e.below)).collect()
+    }
+
+    #[test]
+    fn a_page_before_cut_off_never_hides_what_it_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Shared::open(&dir.path().join("history.db")).unwrap();
+        let mut s = joined(&cache);
+        let (wire, label) = asked(&older_of(&mut s, &cache, "#test"));
+        assert_eq!(wire, "CHATHISTORY BEFORE #test msgid=o7 3");
+        // o4..o6 is on its way; the drop cuts it off after o4.
+        feed(&mut s, &format!("@label={label} :srv BATCH +b chathistory #test"));
+        feed(&mut s, "@batch=b;time=2026-10-22T09:04:00.000Z;msgid=o4 :bob!b@h PRIVMSG #test :o4");
+        s.end(now());
+        assert!(written(&mut s, &cache));
+        // The next connection, and a restart, ask the server for o5 and o6.
+        let mut next = historied("", 3, s.take_book()).keeping();
+        asks_the_server_before(&mut next, &cache, "#test", "o7");
+        asks_the_server_before(&mut restart(&cache, &["#test"]), &cache, "#test", "o7");
+    }
+
+    #[test]
+    fn a_page_nobody_asked_for_never_hides_what_is_between() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Shared::open(&dir.path().join("history.db")).unwrap();
+        let mut s = joined(&cache);
+        // A bouncer's replay of o2 and o3: it doesn't reach o7.
+        batch(&mut s, None, "u", "#test", &[("o2", 2), ("o3", 3)]);
+        assert!(written(&mut s, &cache));
+        asks_the_server_before(&mut s, &cache, "#test", "o7");
+        asks_the_server_before(&mut restart(&cache, &["#test"]), &cache, "#test", "o7");
+    }
+
+    #[test]
+    fn a_cached_channel_joined_again_never_shows_its_old_lines_as_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Shared::open(&dir.path().join("history.db")).unwrap();
+        let mut s = historied("", 3, Book::default()).keeping();
+        let (_, label) = asked(&feed(&mut s, ":alice!a@h JOIN #old"));
+        batch(&mut s, Some(&label), "l", "#old", &[("x1", 1), ("x2", 2)]);
+        assert!(written(&mut s, &cache));
+        // Not configured now, so not seeded: /join gets its latest page.
+        let mut s = restart(&cache, &["#test"]);
+        let (wire, label) = asked(&feed(&mut s, ":alice!a@h JOIN #old"));
+        assert_eq!(wire, "CHATHISTORY LATEST #old * 3");
+        batch(&mut s, Some(&label), "l", "#old", &[("y7", 7), ("y8", 8), ("y9", 9)]);
+        assert!(written(&mut s, &cache));
+        asks_the_server_before(&mut s, &cache, "#old", "y7");
+        asks_the_server_before(&mut restart(&cache, &["#old"]), &cache, "#old", "y7");
+    }
+
+    #[test]
+    fn a_live_line_the_fill_missed_never_hides_what_is_below_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Shared::open(&dir.path().join("history.db")).unwrap();
+        let mut s = historied("", 3, Book::default()).keeping();
+        let (_, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        batch(&mut s, Some(&label), "l", "#test", &[("a1", 1), ("a2", 2)]);
+        s.end(now());
+        assert!(written(&mut s, &cache));
+        let mut s = historied("", 3, s.take_book()).keeping();
+        let (wire, label) = asked(&feed(&mut s, "@time=2026-10-22T11:00:00.000Z;msgid=j1 :alice!a@h JOIN #test"));
+        assert_eq!(wire, "CHATHISTORY AFTER #test msgid=a2 3");
+        live(&mut s, "#test", "l1", 1);
+        // The fill's last page ends at a3: j1 and l1 aren't in it.
+        batch(&mut s, Some(&label), "f", "#test", &[("a3", 3)]);
+        live(&mut s, "#test", "l2", 2);
+        assert!(written(&mut s, &cache));
+        // A restart opens on j1..l2 and asks for what is after l2; scrolling
+        // up asks the server for what is before j1, not the cache for a3.
+        let mut r = restart(&cache, &["#test"]);
+        assert_eq!(asked(&feed(&mut r, ":alice!a@h JOIN #test")).0, "CHATHISTORY AFTER #test msgid=l2 3");
+        asks_the_server_before(&mut restart(&cache, &["#test"]), &cache, "#test", "j1");
+    }
+
+    #[test]
+    fn a_failed_write_never_hides_what_it_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let cache = Shared::open(&path).unwrap();
+        let mut s = joined(&cache);
+        live(&mut s, "#test", "l0", 0);
+        assert!(written(&mut s, &cache));
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TRIGGER no BEFORE INSERT ON lines WHEN NEW.msgid = 'l1' BEGIN SELECT RAISE(ABORT, 'no'); END;")
+            .unwrap();
+        live(&mut s, "#test", "l1", 1);
+        assert!(!written(&mut s, &cache));
+        live(&mut s, "#test", "l2", 2);
+        assert!(written(&mut s, &cache));
+        asks_the_server_before(&mut restart(&cache, &["#test"]), &cache, "#test", "l2");
+    }
+
+    #[test]
+    fn live_lines_follow_on_until_one_the_cache_cannot_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Shared::open(&dir.path().join("history.db")).unwrap();
+        let mut s = joined(&cache);
+        live(&mut s, "#test", "l1", 1);
+        // A line with no msgid to keep it by (ours, without echo-message, is one).
+        feed(&mut s, ":carol!c@h PRIVMSG #test :no msgid on this one");
+        live(&mut s, "#test", "l2", 2);
+        // Ours, on a server without echo-message: shown with no msgid.
+        feed(&mut s, ":srv CAP alice DEL :echo-message");
+        s.command(Command::Say { network: "net".into(), target: "#test".into(), text: "hi".into() }, now());
+        live(&mut s, "#test", "l3", 3);
+        let want = [("l1", Below::Joins("o9".into())), ("l2", Below::Breaks), ("l3", Below::Breaks)];
+        assert_eq!(kept_ids(&mut s), want.map(|(id, b)| (vec![id.to_owned()], b)));
+    }
+
+    #[test]
+    fn a_live_line_while_the_gap_fills_is_kept_as_a_break() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Shared::open(&dir.path().join("history.db")).unwrap();
+        let mut s = historied("", 3, joined(&cache).take_book()).keeping();
+        asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        live(&mut s, "#test", "l1", 1);
+        live(&mut s, "#test", "l2", 2);
+        assert_eq!(kept_ids(&mut s), [(vec!["l1".to_owned()], Below::Breaks), (vec!["l2".to_owned()], Below::Joins("l1".into()))]);
+    }
+
+    #[test]
+    fn a_cache_that_will_not_open_is_one_line_in_each_server_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain");
+        std::fs::write(&file, "not a directory").unwrap();
+        // A server on a local port nothing listens on: no name to look up.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut config = Config::default();
+        config.servers.insert("net".into(), Server { server: "127.0.0.1".into(), port: Some(port), use_tls: false, ..Server::default() });
+        let (_tx, mut rx, flush) = spawn(config, Some(file.join("history.db")));
+        let Some(Event::Line { network, target: Target::Server, line }) = rx.blocking_recv() else { panic!("no error line") };
+        assert_eq!(network, "net");
+        assert!(line.text.starts_with("No history cache"), "{}", line.text);
+        assert_eq!(line.kind, LineKind::Error);
+        // hirc runs on without one.
+        assert!(matches!(rx.blocking_recv(), Some(Event::Status { status: ConnStatus::Connecting, .. })));
+        assert!(flush.wait());
+    }
+
+    #[test]
+    fn flush_waits_for_what_the_network_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let (_tx, _rx, flush) = spawn(Config::default(), Some(path.clone()));
+        assert!(flush.wait());
+        assert!(path.exists());
+        let (_tx, _rx, flush) = spawn(Config::default(), None);
+        assert!(flush.wait());
+        drop(Cache::open(&path).unwrap());
+    }
+
+    #[test]
+    fn a_window_opened_while_offline_is_a_channel_by_the_servers_chantypes() {
+        let mut isupport = Isupport::default();
+        isupport.apply(&["alice".into(), "CHANTYPES=#+".into(), "are supported".into()]);
+        let (tx, mut rx) = unbounded_channel();
+        for target in ["+local", "bob"] {
+            tx.send(Command::Open { network: "net".into(), target: target.into() }).unwrap();
+        }
+        tx.send(Command::Reconnect { network: "net".into() }).unwrap();
+        let mut book = Book::default();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        assert!(rt.block_on(wait_reconnect(&mut rx, &mut book, &isupport)).is_some());
+        assert_eq!(book.queries(), ["bob"]);
+        assert!(book.get("+local").is_some());
+    }
 
     #[test]
     fn backoff_doubles_until_registered_then_resets() {

@@ -4,6 +4,7 @@
 //! moves bytes.
 
 use crate::batch::{self, Batches};
+use crate::cache::{self, Above, Below, Entry};
 use crate::caps::Caps;
 use crate::event::{Command, ConnStatus, Event, PeerChange, Target};
 use crate::history::{self, Anchor, Book, Kind, Request};
@@ -144,6 +145,13 @@ pub struct Session {
     batch_seq: u64,
     /// The multiline limits last told to the UI.
     multiline_said: Option<Limits>,
+    /// Runs of lines for the history cache, each saying how it meets what
+    /// the cache holds; `None` when there is no cache.
+    keep: Option<Vec<Entry>>,
+    /// Per lowercased target, the msgid of the newest line kept at the live
+    /// end, which the next live line follows on from. Gone when that isn't
+    /// known: a gap opened, or a line the cache can't keep was shown.
+    tail: HashMap<String, String>,
 }
 
 /// A name in a TARGETS answer, and when it was last busy.
@@ -263,6 +271,8 @@ impl Session {
             targets_pages: 0,
             batch_seq: 0,
             multiline_said: None,
+            keep: None,
+            tail: HashMap::new(),
         }
     }
 
@@ -300,6 +310,76 @@ impl Session {
         history::page_size(self.cfg.history_page, self.isupport.chathistory)
     }
 
+    /// Older lines for `target` from the cache, shown as a page of history.
+    /// They are older than the oldest held, so only the oldest moves (on a
+    /// tie in time too: they were stored before it), and the next page
+    /// starts before them. Not a server page: no request, gap or queued
+    /// `Older` is touched.
+    pub fn cached(&mut self, target: &str, lines: Vec<Line>) -> Vec<Output> {
+        let query = !self.isupport.is_channel(target);
+        let first = lines.first().map(Anchor::of);
+        // Nothing held yet: the page is all there is, both ends.
+        let last = lines.last().map(Anchor::of).filter(|_| self.book.newest(target).is_none());
+        if first.is_some() {
+            self.book.reach(target, query, first.as_ref(), last.as_ref());
+        }
+        vec![self.history_event(target, lines, false)]
+    }
+
+    /// Say what to write to the history cache, through `kept`.
+    pub fn keeping(mut self) -> Session {
+        self.keep = Some(Vec::new());
+        self
+    }
+
+    /// The runs for the history cache since last asked. Only this session
+    /// knows how each meets what is held: a page after follows on from
+    /// where it was asked from, a page before reaches up to it, a live line
+    /// follows the last one; anything else (a page nobody asked for, one
+    /// cut off, the latest page of a window with nothing held) is a break.
+    pub fn kept(&mut self) -> Vec<Entry> {
+        self.keep.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    fn keep_run(&mut self, target: &str, lines: &[Line], below: Below, above: Above) {
+        let target = self.dest(target);
+        if let Some(keep) = &mut self.keep
+            && !lines.is_empty()
+        {
+            keep.push(Entry { network: self.network.clone(), target, lines: lines.to_vec(), below, above });
+        }
+    }
+
+    /// A live line goes to the cache following the last one kept. One the
+    /// cache can't keep (ours, on a server without echo-message, has no
+    /// msgid) is a hole: the next line kept is a break.
+    fn keep_live(&mut self, target: &Target, line: &Line) {
+        let Some(name) = target.name() else { return };
+        let key = name.to_ascii_lowercase();
+        if let (true, Some(id)) = (cache::cacheable(target, line), &line.msgid) {
+            let below = self.tail.get(&key).cloned().map_or(Below::Breaks, Below::Joins);
+            if let Some(keep) = &mut self.keep {
+                keep.push(Entry { network: self.network.clone(), target: target.clone(), lines: vec![line.clone()], below, above: Above::Leave });
+            }
+            self.tail.insert(key, id.clone());
+        } else if line.msgid.is_none() && line.delivery == Delivery::Sent && !line.boundary {
+            self.tail.remove(&key);
+        }
+    }
+
+    /// The live end of `target` is known to be `msgid`, unless it is
+    /// already.
+    fn tail_unless_known(&mut self, target: &str, msgid: Option<String>) {
+        if let Some(id) = msgid {
+            self.tail.entry(target.to_ascii_lowercase()).or_insert(id);
+        }
+    }
+
+    /// What the server said it supports, as of this connection.
+    pub fn isupport(&self) -> &Isupport {
+        &self.isupport
+    }
+
     /// The first lines of a fresh connection. PASS goes first: bouncers
     /// such as IRCCloud read it before anything else.
     pub fn start(&mut self) -> Vec<Output> {
@@ -323,6 +403,14 @@ impl Session {
         self.discovering = None;
         self.targets_pages = 0;
         self.multiline_said = None;
+        self.tail.clear();
+        // A query's lines can come before registration ends and its gap is
+        // asked for: until then they wait, as they would in an open gap.
+        for q in self.book.queries() {
+            if self.book.newest(&q).is_some() && !services::is_service(&q) {
+                self.gaps.insert(q.to_ascii_lowercase(), None);
+            }
+        }
         let mut out = Vec::new();
         if let Some(p) = &self.cfg.password {
             out.push(send("PASS", [p.as_str()]));
@@ -632,8 +720,10 @@ impl Session {
         let key = target.to_ascii_lowercase();
         // A gap opens even if the request can't go now: until it is
         // filled, the newest held stays where it is.
-        if matches!(kind, Kind::After(_)) {
-            self.gaps.entry(key.clone()).or_default();
+        if matches!(kind, Kind::After(_)) && !self.gaps.contains_key(&key) {
+            self.gaps.insert(key.clone(), None);
+            // Live lines from here are past the hole until it is filled.
+            self.tail.remove(&key);
         }
         if self.inflight.contains_key(&key) {
             return;
@@ -709,6 +799,13 @@ impl Session {
     fn sync(&mut self, now: DateTime<Utc>, out: &mut Vec<Output>) {
         for nick in self.book.queries().into_iter().filter(|n| !services::is_service(n)) {
             self.sync_query(&nick, out);
+        }
+        // Gaps opened at start that nothing is filling (history is off):
+        // the lines that waited are held now.
+        let idle: Vec<String> = self.gaps.keys().filter(|k| !self.inflight.contains_key(*k)).cloned().collect();
+        for key in idle {
+            let name = self.book.get(&key).map_or_else(|| key.clone(), |k| k.name.clone());
+            self.close_gap(&key, &name);
         }
         self.discover(now, out);
     }
@@ -842,6 +939,7 @@ impl Session {
         let answered = self.answers(page.label.as_deref(), &page.target).and_then(|k| self.inflight.remove(&k).map(|i| (k, i)));
         let Some((key, Inflight { request, .. })) = answered else {
             self.widen_unsolicited(&page);
+            self.keep_run(&page.target, &page.lines, Below::Breaks, Above::Breaks);
             if !page.lines.is_empty() {
                 out.push(self.history_event(&page.target, page.lines, false));
             }
@@ -862,6 +960,17 @@ impl Session {
             let query = !self.isupport.is_channel(&request.target);
             self.book.reach(&request.target, query, first, last);
         }
+        // How it meets what the cache holds: as it meets what is held here.
+        let (below, above) = match (&request.kind, cut) {
+            (Kind::After(a), _) => (a.msgid.clone().map_or(Below::Breaks, Below::Joins), Above::Breaks),
+            (Kind::Before(a), false) => (Below::Breaks, a.msgid.clone().map_or(Above::Breaks, Above::Joins)),
+            _ => (Below::Breaks, Above::Breaks),
+        };
+        self.keep_run(&request.target, &page.lines, below, above);
+        let newest_kept = {
+            let dest = self.dest(&request.target);
+            page.lines.iter().rev().find(|l| cache::cacheable(&dest, l)).and_then(|l| l.msgid.clone())
+        };
         if cut {
             if !page.lines.is_empty() {
                 out.push(self.history_event(&request.target, page.lines, false));
@@ -871,10 +980,17 @@ impl Session {
         let start = page.items == 0 && matches!(request.kind, Kind::Latest | Kind::Before(_));
         let full = page.items >= request.limit;
         out.push(self.history_event(&request.target, page.lines, start));
+        // The page reaches the live end: live lines follow on from it.
+        if matches!(request.kind, Kind::Latest) {
+            self.tail_unless_known(&request.target, newest_kept.clone());
+        }
         if let Kind::After(from) = &request.kind {
             match page.last.filter(|l| full && l != from) {
                 Some(last) => self.request(&request.target, Kind::After(last), out),
-                None if !full => self.close_gap(&key, &request.target),
+                None if !full => {
+                    self.tail_unless_known(&request.target, newest_kept.or_else(|| from.msgid.clone()));
+                    self.close_gap(&key, &request.target);
+                }
                 // Full but no further on: the gap stays open for next time.
                 None => {}
             }
@@ -927,7 +1043,8 @@ impl Session {
         }
         let start = matches!(request.kind, Kind::Latest | Kind::Before(_));
         out.push(self.history_event(&request.target, Vec::new(), start));
-        if matches!(request.kind, Kind::After(_)) {
+        if let Kind::After(from) = &request.kind {
+            self.tail_unless_known(&request.target, from.msgid.clone());
             self.close_gap(&key, &request.target);
         }
         self.settled(&key, out);
@@ -1094,6 +1211,7 @@ impl Session {
                 }
                 None => self.book.note(name, query, std::slice::from_ref(line)),
             }
+            self.keep_live(target, line);
         }
     }
 
@@ -1274,6 +1392,13 @@ impl Session {
     }
 
     pub fn command(&mut self, cmd: Command, now: DateTime<Utc>) -> Vec<Output> {
+        let out = self.run(cmd, now);
+        // Our own lines, too: one without a msgid is a hole in the cache.
+        self.note(&out);
+        out
+    }
+
+    fn run(&mut self, cmd: Command, now: DateTime<Utc>) -> Vec<Output> {
         match cmd {
             Command::Say { target, text, .. } => self.say(&target, &text, false, now),
             Command::Action { target, text, .. } => self.say(&target, &text, true, now),
@@ -1374,15 +1499,15 @@ impl Session {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::history::Book;
 
-    pub(super) fn now() -> DateTime<Utc> {
+    pub(crate) fn now() -> DateTime<Utc> {
         "2026-10-22T12:00:00Z".parse().unwrap()
     }
 
-    pub(super) fn cfg() -> SessionConfig {
+    pub(crate) fn cfg() -> SessionConfig {
         SessionConfig {
             nickname: "alice".into(),
             alt_nicks: vec!["alice2".into()],
@@ -1397,11 +1522,11 @@ mod tests {
         }
     }
 
-    pub(super) fn feed(s: &mut Session, line: &str) -> Vec<Output> {
+    pub(crate) fn feed(s: &mut Session, line: &str) -> Vec<Output> {
         s.handle(Message::parse(line).unwrap(), now())
     }
 
-    pub(super) fn sent(out: &[Output]) -> Vec<String> {
+    pub(crate) fn sent(out: &[Output]) -> Vec<String> {
         out.iter()
             .filter_map(|o| match o {
                 Output::Send(m) => Some(m.to_wire()),
@@ -1819,7 +1944,7 @@ mod tests {
     /// Registered with history on: batch, labeled-response and chathistory
     /// (plus `extra` caps), a page of 20, the server's `CHATHISTORY=limit`,
     /// and `book` carried in. What registration sends is dropped.
-    fn historied(extra: &str, limit: usize, book: Book) -> Session {
+    pub(crate) fn historied(extra: &str, limit: usize, book: Book) -> Session {
         let mut s = Session::new("net", SessionConfig { history_page: Some(20), ..cfg() }).with_book(book);
         s.start();
         let ls = format!("message-tags server-time echo-message batch labeled-response draft/chathistory {extra}");
@@ -1842,7 +1967,7 @@ mod tests {
     }
 
     /// The one CHATHISTORY line in `out`, without its label, and the label.
-    fn asked(out: &[Output]) -> (String, String) {
+    pub(crate) fn asked(out: &[Output]) -> (String, String) {
         let ms: Vec<&Message> = out
             .iter()
             .filter_map(|o| match o {
@@ -1856,7 +1981,7 @@ mod tests {
         (bare.to_wire(), label)
     }
 
-    fn histories(out: &[Output]) -> Vec<(Target, Vec<Line>, bool)> {
+    pub(crate) fn histories(out: &[Output]) -> Vec<(Target, Vec<Line>, bool)> {
         out.iter()
             .filter_map(|o| match o {
                 Output::Event(Event::History { target, lines, start, .. }) => Some((target.clone(), lines.clone(), *start)),
@@ -2067,6 +2192,58 @@ mod tests {
 
     const OUR_JOIN: &str = "@time=2026-10-22T11:00:00.000Z;msgid=j1 :alice!a@h JOIN #test";
 
+    /// Registered with a query to bob held up to q0, with `line` (from bob)
+    /// arriving before the end of the MOTD.
+    fn query_line_before_motd(caps: &str, line: &str) -> (Session, Vec<Output>) {
+        let mut book = Book::default();
+        book.note("bob", true, &[Line { msgid: Some("q0".into()), time: "2026-10-22T10:00:00Z".parse().unwrap(), ..local_line() }]);
+        let mut s = Session::new("net", cfg()).with_book(book);
+        s.start();
+        feed(&mut s, &format!(":srv CAP * LS :{caps}"));
+        feed(&mut s, &format!(":srv CAP alice ACK :{caps}"));
+        feed(&mut s, ":srv 001 alice :hi");
+        feed(&mut s, line);
+        let out = feed(&mut s, ":srv 376 alice :End of MOTD");
+        (s, out)
+    }
+
+    #[test]
+    fn a_query_line_before_registration_ends_waits_for_the_gap() {
+        let line = "@time=2026-10-22T11:00:00.000Z;msgid=q1 :bob!b@h PRIVMSG alice :early";
+        let (_, out) = query_line_before_motd("message-tags server-time batch draft/chathistory", line);
+        let wanted: Vec<String> = sent(&out).into_iter().filter(|m| m.starts_with("CHATHISTORY AFTER")).collect();
+        assert_eq!(wanted, ["CHATHISTORY AFTER bob msgid=q0 100"]);
+        // Without history nothing fills it: the line is held at once.
+        let (s, _) = query_line_before_motd("message-tags server-time batch", line);
+        assert_eq!(s.book().newest("bob").and_then(|a| a.msgid.as_deref()), Some("q1"));
+    }
+
+    #[test]
+    fn cached_lines_are_a_page_the_book_learns() {
+        let mut s = Session::new("net", cfg());
+        let line = Line { msgid: Some("c1".into()), replayed: true, ..local_line() };
+        let out = s.cached("#test", vec![line.clone()]);
+        assert_eq!(histories(&out), [(Target::Channel("#test".into()), vec![line], false)]);
+        assert_eq!(s.book().oldest("#test").and_then(|a| a.msgid.as_deref()), Some("c1"));
+    }
+
+    #[test]
+    fn cached_lines_move_only_the_oldest_and_leave_requests_alone() {
+        let mut s = historied("", 2, held());
+        let (_, label) = asked(&feed(&mut s, OUR_JOIN));
+        // Stored before m0 in the same second: still older, so it is the oldest now.
+        let tied = Line { msgid: Some("c0".into()), time: "2026-10-22T10:00:00Z".parse().unwrap(), replayed: true, ..local_line() };
+        let out = s.cached("#test", vec![tied]);
+        assert!(sent(&out).is_empty(), "{out:?}");
+        assert_eq!(s.book().oldest("#test").and_then(|a| a.msgid.as_deref()), Some("c0"));
+        assert_eq!(newest(&s).as_deref(), Some("m0"));
+        // The gap's request is still the one out: its short page closes the
+        // gap, and our join (live meanwhile) is the newest.
+        page(&mut s, Some(&label), "a", &["m1"]);
+        assert_eq!(newest(&s).as_deref(), Some("j1"));
+        assert_eq!(asked(&older(&mut s, "#test")).0, "CHATHISTORY BEFORE #test msgid=c0 2");
+    }
+
     #[test]
     fn a_gap_cut_off_mid_fill_is_asked_for_again() {
         let mut s = historied("", 2, held());
@@ -2259,7 +2436,7 @@ mod tests {
     }
 
     /// A line to build on in tests.
-    fn local_line() -> Line {
+    pub(crate) fn local_line() -> Line {
         Line {
             seq: 0,
             time: now(),

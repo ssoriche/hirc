@@ -20,6 +20,14 @@ debug builds, so later builds and `cargo run` stay fast.
 `~/.config/hirc/themes/<name>.toml`. Keys hirc doesn't support yet are
 ignored.
 
+- `history_page_size` (hirc only, default 100): lines per page of history, never more than the server allows (its `CHATHISTORY` limit). `chathistory = false` turns server history off for that server.
+
+## History
+
+Each window opens on its latest page of history. Scroll to the top for older pages: "loading older messages" shows while one is on its way, and "start of history" once the server has no more. After a reconnect hirc asks only for what it missed. While you were away, queries with new messages open at the end of the window list. Your read position is kept on the server (`draft/read-marker`), so the "new" divider is where you left off on any device.
+
+What hirc has shown is kept in `$XDG_DATA_HOME/hirc/history.db` (else `~/.local/share/hirc/history.db`). Only lines the server gave an id are kept. Nothing from a services query (NickServ and the like), and no config or passwords, ever goes in it. Delete the file to forget it all. A file hirc can't read is renamed to `history.db.bad-<time>`, and a new one is started.
+
 ## Windows
 
 The sidebar is an irssi-style flat numbered list of every buffer across all

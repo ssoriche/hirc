@@ -14,12 +14,39 @@ mod wrap;
 use app::{HircApp, Init, Quit};
 use gpui::{App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size};
 use hirc_core::config;
+use std::time::Duration;
 
 /// The system monospace face, for when the config names no font.
 #[cfg(target_os = "macos")]
 const DEFAULT_FAMILY: &str = "Menlo";
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_FAMILY: &str = "monospace";
+
+/// How long a quit waits for the history cache to be written.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Quit once the lines queued for the history cache are written, or after
+/// `FLUSH_TIMEOUT`. The write waits on the disk, so it runs on its own
+/// thread; the UI thread only awaits the answer.
+fn quit(flush: Option<hirc_core::conn::Flush>, cx: &mut App) {
+    let Some(flush) = flush else { return cx.quit() };
+    let written = cx.background_executor().spawn(async move {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(flush.wait());
+        });
+        rx.recv_timeout(FLUSH_TIMEOUT).ok()
+    });
+    cx.spawn(async move |cx| {
+        match written.await {
+            Some(true) => {}
+            Some(false) => tracing::warn!("history cache: some lines were not written"),
+            None => tracing::warn!("history cache: not written within {FLUSH_TIMEOUT:?}; quitting anyway"),
+        }
+        cx.update(|cx| cx.quit());
+    })
+    .detach();
+}
 
 fn main() {
     tracing_subscriber::fmt::init();
@@ -64,12 +91,20 @@ fn main() {
     // system's monospace face rather than gpui's proportional default.
     let font_family = config.font.family.clone().or_else(|| Some(DEFAULT_FAMILY.to_owned()));
     let font_size = config.font.size.unwrap_or(14.);
+    let start = |config| {
+        let (commands, events, flush) = hirc_core::conn::spawn(config, Some(hirc_core::cache::path()));
+        (commands, events, Some(flush))
+    };
     #[cfg(not(feature = "snapshot"))]
-    let (commands, events) = hirc_core::conn::spawn(config);
+    let (commands, events, flush) = start(config);
+    // A snapshot run never touches the history cache.
     #[cfg(feature = "snapshot")]
-    let (commands, events) = match &mut snap {
-        Some(plan) => plan.channels(),
-        None => hirc_core::conn::spawn(config),
+    let (commands, events, flush) = match &mut snap {
+        Some(plan) => {
+            let (commands, events) = plan.channels();
+            (commands, events, None)
+        }
+        None => start(config),
     };
     let no_layout_file = cfg!(feature = "snapshot") && {
         #[cfg(feature = "snapshot")]
@@ -99,10 +134,25 @@ fn main() {
         input::bind_keys(cx);
         app::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.on_window_closed(|cx, _id| {
+        let quitting = flush.clone();
+        cx.on_action(move |_: &Quit, cx| quit(quitting.clone(), cx));
+        // A quit that skips the Quit action (from the OS, say): gpui gives
+        // quit handlers only a moment, but what is written in it is kept.
+        if let Some(flush) = flush.clone() {
+            cx.on_app_quit(move |cx| {
+                let flush = flush.clone();
+                let written = cx.background_executor().spawn(async move { flush.wait() });
+                async move {
+                    if !written.await {
+                        tracing::warn!("history cache: some lines were not written");
+                    }
+                }
+            })
+            .detach();
+        }
+        cx.on_window_closed(move |cx, _id| {
             if cx.windows().is_empty() {
-                cx.quit();
+                quit(flush.clone(), cx);
             }
         })
         .detach();

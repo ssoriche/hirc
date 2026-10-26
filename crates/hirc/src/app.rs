@@ -486,7 +486,8 @@ impl HircApp {
             Effect::Nav(dir) => self.nav(*dir, cx),
             Effect::Ex(line) => match vim::ex(line) {
                 Ex::None => {}
-                Ex::Quit => cx.quit(),
+                // Through the Quit action, which writes the history cache first.
+                Ex::Quit => cx.dispatch_action(&Quit),
                 Ex::Window(n) => self.goto_typed(n, cx),
                 Ex::Buffer(name) => self.goto_buffer(&name, cx),
                 Ex::Slash(s) => self.submit(s, cx),
