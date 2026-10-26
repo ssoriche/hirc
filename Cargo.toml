@@ -14,6 +14,8 @@ dirs = "7"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "9ab0715969e9854f2efe61a9d782e7698e5fe6d2", default-features = false, features = ["font-kit"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "9ab0715969e9854f2efe61a9d782e7698e5fe6d2", default-features = false, features = ["font-kit", "runtime_shaders"] }
 indexmap = { version = "2", features = ["serde"] }
+# The history cache. `bundled` builds SQLite in, so no system library is needed.
+rusqlite = { version = "0.37", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-platform-verifier = "0.7"
 serde = { version = "1", features = ["derive"] }
