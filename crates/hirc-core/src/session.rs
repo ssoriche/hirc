@@ -12,7 +12,7 @@ use crate::multiline::{self, Limits};
 use crate::proto::Message;
 use crate::store::{Delivery, Line, LineKind};
 use crate::{bridge, sasl, split};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +129,8 @@ pub struct Session {
     /// `Older` for a target that had a request out, by lowercased target:
     /// sent once that request is done.
     queued_older: HashMap<String, String>,
+    /// Names in TARGETS answers still arriving, by batch ref.
+    found: HashMap<String, Vec<String>>,
     /// Numbers the batches we send, so each ref is new on the connection.
     batch_seq: u64,
     /// The multiline limits last told to the UI.
@@ -182,6 +184,43 @@ fn last(msg: &Message) -> &str {
     msg.params.last().map_or("", String::as_str)
 }
 
+// The event lines' words, shared by the live handlers and by replay, so a
+// replayed event reads as its live copy did.
+
+fn join_text(nick: &str) -> String {
+    format!("{nick} joined")
+}
+
+fn part_text(nick: &str, reason: Option<&str>) -> String {
+    match reason.filter(|r| !r.is_empty()) {
+        Some(r) => format!("{nick} left ({r})"),
+        None => format!("{nick} left"),
+    }
+}
+
+fn kick_text(victim: &str, by: &str, reason: Option<&str>) -> String {
+    match reason.filter(|r| !r.is_empty()) {
+        Some(r) => format!("{victim} was kicked by {by} ({r})"),
+        None => format!("{victim} was kicked by {by}"),
+    }
+}
+
+fn quit_text(nick: &str, reason: &str) -> String {
+    if reason.is_empty() { format!("{nick} quit") } else { format!("{nick} quit ({reason})") }
+}
+
+fn nick_text(old: &str, new: &str) -> String {
+    format!("{old} is now known as {new}")
+}
+
+fn topic_text(by: &str, topic: &str) -> String {
+    format!("{by} changed the topic to: {topic}")
+}
+
+fn mode_text(by: &str, modes: &str) -> String {
+    format!("{by} set mode {modes}")
+}
+
 impl Session {
     pub fn new(network: &str, cfg: SessionConfig) -> Session {
         Session {
@@ -207,6 +246,7 @@ impl Session {
             gaps: HashMap::new(),
             gave_up: HashSet::new(),
             queued_older: HashMap::new(),
+            found: HashMap::new(),
             batch_seq: 0,
             multiline_said: None,
         }
@@ -265,6 +305,7 @@ impl Session {
         self.gaps.clear();
         self.gave_up.clear();
         self.queued_older.clear();
+        self.found.clear();
         self.multiline_said = None;
         let mut out = Vec::new();
         if let Some(p) = &self.cfg.password {
@@ -322,6 +363,21 @@ impl Session {
                 && let Some(h) = self.page_of(&r)
             {
                 return self.replay(&h, &msg, now);
+            }
+            // One name in our TARGETS answer. Only as many as were asked for
+            // are kept.
+            if msg.command == "CHATHISTORY"
+                && msg.params.first().map(String::as_str) == Some("TARGETS")
+                && let Some(t) = self.targets_of(&r)
+                && let Some(name) = msg.params.get(1)
+            {
+                let limit = self.page();
+                if let Some(list) = self.found.get_mut(&t)
+                    && list.len() < limit
+                {
+                    list.push(name.clone());
+                }
+                return;
             }
         }
         match msg.command.as_str() {
@@ -454,6 +510,9 @@ impl Session {
         if let Some(page) = self.pages.remove(&r) {
             self.finish_page(page, false, out);
         }
+        if let Some(names) = self.found.remove(&r) {
+            self.finish_targets(names, out);
+        }
         if !open {
             return;
         }
@@ -472,6 +531,13 @@ impl Session {
                 let label = self.batches.label(&r).or_else(|| msg.tag("label").filter(|l| !l.is_empty()).map(str::to_owned));
                 let cap = self.answers(label.as_deref(), &target).and_then(|k| self.inflight.get(&k)).map_or(0, |i| i.request.limit).max(self.page());
                 self.pages.insert(r, Page { target, label, lines: Vec::new(), items: 0, cap, first: None, last: None });
+            }
+            // Only the answer to our TARGETS: anyone else's names open nothing.
+            Some(history::TARGETS_BATCH) if self.found.len() < batch::MAX_OPEN => {
+                let label = self.batches.label(&r).or_else(|| msg.tag("label").filter(|l| !l.is_empty()).map(str::to_owned));
+                if self.answers(label.as_deref(), history::TARGETS).is_some() {
+                    self.found.insert(r, Vec::new());
+                }
             }
             _ => {}
         }
@@ -508,6 +574,12 @@ impl Session {
     /// room for.
     fn page_of(&self, r: &str) -> Option<String> {
         self.batches.enclosing(r, history::BATCH).filter(|h| self.pages.contains_key(h)).or_else(|| self.pages.contains_key(r).then(|| r.to_owned()))
+    }
+
+    /// The TARGETS answer batch `r` is part of, found the way `page_of`
+    /// finds a page.
+    fn targets_of(&self, r: &str) -> Option<String> {
+        self.batches.enclosing(r, history::TARGETS_BATCH).filter(|t| self.found.contains_key(t)).or_else(|| self.found.contains_key(r).then(|| r.to_owned()))
     }
 
     /// The in-flight request a page with `label` for `target` answers. With
@@ -592,11 +664,39 @@ impl Session {
         self.backfill(nick, out);
     }
 
-    /// Registered, with ISUPPORT known: bring every open query up to
-    /// date. Channels do so as they are joined.
-    fn sync(&mut self, _now: DateTime<Utc>, out: &mut Vec<Output>) {
+    /// Registered, with ISUPPORT known: bring every open query up to date,
+    /// then ask who wrote to us while we were away. Channels catch up as
+    /// they are joined.
+    fn sync(&mut self, now: DateTime<Utc>, out: &mut Vec<Output>) {
         for nick in self.book.queries() {
             self.sync_query(&nick, out);
+        }
+        self.discover(now, out);
+    }
+
+    /// `CHATHISTORY TARGETS` from the newest line held (else a week back)
+    /// to a little past now (the server's clock may be ahead of ours).
+    fn discover(&mut self, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        if !self.history_on() {
+            return;
+        }
+        let from = self.book.last_seen().unwrap_or(now - TimeDelta::days(history::DISCOVERY_DAYS));
+        self.request(history::TARGETS, Kind::Targets { from, to: now + TimeDelta::hours(1) }, out);
+    }
+
+    /// The TARGETS answer: each nick (not us) is a query to open and bring
+    /// up to date; its first page opens its window, at the end of the list.
+    /// A query already held was synced with the rest. Channels are left to
+    /// the config and to /join.
+    fn finish_targets(&mut self, names: Vec<String>, out: &mut Vec<Output>) {
+        self.inflight.remove(history::TARGETS);
+        self.labels.retain(|_, k| k != history::TARGETS);
+        for name in names {
+            if self.isupport.is_channel(&name) || self.is_me(&name) || self.book.get(&name).is_some_and(|k| k.query) {
+                continue;
+            }
+            self.book.open(&name, true);
+            self.sync_query(&name, out);
         }
     }
 
@@ -613,6 +713,8 @@ impl Session {
         let mut shown = Vec::new();
         if matches!(msg.command.as_str(), "PRIVMSG" | "NOTICE") {
             self.on_message(msg, now, &mut shown);
+        } else if let Some(target) = self.pages.get(h).map(|p| p.target.clone()) {
+            self.replayed_event(&target, msg, now, &mut shown);
         }
         let anchor = Anchor::from_tags(msg);
         let Some(page) = self.pages.get_mut(h) else { return };
@@ -624,6 +726,29 @@ impl Session {
             Output::Event(Event::Line { line, .. }) => Some(Line { replayed: true, ..line }),
             _ => None,
         }));
+    }
+
+    /// event-playback: a JOIN, PART, ... from history, as the line its
+    /// live copy shows. Members, peers and the topic stay as they are now.
+    fn replayed_event(&mut self, target: &str, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let nick = msg.nick().unwrap_or("").to_owned();
+        let p = |i: usize| msg.params.get(i).map(String::as_str);
+        let (kind, who, text, own) = match msg.command.as_str() {
+            "JOIN" => (LineKind::Join, nick.clone(), join_text(&nick), self.is_me(&nick)),
+            "PART" => (LineKind::Part, nick.clone(), part_text(&nick, p(1)), self.is_me(&nick)),
+            "KICK" => {
+                let victim = p(1).unwrap_or("").to_owned();
+                let own = self.is_me(&victim);
+                (LineKind::Kick, victim.clone(), kick_text(&victim, &nick, p(2)), own)
+            }
+            "QUIT" => (LineKind::Quit, nick.clone(), quit_text(&nick, p(0).unwrap_or("")), false),
+            "NICK" => (LineKind::Nick, nick.clone(), nick_text(&nick, p(0).unwrap_or("")), self.is_me(&nick)),
+            "TOPIC" => (LineKind::Topic, nick.clone(), topic_text(&nick, p(1).unwrap_or("")), self.is_me(&nick)),
+            "MODE" => (LineKind::Mode, nick.clone(), mode_text(&nick, &msg.params.get(1..).unwrap_or_default().join(" ")), self.is_me(&nick)),
+            _ => return,
+        };
+        let line = self.line(msg, now, kind, Some(&who), text, own);
+        out.push(self.event_line(self.dest(target), line));
     }
 
     /// A page is in (or `cut` off by the drop). It answers the request
@@ -959,7 +1084,7 @@ impl Session {
         }
         self.members_of(&chan).insert(nick.to_ascii_lowercase());
         let me = self.is_me(&nick);
-        let line = self.line(msg, now, LineKind::Join, Some(&nick), format!("{nick} joined"), me);
+        let line = self.line(msg, now, LineKind::Join, Some(&nick), join_text(&nick), me);
         out.push(self.event_line(Target::Channel(chan.clone()), line));
         if me {
             self.book.open(&chan, false);
@@ -978,10 +1103,7 @@ impl Session {
 
     fn on_part(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
         let (Some(nick), Some(chan)) = (msg.nick().map(str::to_owned), msg.params.first().cloned()) else { return };
-        let text = match msg.params.get(1).filter(|r| !r.is_empty()) {
-            Some(r) => format!("{nick} left ({r})"),
-            None => format!("{nick} left"),
-        };
+        let text = part_text(&nick, msg.params.get(1).map(String::as_str));
         let line = self.line(msg, now, LineKind::Part, Some(&nick), text, self.is_me(&nick));
         out.push(self.event_line(Target::Channel(chan.clone()), line));
         self.left(&chan, &nick, out);
@@ -991,10 +1113,7 @@ impl Session {
         let [chan, victim, rest @ ..] = msg.params.as_slice() else { return };
         let (chan, victim) = (chan.clone(), victim.clone());
         let by = msg.nick().unwrap_or("").to_owned();
-        let text = match rest.first().filter(|r| !r.is_empty()) {
-            Some(r) => format!("{victim} was kicked by {by} ({r})"),
-            None => format!("{victim} was kicked by {by}"),
-        };
+        let text = kick_text(&victim, &by, rest.first().map(String::as_str));
         // Worded from the one who leaves, as a part or a quit is, so the
         // `<--` always points at the first nick.
         let line = self.line(msg, now, LineKind::Kick, Some(&victim), text, self.is_me(&victim));
@@ -1013,7 +1132,7 @@ impl Session {
     fn on_quit(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
         let Some(nick) = msg.nick().map(str::to_owned) else { return };
         let reason = msg.params.first().cloned().unwrap_or_default();
-        let text = if reason.is_empty() { format!("{nick} quit") } else { format!("{nick} quit ({reason})") };
+        let text = quit_text(&nick, &reason);
         if !self.is_me(&nick) {
             out.push(self.peer(&nick, PeerChange::Quit(reason)));
         }
@@ -1037,7 +1156,7 @@ impl Session {
             let m = self.members_of(&chan);
             m.remove(&old.to_ascii_lowercase());
             m.insert(new.to_ascii_lowercase());
-            let line = self.line(msg, now, LineKind::Nick, Some(&old), format!("{old} is now known as {new}"), own);
+            let line = self.line(msg, now, LineKind::Nick, Some(&old), nick_text(&old, &new), own);
             out.push(self.event_line(Target::Channel(chan), line));
         }
     }
@@ -1047,7 +1166,7 @@ impl Session {
         let (chan, topic) = (chan.clone(), topic.clone());
         let by = msg.nick().unwrap_or("").to_owned();
         out.push(Output::Event(Event::Topic { network: self.network.clone(), channel: chan.clone(), topic: Some(topic.clone()).filter(|t| !t.is_empty()) }));
-        let line = self.line(msg, now, LineKind::Topic, Some(&by), format!("{by} changed the topic to: {topic}"), self.is_me(&by));
+        let line = self.line(msg, now, LineKind::Topic, Some(&by), topic_text(&by, &topic), self.is_me(&by));
         out.push(self.event_line(Target::Channel(chan), line));
     }
 
@@ -1066,7 +1185,7 @@ impl Session {
         let by = msg.nick().unwrap_or("").to_owned();
         let modes = msg.params[1..].join(" ");
         let (dest, own) = if self.isupport.is_channel(&target) { (Target::Channel(target), self.is_me(&by)) } else { (Target::Server, true) };
-        let line = self.line(msg, now, LineKind::Mode, Some(&by), format!("{by} set mode {modes}"), own);
+        let line = self.line(msg, now, LineKind::Mode, Some(&by), mode_text(&by, &modes), own);
         out.push(self.event_line(dest, line));
     }
 
@@ -1618,7 +1737,16 @@ mod tests {
         feed(&mut s, &format!(":srv CAP alice ACK :{}", ack.join(" ")));
         feed(&mut s, ":srv 001 alice :hi");
         feed(&mut s, &format!(":srv 005 alice CHANTYPES=# CHATHISTORY={limit} :are supported"));
-        feed(&mut s, ":srv 376 alice :End of MOTD");
+        // End of MOTD asks for TARGETS: nobody wrote, so each test starts
+        // with nothing in flight.
+        let out = feed(&mut s, ":srv 376 alice :End of MOTD");
+        let targets = out.iter().find_map(|o| match o {
+            Output::Send(m) if m.command == "CHATHISTORY" && m.params.first().map(String::as_str) == Some("TARGETS") => m.tag("label").map(str::to_owned),
+            _ => None,
+        });
+        if let Some(label) = targets {
+            feed(&mut s, &format!("@label={label} :srv ACK"));
+        }
         s
     }
 
@@ -2205,5 +2333,109 @@ mod tests {
         assert_eq!(t, Target::Channel("#Test".into()));
         let (t, _) = lines(&feed(&mut s, ":carol!c@h NICK carla")).remove(0);
         assert_eq!(t, Target::Channel("#Test".into()));
+    }
+
+    #[test]
+    fn replayed_events_read_as_live_ones_but_change_nothing() {
+        let mut s = historied("draft/event-playback", 50, Book::default());
+        let (_, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        feed(&mut s, &format!("@label={label} :srv BATCH +h chathistory #test"));
+        let events = [
+            "@batch=h;time=2026-10-22T10:00:00.000Z;msgid=e1 :erin!e@h JOIN #test",
+            "@batch=h;time=2026-10-22T10:00:01.000Z;msgid=e2 :erin!e@h NICK erin_",
+            "@batch=h;time=2026-10-22T10:00:02.000Z;msgid=e3 :erin_!e@h PART #test :bye",
+            "@batch=h;time=2026-10-22T10:00:03.000Z;msgid=e4 :dan!d@h QUIT :gone",
+            "@batch=h;time=2026-10-22T10:00:04.000Z;msgid=e5 :op!o@h MODE #test +o dan",
+            "@batch=h;time=2026-10-22T10:00:05.000Z;msgid=e6 :op!o@h TOPIC #test :old topic",
+            "@batch=h;time=2026-10-22T10:00:06.000Z;msgid=e7 :op!o@h KICK #test dan :out",
+        ];
+        for e in events {
+            assert!(feed(&mut s, e).is_empty(), "{e}");
+        }
+        let got = histories(&feed(&mut s, ":srv BATCH -h"));
+        let lines = &got[0].1;
+        assert_eq!(
+            texts(lines),
+            [
+                "erin joined",
+                "erin is now known as erin_",
+                "erin_ left (bye)",
+                "dan quit (gone)",
+                "op set mode +o dan",
+                "op changed the topic to: old topic",
+                "dan was kicked by op (out)"
+            ]
+        );
+        let kinds: Vec<LineKind> = lines.iter().map(|l| l.kind).collect();
+        assert_eq!(kinds, [LineKind::Join, LineKind::Nick, LineKind::Part, LineKind::Quit, LineKind::Mode, LineKind::Topic, LineKind::Kick]);
+        // The past is not now: nobody joined or left our member lists.
+        assert!(s.channels_with("erin").is_empty() && s.channels_with("erin_").is_empty());
+    }
+
+    #[test]
+    fn targets_open_the_queries_that_were_busy_while_away() {
+        let mut book = Book::default();
+        book.note("#test", false, &[Line { msgid: Some("c1".into()), time: "2026-10-22T09:00:00Z".parse().unwrap(), ..local_line() }]);
+        let mut s = Session::new("net", SessionConfig { history_page: Some(20), ..cfg() }).with_book(book);
+        s.start();
+        feed(&mut s, ":srv CAP * LS :batch server-time labeled-response draft/chathistory");
+        feed(&mut s, ":srv CAP alice ACK :batch server-time labeled-response draft/chathistory");
+        feed(&mut s, ":srv 001 alice :hi");
+        feed(&mut s, ":srv 005 alice CHANTYPES=# CHATHISTORY=50 :are supported");
+        let out = feed(&mut s, ":srv 376 alice :End of MOTD");
+        // From the newest line held to an hour from now.
+        let (wire, label) = asked(&out);
+        assert_eq!(wire, "CHATHISTORY TARGETS timestamp=2026-10-22T09:00:00.000Z timestamp=2026-10-22T13:00:00.000Z 20");
+        feed(&mut s, &format!("@label={label} :srv BATCH +t draft/chathistory-targets"));
+        for t in ["bob 2026-10-22T11:00:00.000Z", "#test 2026-10-22T11:30:00.000Z", "alice 2026-10-22T11:40:00.000Z"] {
+            assert!(feed(&mut s, &format!("@batch=t :srv CHATHISTORY TARGETS {t}")).is_empty());
+        }
+        let out = feed(&mut s, ":srv BATCH -t");
+        // Only bob: not a channel, not us.
+        assert_eq!(asked(&out).0, "CHATHISTORY LATEST bob * 20");
+        assert_eq!(s.book().queries(), ["bob"]);
+    }
+
+    #[test]
+    fn with_nothing_held_targets_look_back_a_week() {
+        let mut s = Session::new("net", cfg());
+        s.start();
+        feed(&mut s, ":srv CAP * LS :batch server-time draft/chathistory");
+        feed(&mut s, ":srv CAP alice ACK :batch server-time draft/chathistory");
+        feed(&mut s, ":srv 001 alice :hi");
+        let out = feed(&mut s, ":srv 422 alice :MOTD File is missing");
+        assert_eq!(sent(&out), ["CHATHISTORY TARGETS timestamp=2026-10-15T12:00:00.000Z timestamp=2026-10-22T13:00:00.000Z 100"]);
+    }
+
+    #[test]
+    fn only_our_targets_answer_opens_queries_and_held_ones_are_not_asked_twice() {
+        // Answered already (by `historied`): a TARGETS batch now is not ours.
+        let mut s = historied("", 50, Book::default());
+        feed(&mut s, ":srv BATCH +t draft/chathistory-targets");
+        feed(&mut s, "@batch=t :srv CHATHISTORY TARGETS bob 2026-10-22T11:00:00.000Z");
+        assert!(sent(&feed(&mut s, ":srv BATCH -t")).is_empty());
+        assert!(s.book().queries().is_empty());
+
+        // zoe's query is open, so the end of MOTD synced it with the rest.
+        let mut book = Book::default();
+        book.open("zoe", true);
+        let mut s = Session::new("net", SessionConfig { history_page: Some(20), ..cfg() }).with_book(book);
+        s.start();
+        feed(&mut s, ":srv CAP * LS :batch server-time labeled-response draft/chathistory");
+        feed(&mut s, ":srv CAP alice ACK :batch server-time labeled-response draft/chathistory");
+        feed(&mut s, ":srv 001 alice :hi");
+        let out = feed(&mut s, ":srv 376 alice :End of MOTD");
+        let label = |o: &[Output], sub: &str| {
+            o.iter().find_map(|o| match o {
+                Output::Send(m) if m.params.first().map(String::as_str) == Some(sub) => m.tag("label").map(str::to_owned),
+                _ => None,
+            })
+        };
+        let (zoe, targets) = (label(&out, "LATEST").unwrap(), label(&out, "TARGETS").unwrap());
+        feed(&mut s, &format!("@label={zoe} :srv ACK"));
+        feed(&mut s, &format!("@label={targets} :srv BATCH +t draft/chathistory-targets"));
+        feed(&mut s, "@batch=t :srv CHATHISTORY TARGETS Zoe 2026-10-22T11:00:00.000Z");
+        assert!(sent(&feed(&mut s, ":srv BATCH -t")).is_empty());
+        assert!(s.inflight.is_empty());
     }
 }

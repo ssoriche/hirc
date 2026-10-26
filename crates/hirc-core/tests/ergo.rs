@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{Ergo, Raw, register_account};
+use common::{Ergo, Raw, register_account, register_always_on};
 use hirc_core::config::{Config, Sasl, Server};
 use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::store::{Delivery, Line, LineKind};
@@ -279,4 +279,69 @@ async fn history_pages_both_ways_at_the_servers_limit() {
     gap.sort();
     want.sort();
     assert_eq!(gap, want);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replayed_joins_parts_and_nicks_are_event_lines() {
+    let ergo = Ergo::start();
+    register_account(ergo.plain_port, "alice", "hunter22").await;
+    let mut bob = Raw::connect(ergo.plain_port, "bob").await;
+    bob.send("JOIN #test").await;
+    bob.expect("JOIN").await;
+    let mut erin = Raw::connect(ergo.plain_port, "erin").await;
+    erin.send("JOIN #test").await;
+    erin.expect("JOIN").await;
+    erin.send("NICK erin_").await;
+    erin.expect("NICK").await;
+    erin.send("PART #test :bye").await;
+    erin.expect("PART").await;
+    // carol's multiline message, from history, is one line.
+    let (ctx, mut crx) = hirc_core::conn::spawn(carol(&ergo));
+    next_matching(&mut crx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
+    ctx.send(Command::Say { network: "test".into(), target: "#test".into(), text: "one\ntwo".into() }).unwrap();
+    bob.expect("PRIVMSG #test").await;
+
+    let (_tx, mut rx) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"));
+    let mut before = Vec::new();
+    let (lines, _) = next_matching(&mut rx, |e| {
+        before.push(e.clone());
+        match e {
+            Event::History { target: Target::Channel(c), lines, start, .. } if c == "#test" => Some((lines.clone(), *start)),
+            _ => None,
+        }
+    })
+    .await;
+    assert!(lines.iter().all(|l| l.replayed));
+    let shown: Vec<(LineKind, &str)> = lines.iter().map(|l| (l.kind, l.text.as_str())).collect();
+    for want in
+        [(LineKind::Join, "erin joined"), (LineKind::Nick, "erin is now known as erin_"), (LineKind::Part, "erin_ left (bye)"), (LineKind::Privmsg, "one\ntwo")]
+    {
+        assert!(shown.contains(&want), "{want:?} not in {shown:?}");
+    }
+    // History told us nothing about erin as she is now.
+    assert!(!before.iter().any(|e| matches!(e, Event::Peer { nick, .. } if nick.starts_with("erin"))), "{before:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn targets_open_a_query_from_while_we_were_away() {
+    let ergo = Ergo::start();
+    register_always_on(ergo.plain_port, "alice", "hunter22").await;
+    let (tx, mut rx) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"));
+    next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
+    // Something to anchor the next TARGETS on.
+    let mut bob = Raw::connect(ergo.plain_port, "bob").await;
+    bob.send("JOIN #test").await;
+    bob.send("PRIVMSG #test :hi all").await;
+    next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "hi all")).await;
+
+    tx.send(Command::Disconnect { network: "test".into(), reason: None }).unwrap();
+    next_matching(&mut rx, |e| matches!(e, Event::Status { status: ConnStatus::Offline, .. }).then_some(())).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    bob.send("PRIVMSG alice :are you there?").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    tx.send(Command::Reconnect { network: "test".into() }).unwrap();
+
+    let (lines, _) = page(&mut rx, "bob").await;
+    assert_eq!(said(&lines), ["are you there?"]);
+    assert!(lines.iter().all(|l| l.replayed));
 }

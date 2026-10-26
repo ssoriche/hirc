@@ -128,3 +128,17 @@ pub async fn register_account(port: u16, nick: &str, password: &str) {
     c.expect("Account created").await;
     c.send("QUIT").await;
 }
+
+/// Registers `nick` and makes it always-on (Ergo keeps its client, its
+/// history and its read markers while no connection is up), then
+/// disconnects.
+pub async fn register_always_on(port: u16, nick: &str, password: &str) {
+    let mut c = Raw::connect(port, nick).await;
+    c.send(&format!("PRIVMSG NickServ :REGISTER {password}")).await;
+    c.expect("Account created").await;
+    c.send("PRIVMSG NickServ :SET always-on true").await;
+    // Ergo 2.19.1 answers with the stored setting, then whether the
+    // server's settings make it so: the second is the one that counts.
+    c.expect("your client is always-on").await;
+    c.send("QUIT").await;
+}
