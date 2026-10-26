@@ -15,6 +15,9 @@ use crate::{bridge, sasl, services, split};
 use chrono::{DateTime, TimeDelta, Utc};
 use std::collections::{HashMap, HashSet};
 
+/// The read-marker cap.
+const READ_MARKER: &str = "draft/read-marker";
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Output {
     Send(Message),
@@ -450,6 +453,12 @@ impl Session {
             "BATCH" => self.on_batch(&msg, now, out),
             "FAIL" if msg.params.first().map(String::as_str) == Some("CHATHISTORY") => self.on_fail(&msg, now, out),
             "ACK" => self.on_ack(&msg, out),
+            // draft/read-marker: where the user has read up to (`*`: nowhere yet).
+            "MARKREAD" => {
+                if let [target, at, ..] = msg.params.as_slice() {
+                    out.push(Output::Event(Event::ReadMarker { network: self.network.clone(), target: self.dest(target), time: history::parse_timestamp(at) }));
+                }
+            }
             "TAGMSG" | "366" => {}
             c if c.len() == 3 && c.bytes().all(|b| b.is_ascii_digit()) => {
                 let text = msg.params.get(1..).unwrap_or_default().join(" ");
@@ -682,8 +691,13 @@ impl Session {
         }
     }
 
-    /// A query's history since we last had it.
+    /// A query's history since we last had it, and where it was read up
+    /// to (the server sends a channel's marker on JOIN; a query's is asked).
+    /// Callers keep services queries the user did not open out of here.
     fn sync_query(&mut self, nick: &str, out: &mut Vec<Output>) {
+        if self.caps.is_enabled(READ_MARKER) {
+            out.push(send("MARKREAD", [nick]));
+        }
         self.backfill(nick, out);
     }
 
@@ -1285,6 +1299,13 @@ impl Session {
                 let mut out = Vec::new();
                 self.open(&target, &mut out);
                 out
+            }
+            Command::MarkRead { target, time, .. } => {
+                if self.caps.is_enabled(READ_MARKER) {
+                    vec![send("MARKREAD", [target, history::timestamp(time)])]
+                } else {
+                    Vec::new()
+                }
             }
             Command::Reconnect { .. } => Vec::new(),
         }
@@ -2589,6 +2610,75 @@ mod tests {
         // Opened by the user, a services query is theirs to read.
         let out = s.command(Command::Open { network: "net".into(), target: "ChanServ".into() }, now());
         assert_eq!(bare(&out), ["CHATHISTORY LATEST ChanServ * 20"]);
+    }
+
+    #[test]
+    fn markread_from_the_server_is_the_read_marker() {
+        let mut s = historied("draft/read-marker", 50, Book::default());
+        let out = feed(&mut s, ":srv MARKREAD #test timestamp=2026-10-22T10:00:00.000Z");
+        assert_eq!(
+            out,
+            [Output::Event(Event::ReadMarker {
+                network: "net".into(),
+                target: Target::Channel("#test".into()),
+                time: Some("2026-10-22T10:00:00Z".parse().unwrap())
+            })]
+        );
+        let out = feed(&mut s, ":srv MARKREAD bob *");
+        assert_eq!(out, [Output::Event(Event::ReadMarker { network: "net".into(), target: Target::Query("bob".into()), time: None })]);
+    }
+
+    #[test]
+    fn a_malformed_markread_is_no_time_or_nothing() {
+        let mut s = historied("draft/read-marker", 50, Book::default());
+        let out = feed(&mut s, ":srv MARKREAD #test timestamp=garbage");
+        assert_eq!(out, [Output::Event(Event::ReadMarker { network: "net".into(), target: Target::Channel("#test".into()), time: None })]);
+        assert!(feed(&mut s, ":srv MARKREAD #test").is_empty());
+    }
+
+    #[test]
+    fn marking_read_tells_the_server_only_when_it_takes_markers() {
+        let time: DateTime<Utc> = "2026-10-22T10:00:00.5Z".parse().unwrap();
+        let mark = Command::MarkRead { network: "net".into(), target: "#test".into(), time };
+        let mut s = historied("draft/read-marker", 50, Book::default());
+        assert_eq!(sent(&s.command(mark.clone(), now())), ["MARKREAD #test timestamp=2026-10-22T10:00:00.500Z"]);
+        let mut s = historied("", 50, Book::default());
+        assert!(s.command(mark, now()).is_empty());
+    }
+
+    #[test]
+    fn a_query_brought_up_to_date_asks_for_its_marker() {
+        let mut s = historied("draft/read-marker", 50, Book::default());
+        let out = s.command(Command::Open { network: "net".into(), target: "bob".into() }, now());
+        let wire = sent(&out);
+        assert!(wire.contains(&"MARKREAD bob".to_owned()), "{wire:?}");
+        assert!(wire.iter().any(|l| l.ends_with("CHATHISTORY LATEST bob * 20")), "{wire:?}");
+        // Without the cap, no MARKREAD.
+        let mut s = historied("", 50, Book::default());
+        let wire = sent(&s.command(Command::Open { network: "net".into(), target: "bob".into() }, now()));
+        assert!(!wire.iter().any(|l| l.starts_with("MARKREAD")), "{wire:?}");
+    }
+
+    #[test]
+    fn services_queries_the_session_opened_are_not_asked_for_markers() {
+        let mut book = Book::default();
+        book.open("NickServ", true);
+        book.open("bob", true);
+        let mut s = historied("draft/read-marker", 50, book);
+        // `sync` ran at registration inside `historied`; run it again via a fresh session.
+        let mut s2 = Session::new("net", SessionConfig { history_page: Some(20), ..cfg() }).with_book(s.take_book());
+        s2.start();
+        feed(&mut s2, ":srv CAP * LS :message-tags server-time batch labeled-response draft/chathistory draft/read-marker");
+        feed(&mut s2, ":srv CAP alice ACK :message-tags server-time batch labeled-response draft/chathistory draft/read-marker");
+        feed(&mut s2, ":srv 001 alice :hi");
+        let out = feed(&mut s2, ":srv 005 alice CHANTYPES=# CHATHISTORY=50 :are supported");
+        let mut wire = sent(&out);
+        wire.extend(sent(&feed(&mut s2, ":srv 376 alice :End of MOTD")));
+        assert!(wire.contains(&"MARKREAD bob".to_owned()), "{wire:?}");
+        assert!(!wire.iter().any(|l| l.contains("NickServ")), "{wire:?}");
+        // Opened by the user, it is theirs.
+        let wire = sent(&s2.command(Command::Open { network: "net".into(), target: "NickServ".into() }, now()));
+        assert!(wire.contains(&"MARKREAD NickServ".to_owned()), "{wire:?}");
     }
 
     #[test]

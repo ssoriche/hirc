@@ -188,6 +188,13 @@ pub enum Command {
         network: String,
         target: String,
     },
+    /// The user has read `target` up to `time`: move the server's read
+    /// marker there (draft/read-marker), so other clients know.
+    MarkRead {
+        network: String,
+        target: String,
+        time: DateTime<Utc>,
+    },
 }
 
 impl Command {
@@ -202,7 +209,8 @@ impl Command {
             | Command::Disconnect { network, .. }
             | Command::Reconnect { network }
             | Command::Older { network, .. }
-            | Command::Open { network, .. } => network,
+            | Command::Open { network, .. }
+            | Command::MarkRead { network, .. } => network,
         }
     }
 }

@@ -19,6 +19,7 @@ pub const WANTED: CapGroups = &[
     &["labeled-response"],
     &["draft/chathistory", "chathistory"],
     &["draft/event-playback"],
+    &["draft/read-marker"],
 ];
 
 #[derive(Debug)]
@@ -162,7 +163,9 @@ mod tests {
         let req = caps.to_request();
         assert_eq!(
             req,
-            ["message-tags server-time echo-message cap-notify sasl batch away-notify draft/multiline labeled-response draft/chathistory draft/event-playback"]
+            [
+                "message-tags server-time echo-message cap-notify sasl batch away-notify draft/multiline labeled-response draft/chathistory draft/event-playback draft/read-marker"
+            ]
         );
         // Out-of-scope caps Ergo advertises are never requested.
         assert!(!req[0].contains("ergo.chat/nope") && !req[0].contains("znc.in/playback"));

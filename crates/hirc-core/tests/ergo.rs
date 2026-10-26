@@ -345,3 +345,49 @@ async fn targets_open_a_query_from_while_we_were_away() {
     assert_eq!(said(&lines), ["are you there?"]);
     assert!(lines.iter().all(|l| l.replayed));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_marker_survives_a_restart() {
+    let ergo = Ergo::start();
+    register_always_on(ergo.plain_port, "alice", "hunter22").await;
+    let (tx, mut rx) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"));
+    next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
+    let mut bob = Raw::connect(ergo.plain_port, "bob").await;
+    bob.send("JOIN #test").await;
+    // Timestamps have millisecond resolution, so each line is sent once the
+    // last has arrived, 5 ms apart: a marker must fall between two of them.
+    let mut got = Vec::new();
+    for t in ["first", "second", "third"] {
+        bob.send(&format!("PRIVMSG #test :{t}")).await;
+        got.push(next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == t)).await);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let second = &got[1];
+    assert!(got[0].time < second.time && second.time < got[2].time, "{:?}", got.iter().map(|l| l.time).collect::<Vec<_>>());
+    tx.send(Command::MarkRead { network: "test".into(), target: "#test".into(), time: second.time }).unwrap();
+    // Ergo answers a MARKREAD to the session that sent it with the stored
+    // marker: that is the signal the server has it, so wait for it (no sleep).
+    next_matching(&mut rx, |e| match e {
+        Event::ReadMarker { target: Target::Channel(c), time: Some(t), .. } if c == "#test" && *t == second.time => Some(()),
+        _ => None,
+    })
+    .await;
+    tx.send(Command::Disconnect { network: "test".into(), reason: None }).unwrap();
+    next_matching(&mut rx, |e| matches!(e, Event::Status { status: ConnStatus::Offline, .. }).then_some(())).await;
+
+    // A fresh hirc: its store learns the marker and the history, in either order.
+    let (_tx2, mut rx2) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"));
+    let mut store = hirc_core::store::Store::new(["test".to_string()]);
+    let (mut marker, mut third) = (false, false);
+    while !(marker && third) {
+        let ev = next_matching(&mut rx2, |e| Some(e.clone())).await;
+        marker |= matches!(&ev, Event::ReadMarker { target: Target::Channel(c), time: Some(_), .. } if c == "#test");
+        third |= matches!(&ev, Event::History { lines, .. } if lines.iter().any(|l| l.text == "third"));
+        store.apply(ev);
+    }
+    let b = store.buffer_ix(0, &Target::Channel("#test".into()));
+    let buf = &store.networks[0].buffers[b];
+    let ix = buf.first_unread().expect("something unread");
+    assert_eq!(buf.lines[ix].text, "third");
+    assert_eq!(buf.unread, 1);
+}
