@@ -10,6 +10,7 @@ pub mod config;
 pub mod conn;
 pub mod display;
 pub mod event;
+pub mod history;
 pub mod isupport;
 pub mod layout;
 pub mod multiline;

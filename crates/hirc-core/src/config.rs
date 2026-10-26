@@ -55,6 +55,9 @@ pub struct Server {
     pub root_cert_path: Option<PathBuf>,
     pub channels: Vec<String>,
     pub chathistory: bool,
+    /// Lines per history page (default 100), never more than the server's
+    /// CHATHISTORY limit. hirc's key; Halloy ignores it.
+    pub history_page_size: Option<usize>,
     pub sasl: Option<Sasl>,
     /// Relay bots (a Discord bridge, say) whose `<name> text` lines read
     /// as `name`'s own. hirc's key; Halloy ignores it.
@@ -77,6 +80,7 @@ impl Default for Server {
             root_cert_path: None,
             channels: Vec::new(),
             chathistory: true,
+            history_page_size: None,
             sasl: None,
             bridges: Vec::new(),
         }
@@ -388,5 +392,16 @@ password_command = "printf hunter22"
         assert!(missing.is_missing());
         let parse = ConfigError::Parse { path: "x".into(), message: String::new(), line: 1, col: 1 };
         assert!(!parse.is_missing());
+    }
+
+    #[test]
+    fn history_page_size_is_optional_per_server() {
+        let c: Config =
+            toml::from_str("[servers.a]\nnickname='n'\nserver='s'\nhistory_page_size = 250\n[servers.b]\nnickname='n'\nserver='s'\nchathistory = false\n")
+                .unwrap();
+        assert_eq!(c.servers["a"].history_page_size, Some(250));
+        assert!(c.servers["a"].chathistory);
+        assert_eq!(c.servers["b"].history_page_size, None);
+        assert!(!c.servers["b"].chathistory);
     }
 }

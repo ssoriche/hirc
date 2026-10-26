@@ -33,7 +33,8 @@ impl Isupport {
                 "NETWORK" => self.network = (!neg).then(|| val.to_owned()),
                 "CHANTYPES" => self.chantypes = if neg { Isupport::default().chantypes } else { val.to_owned() },
                 "PREFIX" => self.prefix = if neg { Isupport::default().prefix } else { parse_prefix(val) },
-                "CHATHISTORY" | "draft/CHATHISTORY" => self.chathistory = if neg { None } else { val.parse().ok() },
+                // 0 is the spec's "no limit".
+                "CHATHISTORY" | "draft/CHATHISTORY" => self.chathistory = if neg { None } else { val.parse().ok().filter(|&n| n > 0) },
                 _ => {}
             }
         }
@@ -89,5 +90,14 @@ mod tests {
         i.apply(&params(":srv 005 alice PREFIX=garbage =x :y"));
         i.apply(&[]);
         assert!(i.prefix.is_empty());
+    }
+
+    #[test]
+    fn chathistory_zero_is_no_limit() {
+        let mut i = Isupport::default();
+        i.apply(&params(":srv 005 alice CHATHISTORY=0 :are supported"));
+        assert_eq!(i.chathistory, None);
+        i.apply(&params(":srv 005 alice draft/CHATHISTORY=50 :are supported"));
+        assert_eq!(i.chathistory, Some(50));
     }
 }
