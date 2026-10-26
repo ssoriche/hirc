@@ -62,6 +62,8 @@ impl Anchor {
     }
 
     /// The same place by time alone, for a server that can't find the msgid.
+    /// Coarser: many lines can share one millisecond, and a page from a
+    /// time inside such a burst can skip or repeat some of them.
     pub fn by_time(&self) -> Anchor {
         Anchor { msgid: None, time: self.time }
     }
