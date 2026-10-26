@@ -8,6 +8,9 @@
 //!   line, scroll the buffer (`j`/`k`/ctrl-d/ctrl-u/`gg`/`G`) or switch
 //!   windows (`gt`/`gT`). The scroll keys live here because there is no
 //!   other focused widget to receive them while the user is not typing.
+//!   While the text has more than one line, `j` and `k` move between its
+//!   lines instead (as in vim, not past the first or last); the other
+//!   scroll keys still scroll.
 //! - Ex: entered with `:`; typing behaves like Insert and Enter runs the line.
 //!
 //! This module has no gpui types so it can be unit-tested. `input.rs` converts
@@ -284,6 +287,7 @@ impl Vim {
             'd' => self.prefix(Pending::D),
             'c' => self.prefix(Pending::C),
             'g' => self.prefix(Pending::G),
+            'j' | 'k' if text.contains('\n') => line_step(text, cursor, c == 'j').map_or_else(Vec::new, moved),
             'j' => vec![Effect::Scroll(Scroll::Lines(1))],
             'k' => vec![Effect::Scroll(Scroll::Lines(-1))],
             'G' => vec![Effect::Scroll(Scroll::Bottom)],
@@ -348,6 +352,22 @@ pub fn clamp_normal(text: &str, cursor: usize) -> usize {
         c -= 1;
     }
     c
+}
+
+/// The cursor one line down (or up) in a text of several lines, in the
+/// same column (in chars) or at the end of a shorter line; `None` on the
+/// last (or first) line.
+fn line_step(text: &str, at: usize, down: bool) -> Option<usize> {
+    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let column = text[start..at].chars().count();
+    let (from, to) = if down {
+        let end = at + text[at..].find('\n')?;
+        (end + 1, text[end + 1..].find('\n').map_or(text.len(), |i| end + 1 + i))
+    } else {
+        let end = start.checked_sub(1)?;
+        (text[..end].rfind('\n').map_or(0, |i| i + 1), end)
+    };
+    Some(text[from..to].char_indices().nth(column).map_or(to, |(i, _)| from + i))
 }
 
 fn prev_char(text: &str, at: usize) -> usize {
@@ -707,6 +727,28 @@ mod tests {
                 Effect::Scroll(Scroll::Bottom),
             ]
         );
+    }
+
+    #[test]
+    fn j_and_k_move_between_lines_of_a_multiline_text() {
+        // "one\nfour five\nsix": `k`/`j` keep the column, or end a short line.
+        let mut s = Sim::normal("one\nfour five\nsix", 6);
+        s.keys("k");
+        assert_eq!(s.state(), ("one\nfour five\nsix", 2, Mode::Normal));
+        s.keys("j");
+        assert_eq!(s.cursor, 6);
+        s.keys("j");
+        assert_eq!(s.cursor, 16);
+        // Not past the last line or the first, and the view never scrolls.
+        s.keys("j");
+        assert_eq!(s.cursor, 16);
+        s.keys("kkk");
+        assert_eq!(s.cursor, 2);
+        assert!(!s.effects.iter().any(|e| matches!(e, Effect::Scroll(_))), "{:?}", s.effects);
+        // An empty line in between is a line of its own.
+        assert_eq!(line_step("ab\n\ncd", 1, true), Some(3));
+        assert_eq!(line_step("ab\n\ncd", 3, true), Some(4));
+        assert_eq!(line_step("ab\n\ncd", 4, false), Some(3));
     }
 
     #[test]

@@ -409,26 +409,34 @@ impl Runs {
 
     /// The text broken onto lines `width` wide (see `wrap`), in the
     /// app's font as it will be drawn, so its lines always fit and gpui
-    /// never breaks them again.
+    /// never breaks them again. A message of several lines keeps its own
+    /// line breaks, and each of its lines wraps by itself.
     fn wrap(self, app: &HircApp, window: &Window, width: f32) -> Runs {
         if self.text.is_empty() || width <= 0. {
             return self;
         }
-        let runs: Vec<TextRun> = self
-            .runs
-            .iter()
-            .map(|(range, style)| TextRun {
-                len: range.len(),
-                font: gpui::Font { weight: style.font_weight.unwrap_or(app.font.weight), ..app.font.clone() },
-                color: style.color.unwrap_or_default(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            })
-            .collect();
-        let shaped = window.text_system().shape_line(self.text.clone().into(), px(app.metrics.size), &runs, None);
+        // Each line shaped alone, in its runs' fonts.
+        let shape = |line: std::ops::Range<usize>| {
+            let runs: Vec<TextRun> = self
+                .runs
+                .iter()
+                .filter_map(|(range, style)| {
+                    let len = range.end.min(line.end).saturating_sub(range.start.max(line.start));
+                    (len > 0).then(|| TextRun {
+                        len,
+                        font: gpui::Font { weight: style.font_weight.unwrap_or(app.font.weight), ..app.font.clone() },
+                        color: style.color.unwrap_or_default(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    })
+                })
+                .collect();
+            let shaped = window.text_system().shape_line(self.text[line].to_owned().into(), px(app.metrics.size), &runs, None);
+            move |i: usize| f32::from(shaped.x_for_index(i))
+        };
         // Half a px short, so rounding never tips a line over.
-        let breaks = wrap::breaks(&self.text, |i| f32::from(shaped.x_for_index(i)), width - 0.5);
+        let breaks = wrap::breaks_lines(&self.text, shape, width - 0.5);
         if breaks.is_empty() {
             return self;
         }

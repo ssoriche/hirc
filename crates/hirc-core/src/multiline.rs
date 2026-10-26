@@ -103,6 +103,17 @@ pub fn batches<'a>(text: &'a str, budget: usize, limits: &Limits) -> Vec<Vec<Pie
     out
 }
 
+/// How many messages `text` goes out as, each body at most `budget`
+/// bytes, as `Session` sends it: one per batch while the server takes
+/// `limits` (and there is more than one line), else one per piece of each
+/// line that isn't blank.
+pub fn messages(text: &str, budget: usize, limits: Option<&Limits>) -> usize {
+    match limits {
+        Some(limits) if lines(text).len() > 1 => batches(text, budget, limits).len(),
+        _ => text.lines().filter(|l| !l.is_empty()).map(|l| crate::split::split_utf8(l, budget).len()).sum(),
+    }
+}
+
 /// A batch's lines as the one message they make: `\n` between lines,
 /// nothing before a continuation.
 pub fn join<'a>(pieces: impl IntoIterator<Item = (&'a str, bool)>) -> String {
@@ -190,6 +201,17 @@ mod tests {
         let b = batches(&wide, 400, &limits(8, None));
         assert_eq!(b.len(), 3);
         assert!(b.iter().all(|b| !b[0].concat && b.iter().map(|p| p.text.len()).sum::<usize>() <= 8));
+    }
+
+    #[test]
+    fn counts_the_messages_a_text_makes() {
+        let six = "1\n2\n\n3\n4\n5\n6";
+        assert_eq!(messages(six, 400, None), 6);
+        assert_eq!(messages(&"a".repeat(30), 10, None), 3);
+        assert_eq!(messages(six, 400, Some(&limits(4096, None))), 1);
+        assert_eq!(messages(six, 400, Some(&limits(4096, Some(3)))), 3);
+        // One line goes plain, whatever the server takes.
+        assert_eq!(messages("one", 400, Some(&limits(4096, Some(3)))), 1);
     }
 
     #[test]

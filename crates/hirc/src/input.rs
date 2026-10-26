@@ -1,12 +1,20 @@
-//! The message input: a single-line text field with IME, selection and
-//! clipboard. Adapted from gpui's `examples/input.rs` (Apache-2.0,
-//! Zed Industries). Enter emits `Submit` with the text and clears it.
+//! The message input: a text field with IME, selection and clipboard.
+//! Adapted from gpui's `examples/input.rs` (Apache-2.0, Zed Industries).
+//! Enter emits `Submit` with the text; the app clears it once it goes
+//! (`sent`), or holds it with a note under it (`hold`).
+//!
+//! It is one row until the text needs more: a line of its own for each
+//! line break (Shift+Enter, or a paste), and a long line wrapped where
+//! the message view would wrap it, up to `MAX_ROWS`, then it scrolls
+//! inside. Every row is a line of the grid, so the view above gives up
+//! whole lines. The ex line stays one row and scrolls sideways.
 
 use std::ops::Range;
 
 use crate::metrics::{Metrics, Shape};
 use crate::theme::Palette;
 use crate::vim::{self, Effect, Key, Mode, Named, Vim};
+use crate::wrap;
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
@@ -15,7 +23,20 @@ use gpui::{
 use hirc_core::command;
 use unicode_segmentation::*;
 
-actions!(text_input, [Backspace, Delete, Left, Right, SelectLeft, SelectRight, SelectAll, Home, End, ShowCharacterPalette, Paste, Cut, Copy, Enter,]);
+actions!(text_input, [Backspace, Delete, Left, Right, SelectLeft, SelectRight, SelectAll, Home, End, ShowCharacterPalette, Paste, Cut, Copy, Enter, Newline,]);
+
+/// The most rows the input shows; more text scrolls inside them.
+pub const MAX_ROWS: usize = 5;
+
+/// A one-line note under the text: why Enter did not send it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Note {
+    /// It can't go as it is (in the error role).
+    Error(String),
+    /// It goes on a second Enter (in the hint role); Esc or any edit
+    /// puts it away.
+    Confirm(String),
+}
 
 pub struct TextInput {
     focus_handle: FocusHandle,
@@ -27,8 +48,13 @@ pub struct TextInput {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    /// The rows drawn last, when the text took more than one: each one's
+    /// range of the text, its line and where it was drawn.
+    last_rows: Vec<(Range<usize>, ShapedLine, Point<Pixels>)>,
     /// Horizontal scroll of the text, recomputed on every prepaint.
     scroll_x: Pixels,
+    /// The first row shown, when there are more than `MAX_ROWS`.
+    scroll_row: usize,
     is_selecting: bool,
     vim: Vim,
     /// For the mode label; set by the app.
@@ -39,6 +65,11 @@ pub struct TextInput {
     /// view's text column, so a line is typed where it will be shown. The
     /// mode label sits right-aligned before it, where nicks sit.
     pub column: f32,
+    /// The text's width (from the column to the bar's padding), set by
+    /// the app: rows wrap against it, as the message view's text does.
+    pub width: f32,
+    /// Shown under the text until the next edit (see `Note`).
+    pub note: Option<Note>,
 }
 
 impl TextInput {
@@ -126,7 +157,15 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace("\n", " "), window, cx);
+            let text = pasted(&text, self.vim.mode == Mode::Ex);
+            self.replace_text_in_range(None, &text, window, cx);
+        }
+    }
+
+    /// Shift+Enter: a line break, in Insert mode (the ex line is one line).
+    fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vim.mode == Mode::Insert {
+            self.replace_text_in_range(None, "\n", window, cx);
         }
     }
 
@@ -164,6 +203,9 @@ impl TextInput {
         if self.content.is_empty() {
             return 0;
         }
+        if let Some(ix) = self.row_index(position) {
+            return ix;
+        }
 
         let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref()) else {
             return 0;
@@ -175,6 +217,13 @@ impl TextInput {
             return self.content.len();
         }
         line.closest_index_for_x(position.x - bounds.left() + self.scroll_x) + self.hidden()
+    }
+
+    /// The character nearest `position` among the rows drawn last (above
+    /// them, the first row; below, the last), when the text took several.
+    fn row_index(&self, position: Point<Pixels>) -> Option<usize> {
+        let (range, row, origin) = self.last_rows.iter().rev().find(|(_, _, o)| position.y >= o.y).or(self.last_rows.first())?;
+        Some(range.start + row.closest_index_for_x(position.x - origin.x).min(range.len()))
     }
 
     /// Bytes at the start of the line that are not drawn as text: the ex
@@ -227,8 +276,47 @@ impl TextInput {
         self.marked_range = None;
         self.last_layout = None;
         self.last_bounds = None;
+        self.last_rows.clear();
         self.scroll_x = px(0.);
+        self.scroll_row = 0;
         self.is_selecting = false;
+        self.note = None;
+    }
+
+    /// The rows the text shows as, `width` wide, when it needs more than
+    /// one: a row for each line break, and a long line wrapped where the
+    /// message view would wrap it (see `wrap`). `None` for one row, and
+    /// for the ex line, which stays one row and scrolls sideways.
+    fn rows(&self, window: &Window, width: f32) -> Option<Vec<Range<usize>>> {
+        if self.vim.mode == Mode::Ex || self.content.is_empty() {
+            return None;
+        }
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let text = &self.content;
+        let breaks = if width > 0. {
+            let shape = |r: Range<usize>| {
+                let run = TextRun { len: r.len(), font: style.font(), color: style.color, background_color: None, underline: None, strikethrough: None };
+                let line = (!r.is_empty()).then(|| window.text_system().shape_line(text[r].to_owned().into(), font_size, &[run], None));
+                move |i: usize| line.as_ref().map_or(0., |l| f32::from(l.x_for_index(i)))
+            };
+            // Half a px short, as the message view breaks.
+            wrap::breaks_lines(text, shape, width - 0.5)
+        } else {
+            Vec::new()
+        };
+        let rows = wrap::rows(text, &breaks);
+        (rows.len() > 1).then_some(rows)
+    }
+
+    /// The width rows wrap against: the app's, else what was drawn last.
+    fn wrap_width(&self, bounds: Option<Bounds<Pixels>>) -> f32 {
+        if self.width > 0. { self.width } else { bounds.map_or(0., |b| f32::from(b.size.width)) }
+    }
+
+    /// The text changed: a note about what it was goes.
+    fn edited(&mut self) {
+        self.note = None;
     }
 }
 
@@ -269,6 +357,7 @@ impl EntityInputHandler for TextInput {
         self.content = (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
+        self.edited();
         cx.notify();
     }
 
@@ -288,6 +377,7 @@ impl EntityInputHandler for TextInput {
         let range = clamp_range(&self.content, &range);
 
         self.content = (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
+        self.edited();
         if !new_text.is_empty() {
             self.marked_range = Some(range.start..range.start + new_text.len());
         } else {
@@ -303,13 +393,23 @@ impl EntityInputHandler for TextInput {
     }
 
     fn bounds_for_range(&mut self, range_utf16: Range<usize>, bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Bounds<Pixels>> {
-        let last_layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
+        // Several rows: the row the range starts on.
+        if let Some((r, row, origin)) = self.last_rows.iter().rev().find(|(r, _, _)| r.start <= range.start) {
+            let line = self.metrics.map_or(bounds.size.height, |m| px(m.line));
+            let x = |i: usize| origin.x + row.x_for_index(i.clamp(r.start, r.end) - r.start);
+            return Some(Bounds::from_corners(point(x(range.start), origin.y), point(x(range.end), origin.y + line)));
+        }
+        let last_layout = self.last_layout.as_ref()?;
         let x = |i: usize| bounds.left() - self.scroll_x + last_layout.x_for_index(i.saturating_sub(self.hidden()));
         Some(Bounds::from_corners(point(x(range.start), bounds.top()), point(x(range.end), bounds.bottom())))
     }
 
     fn character_index_for_point(&mut self, point: gpui::Point<Pixels>, _window: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
+        if !self.last_rows.is_empty() {
+            self.last_bounds?.localize(&point)?;
+            return self.row_index(point).map(|ix| self.offset_to_utf16(ix));
+        }
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
 
@@ -346,6 +446,11 @@ struct PrepaintState {
     /// While the ex line is open, the draft it parked: at the row's far
     /// end in the placeholder's role, and where it starts.
     parked: Option<(ShapedLine, Pixels)>,
+    /// When the text takes several rows: the ones shown, each with its
+    /// range of the text and where it is drawn (`line` is then `None`),
+    /// and the selection's fill on each.
+    rows: Vec<(Range<usize>, ShapedLine, Point<Pixels>)>,
+    fills: Vec<PaintQuad>,
 }
 
 impl IntoElement for TextElement {
@@ -375,9 +480,12 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        // One line, or as many rows as the text takes, up to `MAX_ROWS`.
+        let input = self.input.read(cx);
+        let rows = input.rows(window, input.wrap_width(input.last_bounds)).map_or(1, |r| r.len().min(MAX_ROWS));
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
+        style.size.height = (window.line_height() * rows as f32).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -442,6 +550,18 @@ impl Element for TextElement {
             let run = TextRun { len: s.len(), font: style.font(), color, background_color: None, underline: None, strikethrough: None };
             window.text_system().shape_line(s, font_size, &[run], None)
         };
+        if hidden == 0
+            && let Some(rows) = input.rows(window, input.wrap_width(Some(bounds)))
+        {
+            let spans = spans(shown.len(), (text, false), &over);
+            let rows = Rows { rows, spans, shown: &shown, mode: input.vim.mode, cursor, selection: selected_range, scroll: input.scroll_row };
+            let (state, top) = Self::rows(rows, bounds, window, m, (text, bg, selection_bg));
+            self.input.update(cx, |input, _cx| {
+                input.scroll_x = px(0.);
+                input.scroll_row = top;
+            });
+            return state;
+        }
         // The placeholder starts on the text column, where typing will:
         // the bar sits in the gap before it, as before any glyph, and under
         // the Normal block its first glyph is reversed, as typed text's is.
@@ -515,8 +635,11 @@ impl Element for TextElement {
             let x = bounds.right() - shaped.width;
             Some((shaped, x))
         });
-        self.input.update(cx, |input, _cx| input.scroll_x = scroll_x);
-        PrepaintState { line: Some(line), placeholder, block, reversed, caret, scroll_x, selection, marks, parked }
+        self.input.update(cx, |input, _cx| {
+            input.scroll_x = scroll_x;
+            input.scroll_row = 0;
+        });
+        PrepaintState { line: Some(line), placeholder, block, reversed, caret, scroll_x, selection, marks, parked, rows: Vec::new(), fills: Vec::new() }
     }
 
     fn paint(
@@ -531,6 +654,9 @@ impl Element for TextElement {
     ) {
         let focus_handle = self.input.read(cx).focus_handle.clone();
         window.handle_input(&focus_handle, ElementInputHandler::new(bounds, self.input.clone()), cx);
+        if !prepaint.rows.is_empty() {
+            return self.paint_rows(bounds, prepaint, focus_handle.is_focused(window), window, cx);
+        }
         let Some(line) = prepaint.line.take() else {
             return;
         };
@@ -584,6 +710,144 @@ impl Element for TextElement {
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.last_rows.clear();
+        });
+    }
+}
+
+/// What `TextElement::rows` lays out: the rows (ranges of `shown`), the
+/// colour spans over the whole text, the mode, the cursor and selection,
+/// and the first row shown last time.
+struct Rows<'a> {
+    rows: Vec<Range<usize>>,
+    spans: Vec<(Range<usize>, (gpui::Hsla, bool))>,
+    shown: &'a str,
+    mode: Mode,
+    cursor: usize,
+    selection: Range<usize>,
+    scroll: usize,
+}
+
+impl TextElement {
+    /// The text on several rows: up to `MAX_ROWS` of them, scrolled so
+    /// the cursor's row shows, each a line of the grid on the text
+    /// column. The cursor, the Normal block and the selection go where
+    /// they would on one line, on their own row. `colors` are the text,
+    /// the background and the selection fill. Returns the first row shown.
+    fn rows(r: Rows, bounds: Bounds<Pixels>, window: &mut Window, m: Metrics, colors: (gpui::Hsla, gpui::Hsla, gpui::Hsla)) -> (PrepaintState, usize) {
+        let (text, bg, selection_bg) = colors;
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line_h = px(m.line);
+        let total = r.rows.len();
+        let at = r.rows.iter().rposition(|row| row.start <= r.cursor).unwrap_or(0);
+        let top = scroll_rows(r.scroll, at, total, MAX_ROWS);
+        let runs = |range: &Range<usize>, color: Option<gpui::Hsla>| -> Vec<TextRun> {
+            r.spans
+                .iter()
+                .filter_map(|(span, (c, underline))| {
+                    let len = span.end.min(range.end).saturating_sub(span.start.max(range.start));
+                    let c = color.unwrap_or(*c);
+                    (len > 0).then(|| TextRun {
+                        len,
+                        font: style.font(),
+                        color: c,
+                        background_color: None,
+                        underline: underline.then_some(UnderlineStyle { color: Some(c), thickness: px(1.0), wavy: false }),
+                        strikethrough: None,
+                    })
+                })
+                .collect()
+        };
+        let shape = |range: &Range<usize>, color: Option<gpui::Hsla>| {
+            window.text_system().shape_line(r.shown[range.clone()].to_owned().into(), font_size, &runs(range, color), None)
+        };
+        let sel = &r.selection;
+        let (mut rows, mut fills, mut block, mut reversed, mut caret) = (Vec::new(), Vec::new(), None, None, None);
+        for (i, range) in r.rows.iter().enumerate().skip(top).take(MAX_ROWS) {
+            let origin = point(bounds.left(), bounds.top() + line_h * (i - top) as f32);
+            let line = shape(range, None);
+            let x = |ix: usize| origin.x + line.x_for_index(ix.clamp(range.start, range.end) - range.start);
+            // The selection on this row. Where it goes on over the break
+            // that ends the row (a line break, a wrapped space), a cell
+            // more shows that it takes the break too.
+            let over = r.rows.get(i + 1).is_some_and(|next| next.start > range.end) && sel.end > range.end;
+            if !sel.is_empty() && sel.start <= range.end && sel.end >= range.start {
+                let (a, b) = (x(sel.start), if over { x(range.end) + px(m.cell) } else { x(sel.end) });
+                if b > a {
+                    fills.push(fill(Bounds::from_corners(point(a, origin.y), point(b, origin.y + line_h)), selection_bg));
+                }
+            }
+            if i == at && sel.is_empty() {
+                let glyph_top = origin.y + px(m.glyph_top);
+                let cursor_x = x(r.cursor);
+                if r.mode == Mode::Normal {
+                    let end = next_char_boundary(r.shown, r.cursor).min(range.end);
+                    let width = if x(end) > cursor_x { x(end) - cursor_x } else { px(m.cell) };
+                    block = Some(fill(Bounds::new(point(cursor_x, glyph_top), size(width, px(m.glyph))), text));
+                    reversed = Some((shape(range, Some(bg)), origin));
+                } else {
+                    // At a row's start the bar sits in the gap before the
+                    // text column, as at the start of one line.
+                    let gap = px(m.caret);
+                    let x = if r.cursor == range.start { origin.x - gap * 2. - px(m.caret) } else { cursor_x + gap };
+                    caret = Some(fill(Bounds::new(point(x, glyph_top), size(px(m.caret), px(m.glyph))), text));
+                }
+            }
+            rows.push((range.clone(), line, origin));
+        }
+        let state = PrepaintState {
+            line: None,
+            placeholder: None,
+            block,
+            reversed,
+            caret,
+            scroll_x: px(0.),
+            selection: None,
+            marks: Vec::new(),
+            parked: None,
+            rows,
+            fills,
+        };
+        (state, top)
+    }
+
+    /// `paint` for text on several rows (see `rows`).
+    fn paint_rows(&mut self, bounds: Bounds<Pixels>, prepaint: &mut PrepaintState, focused: bool, window: &mut Window, cx: &mut App) {
+        let line_height = window.line_height();
+        let block = prepaint.block.take().filter(|_| focused);
+        let caret = prepaint.caret.take().filter(|_| focused);
+        let rows = std::mem::take(&mut prepaint.rows);
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            for quad in prepaint.fills.drain(..) {
+                window.paint_quad(quad);
+            }
+            for (_, line, origin) in &rows {
+                if let Err(e) = line.paint(*origin, line_height, gpui::TextAlign::Left, None, window, cx) {
+                    tracing::debug!("input paint failed: {e}");
+                }
+            }
+            if let Some(block) = block {
+                let cell = block.bounds;
+                window.paint_quad(block);
+                if let Some((text, at)) = prepaint.reversed.take() {
+                    window.with_content_mask(Some(ContentMask { bounds: cell }), |window| {
+                        if let Err(e) = text.paint(at, line_height, gpui::TextAlign::Left, None, window, cx) {
+                            tracing::debug!("input paint failed: {e}");
+                        }
+                    });
+                }
+            }
+        });
+        // Outside the mask, as on one line: at a row's start the bar sits
+        // just before the text column.
+        if let Some(caret) = caret {
+            window.paint_quad(caret);
+        }
+        self.input.update(cx, |input, _cx| {
+            input.last_layout = None;
+            input.last_bounds = Some(bounds);
+            input.last_rows = rows;
         });
     }
 }
@@ -601,6 +865,13 @@ impl Render for TextInput {
             Mode::Ex => (":", p.map(|p| p.text), false),
         };
         let cell = self.metrics.map_or(px(8.), |m| px(m.cell));
+        // A note under the text, on its column: a hint to confirm a big
+        // send, in the placeholder's role, or why it can't go, in the
+        // error role. One row, cut to fit.
+        let note = self.note.as_ref().map(|note| match note {
+            Note::Error(text) => (text.clone(), p.map(|p| p.error)),
+            Note::Confirm(text) => (text.clone(), p.map(|p| p.hint)),
+        });
         div()
             .flex()
             .key_context("TextInput")
@@ -608,6 +879,7 @@ impl Render for TextInput {
             .capture_key_down(cx.listener(Self::on_key_down))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::enter))
+            .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
@@ -634,7 +906,15 @@ impl Render for TextInput {
                     .w(px(self.column))
                     .child(div().when_some(color, |d, c| d.text_color(c)).when(gap, |d| d.mr(cell)).child(label)),
             )
-            .child(div().flex_1().min_w(px(0.)).child(TextElement { input: cx.entity() }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .child(TextElement { input: cx.entity() })
+                    .when_some(note, |d, (text, color)| d.child(div().when_some(color, |d, c| d.text_color(c)).truncate().child(text))),
+            )
     }
 }
 
@@ -660,12 +940,16 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            last_rows: Vec::new(),
             scroll_x: px(0.),
+            scroll_row: 0,
             is_selecting: false,
             vim: Vim::default(),
             palette: None,
             metrics: None,
             column: 0.,
+            width: 0.,
+            note: None,
         }
     }
 
@@ -688,14 +972,29 @@ impl TextInput {
         self.submit(cx);
     }
 
+    /// Hand the text to the app, which clears it once it goes (`sent`)
+    /// or holds it with a note (`hold`). A second Enter on a confirm note
+    /// confirms.
     fn submit(&mut self, cx: &mut Context<Self>) {
         let text = self.content.to_string();
         if text.trim().is_empty() {
             return;
         }
+        let confirmed = matches!(self.note, Some(Note::Confirm(_)));
+        cx.emit(Submit { text, confirmed });
+        cx.notify();
+    }
+
+    /// What was submitted went: start a fresh line.
+    pub fn sent(&mut self, cx: &mut Context<Self>) {
         self.reset();
         self.vim.reset();
-        cx.emit(Submit(text));
+        cx.notify();
+    }
+
+    /// What was submitted stays, with `note` under it.
+    pub fn hold(&mut self, note: Note, cx: &mut Context<Self>) {
+        self.note = Some(note);
         cx.notify();
     }
 
@@ -715,6 +1014,10 @@ impl TextInput {
 
     /// Run a key through vim and apply the effects. True if vim consumed it.
     fn vim_key(&mut self, key: Key, cx: &mut Context<Self>) -> bool {
+        // Esc puts a note away (a confirm is cancelled), whatever the mode.
+        if key.named == Some(Named::Escape) && self.note.take().is_some() {
+            cx.notify();
+        }
         let cursor = clamp_range(&self.content, &(self.cursor_offset()..self.cursor_offset())).start;
         let effects = self.vim.key(&key, &self.content, cursor);
         if effects == [Effect::Pass] {
@@ -724,6 +1027,9 @@ impl TextInput {
             match effect {
                 Effect::Pass => {}
                 Effect::Edit { text, cursor } => {
+                    if text != self.content.as_ref() {
+                        self.edited();
+                    }
                     self.content = text.into();
                     self.selected_range = cursor..cursor;
                     self.selection_reversed = false;
@@ -772,7 +1078,11 @@ pub struct VimEvent(pub vim::Effect);
 
 impl EventEmitter<VimEvent> for TextInput {}
 
-pub struct Submit(pub String);
+/// The text Enter submitted, and whether it confirms a note asking to.
+pub struct Submit {
+    pub text: String,
+    pub confirmed: bool,
+}
 
 impl EventEmitter<Submit> for TextInput {}
 
@@ -780,6 +1090,7 @@ impl EventEmitter<Submit> for TextInput {}
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("enter", Enter, Some("TextInput")),
+        KeyBinding::new("shift-enter", Newline, Some("TextInput")),
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
         KeyBinding::new("delete", Delete, Some("TextInput")),
         KeyBinding::new("left", Left, Some("TextInput")),
@@ -866,6 +1177,30 @@ fn tail_fit(text: &str, room: f32, width: impl Fn(&str) -> f32) -> Option<String
     let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
     let shown = starts.iter().map(|&i| format!("…{}", &text[i..])).find(|s| width(s) <= room)?;
     (shown.chars().count() > PARKED_MIN_CHARS).then_some(shown)
+}
+
+/// The first of `shown` rows to show of `total`, so the cursor's row (`at`)
+/// shows: `prev` while it does, else just far enough to bring it in, and
+/// never past the last row.
+fn scroll_rows(prev: usize, at: usize, total: usize, shown: usize) -> usize {
+    let most = total.saturating_sub(shown);
+    let top = if at < prev {
+        at
+    } else if at >= prev + shown {
+        at + 1 - shown
+    } else {
+        prev
+    };
+    top.min(most)
+}
+
+/// What a paste puts in: its line breaks as `\n` (from `\r\n` and `\r`
+/// too), without those at its very end. The ex line is one line, so there
+/// each break is a space.
+fn pasted(text: &str, one_line: bool) -> String {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text = text.trim_end_matches('\n');
+    if one_line { text.replace('\n', " ") } else { text.to_owned() }
 }
 
 /// `scroll` moved on to the next glyph edge (of `edges`, ascending) that

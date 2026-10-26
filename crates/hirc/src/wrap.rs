@@ -8,6 +8,7 @@
 //! `/` (for paths), which orphans a question mark onto a line of its own;
 //! breaking here first means its lines always fit.
 
+use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// One break: the next line starts at byte `at`. When `space`, the byte
@@ -165,6 +166,49 @@ fn ideographic(c: char) -> bool {
         | 0x2600..=0x27BF)
 }
 
+/// `breaks` for a text that may hold line breaks of its own (a message
+/// of several lines): each line between them breaks by itself, given
+/// `line_x(range)`, the advance function of the line at `range` (from its
+/// own start), and its `\n`s stay as they are.
+pub fn breaks_lines<X: Fn(usize) -> f32>(text: &str, mut line_x: impl FnMut(Range<usize>) -> X, width: f32) -> Vec<Break> {
+    let mut out = Vec::new();
+    for r in hard_lines(text) {
+        let x = line_x(r.clone());
+        out.extend(breaks(&text[r.clone()], x, width).into_iter().map(|b| Break { at: b.at + r.start, ..b }));
+    }
+    out
+}
+
+/// The lines of `text` between its own `\n`s, as byte ranges (one empty
+/// range for an empty text).
+pub fn hard_lines(text: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, _) in text.match_indices('\n') {
+        out.push(start..i);
+        start = i + 1;
+    }
+    out.push(start..text.len());
+    out
+}
+
+/// The rows `text` shows as with `breaks` made (see `breaks_lines`), as
+/// byte ranges of `text`: a row ends at a `\n` or a break, and leaves out
+/// the `\n`, or the space a break replaces.
+pub fn rows(text: &str, breaks: &[Break]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut cuts: Vec<(usize, usize)> = text.match_indices('\n').map(|(i, _)| (i, i + 1)).collect();
+    cuts.extend(breaks.iter().map(|b| if b.space { (b.at - 1, b.at) } else { (b.at, b.at) }));
+    cuts.sort_unstable();
+    for (end, next) in cuts {
+        out.push(start..end);
+        start = next;
+    }
+    out.push(start..text.len());
+    out
+}
+
 /// `text` with `breaks` made: each a `\n`, replacing the space before it
 /// or inserted. Returns the new text and, for each byte offset of the
 /// old text, how far it moved (so styled ranges can follow).
@@ -253,6 +297,26 @@ mod tests {
     #[test]
     fn urls_break_after_a_slash() {
         assert_eq!(lines("see https://ex.am/path/to?q=1", 18.), ["see https://ex.am/", "path/to?q=1"]);
+    }
+
+    #[test]
+    fn own_line_breaks_stay_and_each_line_wraps_alone() {
+        let text = "aaa bbb\n\nccc ddd eee";
+        let b = breaks_lines(text, |r| mono(&text[r]), 7.);
+        let (out, _) = apply(text, &b);
+        assert_eq!(out, "aaa bbb\n\nccc ddd\neee");
+        assert_eq!(hard_lines("a\n\nb"), [0..1, 2..2, 3..4]);
+        assert_eq!(hard_lines(""), vec![0..0]);
+    }
+
+    #[test]
+    fn rows_leave_out_newlines_and_replaced_spaces() {
+        let text = "ab cd\nefgh";
+        let b = [Break { at: 3, space: true }, Break { at: 8, space: false }];
+        let rows: Vec<&str> = rows(text, &b).into_iter().map(|r| &text[r]).collect();
+        assert_eq!(rows, ["ab", "cd", "ef", "gh"]);
+        assert_eq!(super::rows("", &[]), vec![0..0]);
+        assert_eq!(super::rows("a\n", &[]), [0..1, 2..2]);
     }
 
     #[test]

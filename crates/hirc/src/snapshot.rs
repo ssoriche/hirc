@@ -18,7 +18,7 @@
 //!
 //! | Variable | Effect |
 //! |---|---|
-//! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` never leaves the process; a faked server answers some sends through the session: a JOIN comes back as our JOIN plus a NAMES of just us (no topic), a PART as our PART, and on an `echo_message` server a PRIVMSG/NOTICE as its echo. Everything else is dropped. Connection status follows conn.rs: an `Output::Quit` (`/quit`) is `Offline`, an `Output::Stop` (e.g. a SASL failure) is `Failed { reason }`, and a server `ERROR` line closes the connection as `Disconnected { reason: <the ERROR text>, retry }`, with conn.rs's first retry delay. Either way that network reads no more fixture lines and later commands to it go nowhere (no reconnect is faked). |
+//! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` never leaves the process; a faked server answers some sends through the session: a JOIN comes back as our JOIN plus a NAMES of just us (no topic), a PART as our PART, and on an `echo_message` server a PRIVMSG/NOTICE as its echo, a `draft/multiline` batch (a server with `multiline`) as the whole batch. Everything else is dropped. Connection status follows conn.rs: an `Output::Quit` (`/quit`) is `Offline`, an `Output::Stop` (e.g. a SASL failure) is `Failed { reason }`, and a server `ERROR` line closes the connection as `Disconnected { reason: <the ERROR text>, retry }`, with conn.rs's first retry delay. Either way that network reads no more fixture lines and later commands to it go nowhere (no reconnect is faked). |
 //! | `HIRC_SCREENSHOT=<out.png>` | Final image, taken after the script. Window mode waits 300 ms for layout, captures, quits. |
 //! | `HIRC_OFFSCREEN=1` | Offscreen mode (above). Exits 0 when done; on failure prints `snapshot: <reason>` and exits 1. |
 //! | `HIRC_SIZE=WxH` | Logical size (default `1200x800`). |
@@ -43,6 +43,7 @@
 //! | `scroll:<px>` | Scroll wheel over the buffer view; negative scrolls down. |
 //! | `drag:x1,y1,x2,y2` | Primary mouse down at (x1, y1), moved with the button held to (x2, y2) and up there: selects message text. |
 //! | `dclick:x,y`, `tclick:x,y` | A double or triple primary click at (x, y): selects a word or a line. |
+//! | `paste:<text>` | Put `<text>` on the clipboard (`\n` a line break, `\r` a carriage return, `\\` a backslash) and `⌘V` it through the normal key path. |
 //! | `copy` | `⌘C` through the normal key path, then prints what the clipboard holds as `snapshot: clipboard <text>` on stdout (`\` and newlines escaped). |
 //! | `delay:<ms>` | From now on the fake server holds its echo of our messages this long (simulated time offscreen), so a shot can show a line waiting for its echo. `delay:0` answers at once again. |
 //!
@@ -113,6 +114,10 @@ pub struct FixtureServer {
     /// As the config's `bridges`.
     #[serde(default)]
     pub bridges: Vec<String>,
+    /// The `draft/multiline` value the server advertises (and ACKs, with
+    /// `batch` and `message-tags`), e.g. `max-bytes=4096,max-lines=24`.
+    #[serde(default)]
+    pub multiline: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,6 +136,7 @@ pub enum Step {
     /// A click `n` times over, at (x, y).
     Clicks(usize, f32, f32),
     Copy,
+    Paste(String),
     Delay(u64),
     Unknown(String),
 }
@@ -161,6 +167,7 @@ pub fn parse_script(script: &str) -> Vec<Step> {
                 // github-rs writes `cmd+k`; gpui writes `cmd-k`.
                 Some(("key", k)) => Step::Key(k.trim().replace('+', "-")),
                 Some(("type", t)) => Step::Type(t.to_owned()),
+                Some(("paste", t)) => Step::Paste(unescape(t)),
                 Some(("wait", ms)) => ms.trim().parse().map_or_else(|_| unknown(), Step::Wait),
                 Some(("delay", ms)) => ms.trim().parse().map_or_else(|_| unknown(), Step::Delay),
                 Some(("shot", p)) => Step::Shot(p.trim().to_owned()),
@@ -276,9 +283,17 @@ pub fn feed(fx: &Fixture) -> Result<(Vec<Event>, HashMap<String, Session>), Stri
     'servers: for srv in &fx.server {
         let mut session = Session::new(&srv.name, session_config(srv));
         session.start(); // its sends go nowhere
-        if srv.echo_message {
-            // Through `handle`, so no private API is needed.
-            for line in ["CAP * LS :echo-message", "CAP * ACK :echo-message"] {
+        // Through `handle`, so no private API is needed.
+        let caps: Vec<String> = srv
+            .echo_message
+            .then(|| "echo-message".to_owned())
+            .into_iter()
+            .chain(srv.multiline.iter().map(|v| format!("batch message-tags draft/multiline={v}")))
+            .collect();
+        if !caps.is_empty() {
+            let ls = caps.join(" ");
+            let ack: Vec<&str> = ls.split(' ').map(|c| c.split_once('=').map_or(c, |(k, _)| k)).collect();
+            for line in [format!("CAP * LS :{ls}"), format!("CAP * ACK :{}", ack.join(" "))] {
                 feed_line(&mut session, &srv.name, &format!(":irc.example {line}"), base, &mut events)?;
             }
         }
@@ -319,9 +334,14 @@ fn fake_replies(sent: &Message, nick: &str, echo_message: bool, now: DateTime<Ut
             })
             .collect(),
         "PART" => channels().map(|chan| from(us(), "PART", std::iter::once(chan).chain(sent.params.get(1).cloned()).collect())).collect(),
-        "PRIVMSG" | "NOTICE" if echo_message => {
+        // A line of a batch keeps its batch tags; the batch's opening
+        // carries the time and msgid, as Ergo's does.
+        "PRIVMSG" | "NOTICE" | "BATCH" if echo_message => {
             let mut echo = sent.clone();
-            echo.tags = vec![("time".into(), Some(now.to_rfc3339_opts(SecondsFormat::Millis, true))), ("msgid".into(), Some(format!("echo-{n}")))];
+            let opens = sent.command == "BATCH" && sent.params.first().is_some_and(|r| r.starts_with('+'));
+            if sent.tag("batch").is_none() && (sent.command != "BATCH" || opens) {
+                echo.tags = vec![("time".into(), Some(now.to_rfc3339_opts(SecondsFormat::Millis, true))), ("msgid".into(), Some(format!("echo-{n}")))];
+            }
             echo.source = Some(us());
             vec![echo]
         }
@@ -591,6 +611,14 @@ fn inject<C: AppContext>(step: &Step, cx: &mut C, handle: WindowHandle<HircApp>)
             println!("snapshot: clipboard {}", escape(&text));
             Ok(())
         }
+        Step::Paste(text) => {
+            let ks = Keystroke::parse("cmd-v").map_err(|e| format!("bad key cmd-v: {e}"))?;
+            cx.update_window(handle.into(), |_, window, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                window.dispatch_keystroke(ks, cx);
+            })
+            .map_err(gone)
+        }
         Step::Hover(x, y) => send(cx, PlatformInput::MouseMove(MouseMoveEvent { position: at(*x, *y), pressed_button: None, modifiers })),
         Step::Scroll(d) => {
             // Over the buffer view: right of the sidebar, mid-height.
@@ -606,6 +634,26 @@ fn inject<C: AppContext>(step: &Step, cx: &mut C, handle: WindowHandle<HircApp>)
         }
         Step::Wait(_) | Step::Shot(_) | Step::Delay(_) => Ok(()),
     }
+}
+
+/// A `paste:` step's text: `\n`, `\r` and `\\` stand for a line break, a
+/// carriage return and a backslash; any other backslash is kept.
+fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match (c, chars.clone().next()) {
+            ('\\', Some('n')) => out.push('\n'),
+            ('\\', Some('r')) => out.push('\r'),
+            ('\\', Some('\\')) => out.push('\\'),
+            _ => {
+                out.push(c);
+                continue;
+            }
+        }
+        chars.next();
+    }
+    out
 }
 
 /// `text` on one line: `\` and newlines escaped.
@@ -944,6 +992,33 @@ mod tests {
         assert_eq!(fake_replies(&Message::parse("NOTICE bob :yo").unwrap(), "me", true, now, 4).len(), 1);
         // Without echo-message the server sends nothing back.
         assert!(fake_replies(&sent, "me", false, now, 5).is_empty());
+    }
+
+    #[test]
+    fn a_fixture_batch_is_one_message_and_ours_echoes_as_one() {
+        let fx = parse_fixture(DEMO).unwrap();
+        let (events, mut sessions) = feed(&fx).unwrap();
+        let got = events.iter().find_map(|e| match e {
+            Event::Line { line, .. } if line.msgid.as_deref() == Some("ml1") => Some(line.text.clone()),
+            _ => None,
+        });
+        let want = "a checklist for the review:\n- contrast of quiet text\n- the input bar's height, which grows with what is typed and then scrolls inside, see https://example.org/input\n- spacing of wrapped rows";
+        assert_eq!(got.as_deref(), Some(want));
+        assert!(events.contains(&Event::Multiline { network: "demo".into(), limits: hirc_core::multiline::Limits::parse("max-bytes=4096,max-lines=24") }));
+        // Ours goes as a batch, and its echo is one line that takes the
+        // pending one's place.
+        let s = sessions.get_mut("demo").unwrap();
+        let mut n = 0;
+        let (events, _) = answer(s, Command::Say { network: "demo".into(), target: "#general".into(), text: "one\ntwo\nthree".into() }, Utc::now(), &mut n);
+        let lines: Vec<_> = events.iter().filter(|e| matches!(e, Event::Line { .. })).collect();
+        assert_eq!(lines.len(), 2, "{events:?}");
+        assert!(lines.iter().all(|e| matches!(e, Event::Line { line, .. } if line.text == "one\ntwo\nthree")));
+        assert!(!is_echo(lines[0]) && is_echo(lines[1]));
+    }
+
+    #[test]
+    fn paste_steps_unescape_line_breaks() {
+        assert_eq!(parse_script("paste:a\\nb\\r\\nc\\\\n\\x"), [Step::Paste("a\nb\r\nc\\n\\x".into())]);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! App state and the event loop. The network thread sends `Event`s; we
 //! apply them to the `Store` and redraw. Input goes back as `Command`s.
 
-use crate::input::{self, Submit, TextInput, VimEvent};
+use crate::input::{self, Note, Submit, TextInput, VimEvent};
 use crate::links;
 use crate::metrics::{Columns, Metrics, Shape};
 use crate::scroll::{self, Pos};
@@ -14,11 +14,11 @@ use gpui::{
     SharedString, Window, actions, div, list, prelude::*, px,
 };
 use hirc_core::command::{self, Input, WindowAction};
-use hirc_core::display;
 use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::layout::{self, Layout};
 use hirc_core::store::{Applied, Buffer, LineKind, Network, Store};
 use hirc_core::theme::Theme;
+use hirc_core::{display, multiline, split};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -187,7 +187,7 @@ impl HircApp {
             input.metrics = Some(metrics);
             input
         });
-        cx.subscribe(&input, |this, _, ev: &Submit, cx| this.submit(ev.0.clone(), cx)).detach();
+        cx.subscribe(&input, |this, _, ev: &Submit, cx| this.submit_input(ev.text.clone(), ev.confirmed, cx)).detach();
         cx.subscribe(&input, |this, _, ev: &VimEvent, cx| this.vim_effect(&ev.0, cx)).detach();
         let handle = input.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
@@ -581,6 +581,41 @@ impl HircApp {
         self.lines.splice(index..index, 1);
     }
 
+    /// Enter in the input. A text of several lines that starts as a
+    /// command stays, with why (commands are one line); one that would go
+    /// out as many messages waits for a second Enter (see `confirm`). Else
+    /// the input starts afresh and the text goes as `submit` sends it.
+    fn submit_input(&mut self, text: String, confirmed: bool, cx: &mut Context<Self>) {
+        if let Some(note) = self.hold_for(&text, confirmed) {
+            self.input.update(cx, |input, cx| input.hold(note, cx));
+            return;
+        }
+        self.input.update(cx, |input, cx| input.sent(cx));
+        self.submit(text, cx);
+    }
+
+    /// Why `text` should not go on this Enter, if it should not.
+    fn hold_for(&self, text: &str, confirmed: bool) -> Option<Note> {
+        let lines = multiline::lines(text).len();
+        if lines < 2 {
+            return None;
+        }
+        if text.starts_with('/') && !text.starts_with("//") {
+            return Some(Note::Error("Commands are one line: remove the line breaks to run it".into()));
+        }
+        if confirmed {
+            return None;
+        }
+        let (net, buf) = self.current()?;
+        let target = buf.target.name()?;
+        if !matches!(net.status, ConnStatus::Connected { .. }) {
+            return None;
+        }
+        let messages =
+            multiline::messages(text, split::body_budget("PRIVMSG", target, net.nick.as_deref().unwrap_or_default().len() + 75).max(1), net.multiline.as_ref());
+        confirm(lines, messages, net.multiline.is_some()).map(Note::Confirm)
+    }
+
     fn submit(&mut self, text: String, cx: &mut Context<Self>) {
         if text.trim().is_empty() {
             return;
@@ -852,8 +887,10 @@ impl Render for HircApp {
         // The input types on the message text column, and names its target.
         let column = m.text_column(cols);
         let placeholder = self.placeholder();
+        let text_width = pane - 2. * m.gutter - column;
         self.input.update(cx, |input, _| {
             input.column = column;
+            input.width = text_width;
             input.placeholder = placeholder.into();
         });
         let at_top = !following && f32::from(self.lines.scroll_px_offset_for_scrollbar().y) >= 0.;
@@ -962,6 +999,19 @@ fn way_out(status: &ConnStatus) -> &'static str {
     }
 }
 
+/// The most lines a text may go out as one message each without asking
+/// first, on a server that takes no multiline batches.
+const PLAIN_LINES: usize = 5;
+
+/// The hint that asks before a big send of `lines` lines as `messages`
+/// messages: without multiline batches (`batches` false) once there are
+/// more than `PLAIN_LINES`, since each line is a message of its own; with
+/// them, once it takes more than one batch. `None` when it goes at once.
+fn confirm(lines: usize, messages: usize, batches: bool) -> Option<String> {
+    let ask = if batches { messages > 1 } else { lines > PLAIN_LINES };
+    ask.then(|| format!("{lines} lines will be sent as {messages} messages — Enter to send, Esc to cancel"))
+}
+
 /// "No window 30 (there are 6)."
 fn no_window(number: usize, count: usize) -> String {
     format!("No window {number} (there are {count})")
@@ -976,5 +1026,20 @@ fn measure(window: &Window, font: &gpui::Font, size: f32) -> Shape {
     match ts.ch_advance(id, size) {
         Ok(cell) => Shape { cell: per_px(cell), ascent: per_px(ts.ascent(id, size)).abs(), descent: per_px(ts.descent(id, size)).abs() },
         Err(_) => Shape::FALLBACK,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn big_sends_ask_first() {
+        // Without batches, more than five lines asks; five goes at once.
+        assert_eq!(confirm(5, 5, false), None);
+        assert_eq!(confirm(12, 12, false).as_deref(), Some("12 lines will be sent as 12 messages — Enter to send, Esc to cancel"));
+        // With them, only more than one batch asks.
+        assert_eq!(confirm(24, 1, true), None);
+        assert_eq!(confirm(30, 2, true).as_deref(), Some("30 lines will be sent as 2 messages — Enter to send, Esc to cancel"));
     }
 }

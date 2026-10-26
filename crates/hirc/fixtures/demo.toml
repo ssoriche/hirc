@@ -9,6 +9,7 @@ base_time = "2026-01-01T12:00:00Z"
 name = "demo"
 nick = "me"
 echo_message = true # pretend the server ACKed echo-message
+multiline = "max-bytes=4096,max-lines=24" # and draft/multiline, with these limits
 lines = [
   ":irc.example 001 me :Welcome to the Demo network",
   ":irc.example 005 me CHANTYPES=# PREFIX=(ov)@+ NETWORK=Demo :are supported by this server",
@@ -63,6 +64,13 @@ lines = [
   ":erin!e@h PRIVMSG #design :try 4.5:1 for the text",
   ":frank!f@h PRIVMSG #design :the contrast rules are at https://www.w3.org/TR/WCAG21/#contrast-minimum.",
   ":erin!e@h PRIVMSG #design :and (see https://en.wikipedia.org/wiki/Contrast_(vision)) for why; or www.example.org, not foo.bar",
+  "@msgid=ml1 :erin!e@h BATCH +ml1 draft/multiline #design",
+  "@batch=ml1 :erin!e@h PRIVMSG #design :a checklist for the review:",
+  "@batch=ml1 :erin!e@h PRIVMSG #design :- contrast of quiet text",
+  "@batch=ml1 :erin!e@h PRIVMSG #design :- the input bar's height, which grows with what is typed and ",
+  "@batch=ml1;draft/multiline-concat :erin!e@h PRIVMSG #design :then scrolls inside, see https://example.org/input",
+  "@batch=ml1 :erin!e@h PRIVMSG #design :- spacing of wrapped rows",
+  ":erin!e@h BATCH -ml1",
   ":carol!c@h PRIVMSG me :a direct message, just for you",
   ":carol!c@h PRIVMSG me :are you around later?",
 ]
