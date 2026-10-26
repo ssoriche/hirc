@@ -3,6 +3,7 @@
 
 use crate::multiline::Limits;
 use crate::store::Line;
+use chrono::{DateTime, Utc};
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +76,22 @@ pub enum Event {
         network: String,
         target: Target,
         line: Line,
+    },
+    /// One page of a buffer's history, oldest first, every line
+    /// `replayed`: from the server (a `chathistory` batch) or the cache.
+    /// `start`: the server has nothing older.
+    History {
+        network: String,
+        target: Target,
+        lines: Vec<Line>,
+        start: bool,
+    },
+    /// Where the user has read up to in `target` (draft/read-marker), as
+    /// the server says; `None` is its `*`, no marker yet.
+    ReadMarker {
+        network: String,
+        target: Target,
+        time: Option<DateTime<Utc>>,
     },
     Joined {
         network: String,

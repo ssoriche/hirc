@@ -532,6 +532,9 @@ impl HircApp {
                     self.arrived(network, buffer, index);
                 }
             }
+            Applied::History { network, buffer, at } => self.history_arrived(network, buffer, at),
+            // The divider follows the server's marker in Task 10.
+            Applied::Read { .. } => {}
             Applied::Changed | Applied::Nothing => {}
         }
         self.sync_layout();
@@ -553,6 +556,22 @@ impl HircApp {
             buf.unread = 0;
             buf.mentions = 0;
         }
+    }
+
+    /// A page of history landed in `(n, b)`, each line at its index in
+    /// `at` (in the order they went in). On screen each is spliced in
+    /// where it went. Lines above the view keep it where it was: the list
+    /// moves its top item down with them, so nothing jumps.
+    fn history_arrived(&mut self, n: usize, b: usize, at: Vec<usize>) {
+        if self.selected != Some((n, b)) {
+            return;
+        }
+        for ix in at {
+            self.lines.splice(ix..ix, 1);
+        }
+        let buf = &mut self.store.networks[n].buffers[b];
+        buf.unread = 0;
+        buf.mentions = 0;
     }
 
     /// Show a local error line in the current buffer.

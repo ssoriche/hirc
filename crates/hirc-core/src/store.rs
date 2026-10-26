@@ -44,6 +44,9 @@ pub struct Line {
     /// A change of connection state (a drop, a quit, a failed connect):
     /// the end of one session's lines and the start of the next.
     pub boundary: bool,
+    /// From history (a `chathistory` batch, or the cache), not said just
+    /// now: never news, and unread only past the read marker.
+    pub replayed: bool,
 }
 
 /// Where a line we sent stands. Everything else is `Sent`.
@@ -57,6 +60,17 @@ pub enum Delivery {
     /// The connection dropped before the echo came: it may never have
     /// gone out.
     Unsent,
+}
+
+/// Where a buffer's older history stands. Scrolling to the top asks for more.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HistoryState {
+    #[default]
+    Idle,
+    /// A page of older lines is on its way.
+    Loading,
+    /// The server has nothing older.
+    Start,
 }
 
 /// What we know of another user on a network, for a query's header.
@@ -92,12 +106,31 @@ pub struct Buffer {
     /// Unread lines meant for us: a message that names us, or anything
     /// said in a query (irssi's highlight activity).
     pub mentions: usize,
+    /// Read up to here (draft/read-marker): the newest of the server's
+    /// marker and what we last marked.
+    pub read: Option<DateTime<Utc>>,
+    /// The server has told this connection where its marker is. Until
+    /// then hirc doesn't send its own, which could mark unread history
+    /// read before the "new" divider shows.
+    pub read_synced: bool,
+    pub history: HistoryState,
     msgids: HashSet<String>,
 }
 
 impl Buffer {
     pub fn new(target: Target) -> Buffer {
-        Buffer { target, lines: Vec::new(), topic: None, joined: false, unread: 0, mentions: 0, msgids: HashSet::new() }
+        Buffer {
+            target,
+            lines: Vec::new(),
+            topic: None,
+            joined: false,
+            unread: 0,
+            mentions: 0,
+            read: None,
+            read_synced: false,
+            history: HistoryState::Idle,
+            msgids: HashSet::new(),
+        }
     }
 
     /// Where the line went, or `None` if we already have its msgid.
@@ -138,12 +171,49 @@ impl Buffer {
         })?;
         (ix > 0).then_some(ix)
     }
+
+    /// Insert `line`, and count it as unread (and a mention) when it is
+    /// news. `None` when its msgid was already here.
+    fn add_counted(&mut self, line: Line, me: Option<&str>) -> Option<usize> {
+        let news = is_news(self, &line);
+        let mention = news && meant_for(&self.target, &line, me);
+        let ix = self.insert(line)?;
+        if news {
+            self.unread += 1;
+        }
+        if mention {
+            self.mentions += 1;
+        }
+        Some(ix)
+    }
+
+    /// Count unread lines and mentions again from the read marker: every
+    /// line past it that `counts`. Without a marker the counts stand.
+    pub fn recount(&mut self, me: Option<&str>) {
+        let Some(read) = self.read else { return };
+        let fresh: Vec<&Line> = self.lines.iter().filter(|l| counts(l) && l.time > read).collect();
+        self.mentions = fresh.iter().filter(|l| meant_for(&self.target, l, me)).count();
+        self.unread = fresh.len();
+    }
 }
 
 /// Whether `line` counts toward a window's unread lines: something someone
 /// else said.
 pub fn counts(line: &Line) -> bool {
     !line.own && matches!(line.kind, LineKind::Privmsg | LineKind::Action | LineKind::Notice)
+}
+
+/// Whether `line` adds to `buf`'s unread lines as it lands: anything that
+/// `counts`, except history at or before the read marker (or with no
+/// marker known), which the user has already had the chance to see.
+pub fn is_news(buf: &Buffer, line: &Line) -> bool {
+    counts(line) && (!line.replayed || buf.read.is_some_and(|r| line.time > r))
+}
+
+/// Whether `line` in `target` is meant for us: anything in a query, or a
+/// message that names `me`.
+fn meant_for(target: &Target, line: &Line, me: Option<&str>) -> bool {
+    matches!(target, Target::Query(_)) || me.is_some_and(|me| crate::display::mentions(&line.text, me))
 }
 
 #[derive(Debug)]
@@ -233,12 +303,28 @@ pub enum Applied {
         removed: usize,
         index: Option<usize>,
     },
+    /// A page of history went into one buffer: each line's index as it
+    /// went in, in order (duplicates of lines already here are left out).
+    History {
+        network: usize,
+        buffer: usize,
+        at: Vec<usize>,
+    },
+    /// The read marker of one buffer changed.
+    Read {
+        network: usize,
+        buffer: usize,
+    },
 }
 
 #[derive(Debug, Default)]
 pub struct Store {
     pub networks: Vec<Network>,
     local_seq: u64,
+    /// Numbers lines as they arrive. Sessions restart theirs on every
+    /// connection and cached lines have none, so the store's are the ones
+    /// the UI keys on (the "new" divider, the selection).
+    arrival: u64,
     /// The time lines hirc writes itself are stamped with; `None` is the
     /// wall clock. Fixtures set it so their screenshots keep one clock.
     pub clock: Option<DateTime<Utc>>,
@@ -291,8 +377,18 @@ impl Store {
             own: true,
             delivery: Delivery::Sent,
             boundary: false,
+            replayed: false,
         };
         self.networks[network].buffers[buffer].insert(line).unwrap_or(0)
+    }
+
+    /// The user has read `(network, buffer)` up to `time` (hirc is about
+    /// to tell the server): nothing there is unread now.
+    pub fn mark_read(&mut self, network: usize, buffer: usize, time: DateTime<Utc>) {
+        let buf = &mut self.networks[network].buffers[buffer];
+        buf.read = Some(buf.read.map_or(time, |r| r.max(time)));
+        buf.unread = 0;
+        buf.mentions = 0;
     }
 
     /// `push_local`, for a change of connection state (see `Line::boundary`).
@@ -332,6 +428,12 @@ impl Store {
                     net.multiline = None;
                     for b in &mut net.buffers {
                         b.joined = false;
+                        // A request that was out is gone with the socket,
+                        // and the next server will say its marker again.
+                        b.read_synced = false;
+                        if b.history == HistoryState::Loading {
+                            b.history = HistoryState::Idle;
+                        }
                     }
                 }
                 if status.is_down() {
@@ -375,31 +477,57 @@ impl Store {
                 self.networks[n].buffers[b].topic = topic;
                 Applied::Changed
             }
-            Event::Line { network, target, line } => {
+            Event::Line { network, target, mut line } => {
                 let n = self.network_ix(&network);
                 let b = self.buffer_ix(n, &target);
-                let counts = counts(&line);
+                self.arrival += 1;
+                line.seq = self.arrival;
                 let net = &mut self.networks[n];
                 let me = net.nick.as_deref();
-                let mention = counts && (matches!(target, Target::Query(_)) || me.is_some_and(|me| crate::display::mentions(&line.text, me)));
                 let buf = &mut net.buffers[b];
                 if let Some(removed) = buf.pending_for(&line) {
                     buf.lines.remove(removed);
                     let index = buf.insert(line);
                     return Applied::Replaced { network: n, buffer: b, removed, index };
                 }
-                match buf.insert(line) {
-                    Some(index) => {
-                        if counts {
-                            buf.unread += 1;
-                        }
-                        if mention {
-                            buf.mentions += 1;
-                        }
-                        Applied::Line { network: n, buffer: b, index }
-                    }
+                match buf.add_counted(line, me) {
+                    Some(index) => Applied::Line { network: n, buffer: b, index },
                     None => Applied::Nothing,
                 }
+            }
+            Event::History { network, target, lines, start } => {
+                let n = self.network_ix(&network);
+                let b = self.buffer_ix(n, &target);
+                let net = &mut self.networks[n];
+                let me = net.nick.as_deref();
+                let buf = &mut net.buffers[b];
+                let mut at = Vec::new();
+                // Never matched against our pending lines: an old line of
+                // ours with the same text is not the echo of a new one.
+                for mut line in lines {
+                    self.arrival += 1;
+                    line.seq = self.arrival;
+                    at.extend(buf.add_counted(line, me));
+                }
+                buf.history = match (start, buf.history) {
+                    (true, _) => HistoryState::Start,
+                    (false, HistoryState::Loading) => HistoryState::Idle,
+                    (false, state) => state,
+                };
+                Applied::History { network: n, buffer: b, at }
+            }
+            Event::ReadMarker { network, target, time } => {
+                let n = self.network_ix(&network);
+                let b = self.buffer_ix(n, &target);
+                let net = &mut self.networks[n];
+                let me = net.nick.as_deref();
+                let buf = &mut net.buffers[b];
+                if let Some(t) = time {
+                    buf.read = Some(buf.read.map_or(t, |r| r.max(t)));
+                }
+                buf.read_synced = true;
+                buf.recount(me);
+                Applied::Read { network: n, buffer: b }
             }
         }
     }
@@ -447,6 +575,7 @@ mod tests {
             own: false,
             delivery: Delivery::Sent,
             boundary: false,
+            replayed: false,
         }
     }
 
@@ -642,5 +771,116 @@ mod tests {
         // A new connection knows no one.
         s.apply(Event::Status { network: "net".into(), status: ConnStatus::Connecting });
         assert_eq!(s.networks[0].peer("carla"), None);
+    }
+
+    fn old(seq: u64, secs: i64, msgid: &str, text: &str) -> Line {
+        Line { replayed: true, ..line(seq, secs, Some(msgid), text) }
+    }
+
+    fn page(target: &str, lines: Vec<Line>, start: bool) -> Event {
+        Event::History { network: "net".into(), target: Target::Channel(target.into()), lines, start }
+    }
+
+    #[test]
+    fn history_goes_in_by_time_and_collapses_with_live_copies() {
+        let mut s = Store::new(["net".to_string()]);
+        let chan = || Target::Channel("#a".into());
+        s.apply(Event::Line { network: "net".into(), target: chan(), line: line(1, 10, Some("live"), "live one") });
+        let applied = s.apply(page("#a", vec![old(1, 5, "h1", "older"), old(2, 10, "live", "live one"), old(3, 12, "h3", "newer")], false));
+        // "live" was already here; the others go in around it.
+        assert_eq!(applied, Applied::History { network: 0, buffer: 1, at: vec![0, 2] });
+        let texts: Vec<_> = s.networks[0].buffers[1].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["older", "live one", "newer"]);
+        // Seqs are the store's own, so no two lines share one.
+        let mut seqs: Vec<_> = s.networks[0].buffers[1].lines.iter().map(|l| l.seq).collect();
+        seqs.sort();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 3);
+        // A live line is restamped too, not left with the session's seq.
+        s.apply(Event::Line { network: "net".into(), target: chan(), line: line(1, 20, Some("l2"), "later") });
+        let last = s.networks[0].buffers[1].lines.last().unwrap().seq;
+        assert!(last > *seqs.last().unwrap());
+    }
+
+    #[test]
+    fn replayed_lines_are_unread_only_past_the_read_marker() {
+        let mut s = Store::new(["net".to_string()]);
+        s.apply(Event::Status { network: "net".into(), status: ConnStatus::Connected { nick: "me".into() } });
+        // No marker known: history is not news, even when it names us.
+        s.apply(page("#a", vec![old(1, 1, "h1", "me: one"), old(2, 2, "h2", "two")], false));
+        let b = s.buffer_ix(0, &Target::Channel("#a".into()));
+        assert_eq!((s.networks[0].buffers[b].unread, s.networks[0].buffers[b].mentions), (0, 0));
+        // The server's marker says the first was read: the rest counts.
+        let at = s.networks[0].buffers[b].lines[0].time;
+        assert_eq!(
+            s.apply(Event::ReadMarker { network: "net".into(), target: Target::Channel("#a".into()), time: Some(at) }),
+            Applied::Read { network: 0, buffer: b }
+        );
+        let buf = &s.networks[0].buffers[b];
+        assert_eq!((buf.unread, buf.mentions, buf.read, buf.read_synced), (1, 0, Some(at), true));
+        assert_eq!(buf.first_unread(), Some(1));
+        // A later page past the marker counts as it lands, mentions too.
+        s.apply(page("#a", vec![old(3, 3, "h3", "me: three")], false));
+        let buf = &s.networks[0].buffers[b];
+        assert_eq!((buf.unread, buf.mentions), (2, 1));
+        // An older marker never moves it back.
+        s.apply(Event::ReadMarker { network: "net".into(), target: Target::Channel("#a".into()), time: Some(at - chrono::TimeDelta::seconds(5)) });
+        assert_eq!(s.networks[0].buffers[b].read, Some(at));
+        // `*` (no marker yet) leaves the counts alone.
+        s.apply(Event::ReadMarker { network: "net".into(), target: Target::Channel("#a".into()), time: None });
+        assert_eq!(s.networks[0].buffers[b].unread, 2);
+        // A replayed line exactly at the marker is read.
+        s.apply(page("#a", vec![old(4, 1, "h4", "at the marker")], false));
+        assert_eq!(s.networks[0].buffers[b].unread, 2);
+        // A live line still counts once a marker exists.
+        s.apply(Event::Line { network: "net".into(), target: Target::Channel("#a".into()), line: line(1, 30, Some("l"), "live") });
+        assert_eq!(s.networks[0].buffers[b].unread, 3);
+    }
+
+    #[test]
+    fn a_star_marker_still_marks_the_buffer_synced() {
+        let mut s = Store::new(["net".to_string()]);
+        let b = s.buffer_ix(0, &Target::Channel("#a".into()));
+        s.apply(Event::ReadMarker { network: "net".into(), target: Target::Channel("#a".into()), time: None });
+        let buf = &s.networks[0].buffers[b];
+        assert_eq!((buf.read_synced, buf.read), (true, None));
+    }
+
+    #[test]
+    fn marking_read_moves_the_marker_and_clears_the_counts() {
+        let mut s = Store::new(["net".to_string()]);
+        s.apply(Event::Line { network: "net".into(), target: Target::Query("bob".into()), line: line(1, 1, Some("q1"), "hi") });
+        let b = s.buffer_ix(0, &Target::Query("bob".into()));
+        assert_eq!(s.networks[0].buffers[b].mentions, 1);
+        s.mark_read(0, b, at(1));
+        let buf = &s.networks[0].buffers[b];
+        assert_eq!((buf.read, buf.unread, buf.mentions), (Some(at(1)), 0, 0));
+        s.mark_read(0, b, at(0));
+        assert_eq!(s.networks[0].buffers[b].read, Some(at(1)));
+    }
+
+    #[test]
+    fn a_page_ends_loading_and_an_empty_one_can_be_the_start() {
+        let mut s = Store::new(["net".to_string()]);
+        let b = s.buffer_ix(0, &Target::Channel("#a".into()));
+        s.networks[0].buffers[b].history = HistoryState::Loading;
+        s.apply(page("#a", vec![old(1, 1, "h1", "x")], false));
+        assert_eq!(s.networks[0].buffers[b].history, HistoryState::Idle);
+        s.apply(page("#a", vec![], true));
+        assert_eq!(s.networks[0].buffers[b].history, HistoryState::Start);
+        // A later page that is not the start leaves it there.
+        s.apply(page("#a", vec![old(2, 2, "h2", "y")], false));
+        assert_eq!(s.networks[0].buffers[b].history, HistoryState::Start);
+    }
+
+    #[test]
+    fn a_drop_stops_loading_and_forgets_the_server_marker() {
+        let mut s = Store::new(["net".to_string()]);
+        let b = s.buffer_ix(0, &Target::Channel("#a".into()));
+        s.apply(Event::ReadMarker { network: "net".into(), target: Target::Channel("#a".into()), time: Some(at(1)) });
+        s.networks[0].buffers[b].history = HistoryState::Loading;
+        s.apply(Event::Status { network: "net".into(), status: ConnStatus::Disconnected { reason: "x".into(), retry: std::time::Duration::from_secs(2) } });
+        let buf = &s.networks[0].buffers[b];
+        assert_eq!((buf.history, buf.read_synced, buf.read), (HistoryState::Idle, false, Some(at(1))));
     }
 }
