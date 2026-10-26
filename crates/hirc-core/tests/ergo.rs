@@ -9,7 +9,7 @@ mod common;
 use common::{Ergo, Raw, register_account};
 use hirc_core::config::{Config, Sasl, Server};
 use hirc_core::event::{Command, ConnStatus, Event, Target};
-use hirc_core::store::Line;
+use hirc_core::store::{Line, LineKind};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -85,6 +85,50 @@ async fn sasl_join_send_and_receive() {
     while let Ok(ev) = rx.try_recv() {
         assert!(line_in(&ev, "#test").is_none_or(|l| l.text != "hello from hirc"), "duplicate own line");
     }
+}
+
+/// A second hirc, without SASL, on the plaintext port.
+fn carol(ergo: &Ergo) -> Config {
+    let mut config = Config::default();
+    config.servers.insert(
+        "test".into(),
+        Server {
+            nickname: "carol".into(),
+            server: "localhost".into(),
+            port: Some(ergo.plain_port),
+            use_tls: false,
+            channels: vec!["#test".into()],
+            ..Server::default()
+        },
+    );
+    config
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multiline_round_trip() {
+    let ergo = Ergo::start();
+    register_account(ergo.plain_port, "alice", "hunter22").await;
+    let (tx, mut rx) = hirc_core::conn::spawn(alice(&ergo, "printf hunter22"));
+    let limits = next_matching(&mut rx, |e| match e {
+        Event::Multiline { limits, .. } => Some(*limits),
+        _ => None,
+    })
+    .await;
+    // The harness's own limits, read from its CAP LS.
+    assert_eq!(limits, Some(hirc_core::multiline::Limits { max_bytes: 4096, max_lines: Some(100) }));
+    next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
+    let (_ctx, mut crx) = hirc_core::conn::spawn(carol(&ergo));
+    next_matching(&mut crx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
+
+    tx.send(Command::Say { network: "test".into(), target: "#test".into(), text: "one\ntwo\nthree".into() }).unwrap();
+    // Carol gets it as one message of three lines.
+    let got = next_matching(&mut crx, |e| line_in(e, "#test").filter(|l| l.nick.as_deref() == Some("alice") && l.kind == LineKind::Privmsg)).await;
+    assert_eq!(got.text, "one\ntwo\nthree");
+    assert!(got.msgid.is_some());
+    // Alice's echo comes back as one message too, with the server's msgid.
+    let own = next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.own && l.kind == LineKind::Privmsg && l.msgid.is_some())).await;
+    assert_eq!(own.text, "one\ntwo\nthree");
+    assert_eq!(own.msgid, got.msgid);
 }
 
 #[tokio::test(flavor = "multi_thread")]

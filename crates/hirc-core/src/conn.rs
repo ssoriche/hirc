@@ -248,66 +248,76 @@ async fn connect_once(
     let mut last_rx = Instant::now();
     let mut pinged = false;
     let mut tick = tokio::time::interval(Duration::from_secs(30));
-    loop {
-        for out in outs.drain(..) {
-            match out {
-                Output::Send(m) => {
-                    w.write_all(m.to_wire().as_bytes()).await?;
-                    w.write_all(b"\r\n").await?;
-                }
-                Output::Event(e) => {
-                    if matches!(e, Event::Status { status: ConnStatus::Connected { .. }, .. }) {
-                        *registered = true;
+    let end = async {
+        loop {
+            for out in outs.drain(..) {
+                match out {
+                    Output::Send(m) => {
+                        w.write_all(m.to_wire().as_bytes()).await?;
+                        w.write_all(b"\r\n").await?;
                     }
-                    match &e {
-                        Event::Joined { channel, .. } if !rejoin.iter().any(|c| c.eq_ignore_ascii_case(channel)) => rejoin.push(channel.clone()),
-                        Event::Parted { channel, .. } => rejoin.retain(|c| !c.eq_ignore_ascii_case(channel)),
-                        _ => {}
+                    Output::Event(e) => {
+                        if matches!(e, Event::Status { status: ConnStatus::Connected { .. }, .. }) {
+                            *registered = true;
+                        }
+                        match &e {
+                            Event::Joined { channel, .. } if !rejoin.iter().any(|c| c.eq_ignore_ascii_case(channel)) => rejoin.push(channel.clone()),
+                            Event::Parted { channel, .. } => rejoin.retain(|c| !c.eq_ignore_ascii_case(channel)),
+                            _ => {}
+                        }
+                        let _ = events.send(e);
                     }
-                    let _ = events.send(e);
-                }
-                Output::Stop(reason) => {
-                    let _ = w.flush().await;
-                    return Ok(End::Stopped(reason));
-                }
-                Output::Quit => {
-                    let _ = w.flush().await;
-                    return Ok(End::Quit);
+                    Output::Stop(reason) => {
+                        let _ = w.flush().await;
+                        return Ok(End::Stopped(reason));
+                    }
+                    Output::Quit => {
+                        let _ = w.flush().await;
+                        return Ok(End::Quit);
+                    }
                 }
             }
-        }
-        w.flush().await?;
-        tokio::select! {
-            line = reader.next_line() => {
-                let Some(line) = line? else { return Ok(End::Closed(session.closing().map(str::to_owned))) };
-                last_rx = Instant::now();
-                pinged = false;
-                match Message::parse(&line) {
-                    Ok(m) => outs = session.handle(m, Utc::now()),
-                    Err(e) => tracing::debug!("{name}: dropped line ({e}): {line:?}"),
+            w.flush().await?;
+            tokio::select! {
+                line = reader.next_line() => {
+                    let Some(line) = line? else { return Ok(End::Closed(session.closing().map(str::to_owned))) };
+                    last_rx = Instant::now();
+                    pinged = false;
+                    match Message::parse(&line) {
+                        Ok(m) => outs = session.handle(m, Utc::now()),
+                        Err(e) => tracing::debug!("{name}: dropped line ({e}): {line:?}"),
+                    }
                 }
-            }
-            cmd = cmds.recv() => match cmd {
-                None => return Ok(End::Stopped("shutting down".into())),
-                Some(Command::Reconnect { .. }) => {
-                    let _ = w.write_all(b"QUIT :Reconnecting\r\n").await;
-                    let _ = w.flush().await;
-                    return Ok(End::Closed(None));
-                }
-                Some(c) => outs = session.command(c, Utc::now()),
-            },
-            _ = tick.tick() => {
-                let idle = last_rx.elapsed();
-                if idle > IDLE_DEAD {
-                    return Err("no reply from server".into());
-                }
-                if idle > IDLE_PING && !pinged {
-                    pinged = true;
-                    outs = vec![Output::Send(Message::new("PING", ["hirc"]))];
+                cmd = cmds.recv() => match cmd {
+                    None => return Ok(End::Stopped("shutting down".into())),
+                    Some(Command::Reconnect { .. }) => {
+                        let _ = w.write_all(b"QUIT :Reconnecting\r\n").await;
+                        let _ = w.flush().await;
+                        return Ok(End::Closed(None));
+                    }
+                    Some(c) => outs = session.command(c, Utc::now()),
+                },
+                _ = tick.tick() => {
+                    let idle = last_rx.elapsed();
+                    if idle > IDLE_DEAD {
+                        return Err("no reply from server".into());
+                    }
+                    if idle > IDLE_PING && !pinged {
+                        pinged = true;
+                        outs = vec![Output::Send(Message::new("PING", ["hirc"]))];
+                    }
                 }
             }
         }
     }
+    .await;
+    // A multiline batch cut off by the drop still shows what came of it.
+    for out in session.end(Utc::now()) {
+        if let Output::Event(e) = out {
+            let _ = events.send(e);
+        }
+    }
+    end
 }
 
 #[cfg(test)]

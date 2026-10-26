@@ -11,6 +11,7 @@ pub mod display;
 pub mod event;
 pub mod isupport;
 pub mod layout;
+pub mod multiline;
 pub mod proto;
 pub mod sasl;
 pub mod session;

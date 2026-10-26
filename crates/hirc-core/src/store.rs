@@ -3,6 +3,7 @@
 //! once, so a live copy and a replayed copy of a message collapse.
 
 use crate::event::{ConnStatus, Event, PeerChange, Target};
+use crate::multiline::Limits;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
@@ -159,6 +160,9 @@ pub struct Network {
     /// Other users, by lowercased nick: what this connection has seen of
     /// them.
     pub peers: HashMap<String, Peer>,
+    /// What one `draft/multiline` batch may hold on this connection;
+    /// `None` when the server takes none.
+    pub multiline: Option<Limits>,
 }
 
 impl Network {
@@ -260,6 +264,7 @@ impl Store {
             nick: None,
             buffers: vec![Buffer::new(Target::Server)],
             peers: HashMap::new(),
+            multiline: None,
         });
         self.networks.len() - 1
     }
@@ -324,6 +329,7 @@ impl Store {
                     // and what we saw of others is no longer news.
                     let net = &mut self.networks[n];
                     net.peers.clear();
+                    net.multiline = None;
                     for b in &mut net.buffers {
                         b.joined = false;
                     }
@@ -349,6 +355,11 @@ impl Store {
             Event::OwnNick { network, nick } => {
                 let n = self.network_ix(&network);
                 self.networks[n].nick = Some(nick);
+                Applied::Changed
+            }
+            Event::Multiline { network, limits } => {
+                let n = self.network_ix(&network);
+                self.networks[n].multiline = limits;
                 Applied::Changed
             }
             Event::Peer { network, nick, change } => {

@@ -38,6 +38,25 @@ pub fn unwrap(text: &str) -> Option<(LineKind, String, &str)> {
     Some((LineKind::Action, clean(name)?, rest))
 }
 
+/// `unwrap` for a message of several lines (`draft/multiline`): `Some`
+/// only when every line is relayed from the same name as the same kind,
+/// with the relayed words joined back by `\n`. For one line it is `unwrap`.
+pub fn unwrap_lines(text: &str) -> Option<(LineKind, String, String)> {
+    let mut out: Option<(LineKind, String, String)> = None;
+    for line in text.split('\n') {
+        let (kind, name, rest) = unwrap(line)?;
+        match &mut out {
+            None => out = Some((kind, name, rest.to_owned())),
+            Some((k, n, words)) if *k == kind && *n == name => {
+                words.push('\n');
+                words.push_str(rest);
+            }
+            Some(_) => return None,
+        }
+    }
+    out
+}
+
 /// `name` without its zero-width characters and formatting codes, if
 /// anything nameable is left.
 fn clean(name: &str) -> Option<String> {
@@ -159,6 +178,18 @@ mod tests {
         assert_eq!(unwrap("<hacker>"), Some((LineKind::Privmsg, "hacker".into(), "")));
         assert_eq!(unwrap("<hacker> "), Some((LineKind::Privmsg, "hacker".into(), "")));
         assert_eq!(unwrap("* hacker"), Some((LineKind::Action, "hacker".into(), "")));
+    }
+
+    #[test]
+    fn several_lines_unwrap_only_from_one_name() {
+        let one = |k, n: &str, t: &str| Some((k, n.to_owned(), t.to_owned()));
+        assert_eq!(unwrap_lines("<hacker> hi"), one(LineKind::Privmsg, "hacker", "hi"));
+        assert_eq!(unwrap_lines("<hacker> hi\n<ha\u{200B}cker> there"), one(LineKind::Privmsg, "hacker", "hi\nthere"));
+        assert_eq!(unwrap_lines("* hacker waves\n* hacker again"), one(LineKind::Action, "hacker", "waves\nagain"));
+        // Two names, a mix of kinds, or a line with no name: not one person's.
+        for text in ["<a> hi\n<b> hi", "<a> hi\n* a waves", "<a> hi\nplain", "<a> hi\n"] {
+            assert_eq!(unwrap_lines(text), None, "{text:?}");
+        }
     }
 
     #[test]

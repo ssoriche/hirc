@@ -1,6 +1,7 @@
 //! What flows between the network thread and the UI: `Event`s up,
 //! `Command`s down.
 
+use crate::multiline::Limits;
 use crate::store::Line;
 use std::time::Duration;
 
@@ -91,6 +92,12 @@ pub enum Event {
     OwnNick {
         network: String,
         nick: String,
+    },
+    /// Whether the server takes `draft/multiline` batches now, and how
+    /// big: `None` when it doesn't (each line goes as its own message).
+    Multiline {
+        network: String,
+        limits: Option<Limits>,
     },
     /// What we learned about someone else on the network (for a query's
     /// header: are they there, away, gone).

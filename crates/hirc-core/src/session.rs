@@ -6,6 +6,7 @@
 use crate::caps::Caps;
 use crate::event::{Command, ConnStatus, Event, PeerChange, Target};
 use crate::isupport::Isupport;
+use crate::multiline::{self, Limits};
 use crate::proto::Message;
 use crate::store::{Delivery, Line, LineKind};
 use crate::{bridge, sasl, split};
@@ -92,6 +93,21 @@ pub struct Session {
     authed: bool,
     /// The server's `ERROR` text: why it is about to close the connection.
     closing: Option<String>,
+    /// `draft/multiline` batches still arriving, by ref, oldest first.
+    incoming: Vec<(String, Incoming)>,
+    /// Numbers the batches we send, so each ref is new on the connection.
+    batch_seq: u64,
+    /// The multiline limits last told to the UI.
+    multiline_said: Option<Limits>,
+}
+
+/// A `draft/multiline` batch being received: one message once it closes.
+#[derive(Debug)]
+struct Incoming {
+    /// `BATCH +ref draft/multiline <target>`: the message's sender, and its
+    /// time and msgid when the server tags them here.
+    open: Message,
+    lines: Vec<Message>,
 }
 
 fn send<I, S>(command: &str, params: I) -> Output
@@ -120,6 +136,9 @@ impl Session {
             seq: 0,
             authed: false,
             closing: None,
+            incoming: Vec::new(),
+            batch_seq: 0,
+            multiline_said: None,
         }
     }
 
@@ -147,6 +166,8 @@ impl Session {
         self.nick = self.cfg.nickname.clone();
         self.alt = 0;
         self.authed = false;
+        self.incoming.clear();
+        self.multiline_said = None;
         let mut out = Vec::new();
         if let Some(p) = &self.cfg.password {
             out.push(send("PASS", [p.as_str()]));
@@ -157,8 +178,31 @@ impl Session {
         out
     }
 
+    /// The connection is gone: a multiline batch that never closed is
+    /// shown with the lines it got, rather than lost.
+    pub fn end(&mut self, now: DateTime<Utc>) -> Vec<Output> {
+        let mut out = Vec::new();
+        for (_, batch) in std::mem::take(&mut self.incoming) {
+            self.finish(batch, now, &mut out);
+        }
+        out
+    }
+
+    /// What one multiline batch may hold, while the server takes them.
+    pub fn multiline(&self) -> Option<Limits> {
+        let on = ["batch", "message-tags", multiline::CAP].iter().all(|c| self.caps.is_enabled(c));
+        if on { self.caps.value(multiline::CAP).and_then(Limits::parse) } else { None }
+    }
+
     pub fn handle(&mut self, msg: Message, now: DateTime<Utc>) -> Vec<Output> {
         let mut out = Vec::new();
+        if matches!(msg.command.as_str(), "PRIVMSG" | "NOTICE")
+            && let Some(r) = msg.tag("batch")
+            && let Some(i) = self.incoming.iter().position(|(k, _)| k == r)
+        {
+            self.incoming[i].1.lines.push(msg);
+            return out;
+        }
         match msg.command.as_str() {
             "PING" => out.push(send("PONG", msg.params.clone())),
             "CAP" => self.on_cap(&msg, &mut out),
@@ -210,7 +254,8 @@ impl Session {
             // No line of its own: the close follows, and its status line
             // gives this text as the reason.
             "ERROR" => self.closing = Some(last(&msg).to_owned()).filter(|t| !t.is_empty()),
-            "BATCH" | "TAGMSG" | "366" => {}
+            "BATCH" => self.on_batch(&msg, now, &mut out),
+            "TAGMSG" | "366" => {}
             c if c.len() == 3 && c.bytes().all(|b| b.is_ascii_digit()) => {
                 let text = msg.params.get(1..).unwrap_or_default().join(" ");
                 let line = self.line(&msg, now, LineKind::Server, None, text, false);
@@ -260,6 +305,47 @@ impl Session {
             Some("DEL") => self.caps.on_del(&list),
             _ => {}
         }
+        let limits = self.multiline();
+        if limits != self.multiline_said {
+            self.multiline_said = limits;
+            out.push(Output::Event(Event::Multiline { network: self.network.clone(), limits }));
+        }
+    }
+
+    /// `BATCH +ref type ...` / `BATCH -ref`. Only `draft/multiline` batches
+    /// are collected; the lines of any other type are handled as they come.
+    fn on_batch(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let Some(r) = msg.params.first() else { return };
+        let (open, r) = match (r.strip_prefix('+'), r.strip_prefix('-')) {
+            (Some(r), _) => (true, r),
+            (_, Some(r)) => (false, r),
+            _ => return,
+        };
+        // A close, or a ref opened again while its batch never closed: show
+        // what it got.
+        if let Some(i) = self.incoming.iter().position(|(k, _)| k == r) {
+            let (_, batch) = self.incoming.remove(i);
+            self.finish(batch, now, out);
+        }
+        if open && msg.params.get(1).map(String::as_str) == Some(multiline::CAP) {
+            self.incoming.push((r.to_owned(), Incoming { open: msg.clone(), lines: Vec::new() }));
+        }
+    }
+
+    /// A multiline batch's lines as the one message they are: `\n`
+    /// between lines, continuations joined, the batch's sender and target,
+    /// and its time and msgid (else the first line's).
+    fn finish(&mut self, batch: Incoming, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let Some(first) = batch.lines.first() else { return };
+        let text = multiline::join(batch.lines.iter().map(|m| (m.params.get(1).map_or("", String::as_str), m.tag(multiline::CONCAT).is_some())));
+        let tags = ["time", "msgid"]
+            .into_iter()
+            .filter_map(|k| batch.open.tag(k).or_else(|| first.tag(k)).filter(|v| !v.is_empty()).map(|v| (k.to_owned(), Some(v.to_owned()))))
+            .collect();
+        let target = batch.open.params.get(2).or(first.params.first()).cloned().unwrap_or_default();
+        let source = batch.open.source.clone().or_else(|| first.source.clone());
+        let msg = Message { tags, source, command: first.command.clone(), params: vec![target, text] };
+        self.on_message(&msg, now, out);
     }
 
     fn request_caps(&mut self, out: &mut Vec<Output>) {
@@ -379,6 +465,22 @@ impl Session {
                 _ => return,
             }
         }
+        let relay = from_user && !own && kind == LineKind::Privmsg && bridge::is_bridge(&self.cfg.bridges, from);
+        // A bridge's multiline message whose lines aren't all one person's:
+        // each line stands alone, unwrapped (or not) by itself. Their msgids
+        // stay distinct so the store keeps every line.
+        if relay && text.contains('\n') && bridge::unwrap_lines(text).is_none() {
+            let msgid = msg.tag("msgid").filter(|m| !m.is_empty()).map(str::to_owned);
+            for (i, line) in text.split('\n').filter(|l| !l.is_empty()).enumerate() {
+                let mut one = Message { params: vec![to.clone(), line.to_owned()], ..msg.clone() };
+                if let Some(id) = msgid.as_deref().filter(|_| i > 0) {
+                    one.tags.retain(|(k, _)| k != "msgid");
+                    one.tags.push(("msgid".into(), Some(format!("{id}:{i}"))));
+                }
+                self.on_message(&one, now, out);
+            }
+            return;
+        }
         let target = if !from_user {
             Target::Server
         } else if self.isupport.is_channel(to) {
@@ -392,17 +494,13 @@ impl Session {
             out.push(self.seen(msg, from));
         }
         let mut nick = from_user.then(|| from.to_owned());
+        let mut text = text.to_owned();
         // A relay bot's `<name> text` reads as `name`'s own line; the bot's
         // own words and actions stay its.
-        if from_user
-            && !own
-            && kind == LineKind::Privmsg
-            && bridge::is_bridge(&self.cfg.bridges, from)
-            && let Some((relayed, name, rest)) = bridge::unwrap(text)
-        {
+        if relay && let Some((relayed, name, rest)) = bridge::unwrap_lines(&text) {
             (kind, nick, text) = (relayed, Some(name), rest);
         }
-        let line = self.line(msg, now, kind, nick.as_deref(), text.to_owned(), own);
+        let line = self.line(msg, now, kind, nick.as_deref(), text, own);
         out.push(self.event_line(target, line));
     }
 
@@ -562,6 +660,36 @@ impl Session {
         let budget = split::body_budget("PRIVMSG", target, self.nick.len() + 75).saturating_sub(wrap).max(1);
         let dest = if self.isupport.is_channel(target) { Target::Channel(target.to_owned()) } else { Target::Query(target.to_owned()) };
         let mut out = Vec::new();
+        // Several lines, and the server takes them as one message: a batch
+        // (or several, to stay inside its limits), each shown as one line
+        // of ours that its echo replaces, as below.
+        if !action
+            && multiline::lines(text).len() > 1
+            && let Some(limits) = self.multiline()
+        {
+            for batch in multiline::batches(text, budget, &limits) {
+                self.batch_seq += 1;
+                let r = format!("hirc{}", self.batch_seq);
+                let joined = multiline::join(batch.iter().map(|p| (p.text, p.concat)));
+                let mut l = self.local(LineKind::Privmsg, joined, now);
+                l.nick = Some(self.nick.clone());
+                if echo {
+                    l.delivery = Delivery::Pending;
+                }
+                out.push(self.event_line(dest.clone(), l));
+                out.push(send("BATCH", [format!("+{r}"), multiline::CAP.to_owned(), target.to_owned()]));
+                for p in &batch {
+                    let mut m = Message::new("PRIVMSG", [target, p.text]);
+                    m.tags.push(("batch".into(), Some(r.clone())));
+                    if p.concat {
+                        m.tags.push((multiline::CONCAT.into(), None));
+                    }
+                    out.push(Output::Send(m));
+                }
+                out.push(send("BATCH", [format!("-{r}")]));
+            }
+            return out;
+        }
         for line in text.lines().filter(|l| !l.is_empty()) {
             for chunk in split::split_utf8(line, budget) {
                 let body = if action { format!("\x01ACTION {chunk}\x01") } else { chunk.to_owned() };
@@ -883,6 +1011,194 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         assert!(msgs.iter().all(|m| m.len() + 2 + 1 + "alice".len() + 75 < 512), "{msgs:?}");
         assert_eq!(msgs[3], "PRIVMSG #test second");
+    }
+
+    /// Registered with echo-message, batch and `draft/multiline=<value>`.
+    fn multiline(value: &str) -> Session {
+        let mut s = Session::new("net", cfg());
+        s.start();
+        feed(&mut s, &format!(":srv CAP * LS :message-tags server-time echo-message batch draft/multiline={value}"));
+        feed(&mut s, ":srv CAP alice ACK :message-tags server-time echo-message batch draft/multiline");
+        feed(&mut s, ":srv 001 alice :hi");
+        feed(&mut s, ":srv 005 alice CHANTYPES=# PREFIX=(ov)@+ :are supported");
+        s
+    }
+
+    fn say(s: &mut Session, text: &str) -> Vec<Output> {
+        s.command(Command::Say { network: "net".into(), target: "#test".into(), text: text.into() }, now())
+    }
+
+    #[test]
+    fn multiline_limits_are_the_servers_and_reach_the_ui() {
+        let mut s = Session::new("net", cfg());
+        s.start();
+        feed(&mut s, ":srv CAP * LS :message-tags batch draft/multiline=max-bytes=4096,max-lines=24");
+        let out = feed(&mut s, ":srv CAP alice ACK :message-tags batch draft/multiline");
+        let limits = Some(Limits { max_bytes: 4096, max_lines: Some(24) });
+        assert!(out.contains(&Output::Event(Event::Multiline { network: "net".into(), limits })), "{out:?}");
+        assert_eq!(s.multiline(), limits);
+        let out = feed(&mut s, ":srv CAP alice DEL :draft/multiline");
+        assert!(out.contains(&Output::Event(Event::Multiline { network: "net".into(), limits: None })), "{out:?}");
+        // Without batch the cap is no use; a garbled value is none either.
+        assert_eq!(multiline("max-lines=5").multiline(), None);
+        let mut s = Session::new("net", cfg());
+        s.start();
+        feed(&mut s, ":srv CAP * LS :message-tags draft/multiline=max-bytes=4096");
+        feed(&mut s, ":srv CAP alice ACK :message-tags draft/multiline");
+        assert_eq!(s.multiline(), None);
+    }
+
+    #[test]
+    fn multiline_say_is_one_batch_shown_as_one_pending_line() {
+        let mut s = multiline("max-bytes=4096,max-lines=24");
+        let out = say(&mut s, "one\n\nthree");
+        assert_eq!(
+            sent(&out),
+            [
+                "BATCH +hirc1 draft/multiline #test",
+                "@batch=hirc1 PRIVMSG #test one",
+                "@batch=hirc1 PRIVMSG #test :",
+                "@batch=hirc1 PRIVMSG #test three",
+                "BATCH -hirc1",
+            ]
+        );
+        let shown = lines(&out);
+        assert_eq!(shown.len(), 1);
+        assert_eq!((shown[0].1.text.as_str(), shown[0].1.delivery), ("one\n\nthree", Delivery::Pending));
+        // A second send gets a ref of its own.
+        assert_eq!(sent(&say(&mut s, "a\nb"))[0], "BATCH +hirc2 draft/multiline #test");
+    }
+
+    #[test]
+    fn single_line_say_stays_a_plain_privmsg() {
+        let mut s = multiline("max-bytes=4096");
+        assert_eq!(sent(&say(&mut s, "\nhi\n")), ["PRIVMSG #test hi"]);
+    }
+
+    #[test]
+    fn a_long_line_in_a_batch_continues_with_concat() {
+        let mut s = multiline("max-bytes=4096");
+        let long = format!("{} {}", "a".repeat(300), "b".repeat(300));
+        let msgs = sent(&say(&mut s, &format!("{long}\nend")));
+        assert_eq!(msgs.len(), 5, "{msgs:?}");
+        assert_eq!(msgs[1], format!("@batch=hirc1 PRIVMSG #test :{} ", "a".repeat(300)));
+        assert_eq!(msgs[2], format!("@batch=hirc1;draft/multiline-concat PRIVMSG #test {}", "b".repeat(300)));
+        assert_eq!(msgs[3], "@batch=hirc1 PRIVMSG #test end");
+    }
+
+    #[test]
+    fn multiline_say_splits_into_batches_by_max_lines_and_max_bytes() {
+        let mut s = multiline("max-bytes=4096,max-lines=2");
+        let out = say(&mut s, "1\n2\n3");
+        let msgs = sent(&out);
+        assert_eq!(msgs.iter().filter(|m| m.starts_with("BATCH +")).count(), 2, "{msgs:?}");
+        assert_eq!(msgs[3], "BATCH -hirc1");
+        assert_eq!(msgs[4], "BATCH +hirc2 draft/multiline #test");
+        let shown: Vec<String> = lines(&out).into_iter().map(|(_, l)| l.text).collect();
+        assert_eq!(shown, ["1\n2", "3"]);
+
+        let mut s = multiline("max-bytes=10");
+        let shown: Vec<String> = lines(&say(&mut s, "aaaaa\nbbbbb\nccccc")).into_iter().map(|(_, l)| l.text).collect();
+        assert_eq!(shown, ["aaaaa\nbbbbb", "ccccc"]);
+    }
+
+    #[test]
+    fn without_the_cap_each_line_is_its_own_privmsg() {
+        let mut s = registered(ECHO);
+        assert_eq!(sent(&say(&mut s, "one\n\ntwo")), ["PRIVMSG #test one", "PRIVMSG #test two"]);
+    }
+
+    #[test]
+    fn a_received_batch_is_one_message() {
+        let mut s = multiline("max-bytes=4096");
+        assert!(feed(&mut s, "@time=2026-10-22T10:00:00.000Z;msgid=m1 :bob!b@h BATCH +x draft/multiline #test").is_empty());
+        assert!(feed(&mut s, "@batch=x :bob!b@h PRIVMSG #test :first ").is_empty());
+        assert!(feed(&mut s, "@batch=x;draft/multiline-concat :bob!b@h PRIVMSG #test :half").is_empty());
+        assert!(feed(&mut s, "@batch=x :bob!b@h PRIVMSG #test :").is_empty());
+        assert!(feed(&mut s, "@batch=x :bob!b@h PRIVMSG #test :last").is_empty());
+        let got = lines(&feed(&mut s, ":bob!b@h BATCH -x"));
+        assert_eq!(got.len(), 1);
+        let (t, l) = &got[0];
+        assert_eq!(*t, Target::Channel("#test".into()));
+        assert_eq!((l.nick.as_deref(), l.text.as_str(), l.msgid.as_deref()), (Some("bob"), "first half\n\nlast", Some("m1")));
+        assert_eq!(l.time, "2026-10-22T10:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[test]
+    fn other_batches_pass_through() {
+        let mut s = multiline("max-bytes=4096");
+        feed(&mut s, ":srv BATCH +n netsplit irc.a irc.b");
+        assert_eq!(lines(&feed(&mut s, "@batch=n :bob!b@h PRIVMSG #test :still here")).len(), 1);
+        assert!(lines(&feed(&mut s, ":srv BATCH -n")).is_empty());
+    }
+
+    #[test]
+    fn our_echoed_batch_replaces_the_pending_line() {
+        let mut s = multiline("max-bytes=4096");
+        let mut store = crate::store::Store::new(["net".to_owned()]);
+        let apply = |store: &mut crate::store::Store, out: Vec<Output>| {
+            out.into_iter()
+                .filter_map(|o| match o {
+                    Output::Event(e) => Some(store.apply(e)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        apply(&mut store, say(&mut s, "hello\nworld"));
+        feed(&mut s, "@msgid=e1 :alice!a@h BATCH +srv1 draft/multiline #test");
+        feed(&mut s, "@batch=srv1 :alice!a@h PRIVMSG #test hello");
+        feed(&mut s, "@batch=srv1 :alice!a@h PRIVMSG #test world");
+        let applied = apply(&mut store, feed(&mut s, ":alice!a@h BATCH -srv1"));
+        assert!(matches!(applied[..], [crate::store::Applied::Replaced { .. }]), "{applied:?}");
+        let buf = &store.networks[0].buffers[1];
+        assert_eq!(buf.lines.len(), 1);
+        assert_eq!((buf.lines[0].text.as_str(), buf.lines[0].delivery, buf.lines[0].msgid.as_deref()), ("hello\nworld", Delivery::Sent, Some("e1")));
+    }
+
+    #[test]
+    fn an_unterminated_batch_is_flushed_not_leaked() {
+        let mut s = multiline("max-bytes=4096");
+        feed(&mut s, ":bob!b@h BATCH +x draft/multiline #test");
+        feed(&mut s, "@batch=x :bob!b@h PRIVMSG #test :cut");
+        feed(&mut s, "@batch=x :bob!b@h PRIVMSG #test :off");
+        let got = lines(&s.end(now()));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1.text, "cut\noff");
+        assert!(s.end(now()).is_empty());
+        // The same ref opened again: the old one is shown, the new one collected.
+        feed(&mut s, ":bob!b@h BATCH +y draft/multiline #test");
+        feed(&mut s, "@batch=y :bob!b@h PRIVMSG #test :old");
+        let got = lines(&feed(&mut s, ":bob!b@h BATCH +y draft/multiline #test"));
+        assert_eq!(got[0].1.text, "old");
+        feed(&mut s, "@batch=y :bob!b@h PRIVMSG #test :new");
+        assert_eq!(lines(&feed(&mut s, ":bob!b@h BATCH -y"))[0].1.text, "new");
+    }
+
+    #[test]
+    fn a_bridged_batch_is_unwrapped_per_line() {
+        let mut s = multiline("max-bytes=4096");
+        s.cfg.bridges = vec!["IrcBot".into()];
+        let batch = |s: &mut Session, id: &str, texts: &[&str]| {
+            feed(s, &format!("@msgid={id} :IrcBot!b@h BATCH +{id} draft/multiline #test"));
+            for t in texts {
+                feed(s, &format!("@batch={id} :IrcBot!b@h PRIVMSG #test :{t}"));
+            }
+            lines(&feed(s, &format!(":IrcBot!b@h BATCH -{id}")))
+                .into_iter()
+                .map(|(_, l)| (l.nick.unwrap_or_default(), l.text, l.msgid.unwrap_or_default()))
+                .collect::<Vec<_>>()
+        };
+        // One name on every line: one message from that name.
+        let got = batch(&mut s, "a", &["<hacker> one", "<hacker> two"]);
+        assert_eq!(got, [("hacker".into(), "one\ntwo".into(), "a".into())]);
+        // Mixed: each line on its own, with msgids kept apart.
+        let got = batch(&mut s, "b", &["<hacker> one", "<other> two", "bot words"]);
+        let want: Vec<(String, String, String)> = vec![
+            ("hacker".into(), "one".into(), "b".into()),
+            ("other".into(), "two".into(), "b:1".into()),
+            ("IrcBot".into(), "bot words".into(), "b:2".into()),
+        ];
+        assert_eq!(got, want);
     }
 
     #[test]
