@@ -190,6 +190,19 @@ pub fn apply(text: &str, breaks: &[Break]) -> (String, impl Fn(usize) -> usize +
     (out, shift)
 }
 
+/// Where `breaks` insert a `\n` (rather than replace a space), in the
+/// old text's bytes: what `unshift` needs to map back.
+pub fn inserted(breaks: &[Break]) -> Vec<usize> {
+    breaks.iter().filter(|b| !b.space).map(|b| b.at).collect()
+}
+
+/// A byte of the broken text back in the old text (`inserted` as
+/// `inserted` gives them): an inserted `\n` is where the next line
+/// starts.
+pub fn unshift(inserted: &[usize], i: usize) -> usize {
+    i - inserted.iter().enumerate().filter(|(k, at)| *at + k < i).count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +263,16 @@ mod tests {
         let (out, shift) = apply("ab cd", &[Break { at: 3, space: true }]);
         assert_eq!(out, "ab\ncd");
         assert_eq!(shift(5), 5);
+        // And back: every byte of the broken text to the old text's.
+        let breaks = [Break { at: 2, space: false }, Break { at: 5, space: true }, Break { at: 7, space: false }];
+        let (out, shift) = apply("abcd fgh", &breaks);
+        assert_eq!(out, "ab\ncd\nfg\nh");
+        let ins = inserted(&breaks);
+        assert_eq!(ins, [2, 7]);
+        for i in 0..="abcd fgh".len() {
+            assert_eq!(unshift(&ins, shift(i)), i, "{i}");
+        }
+        // An inserted `\n` maps to where its next line starts.
+        assert_eq!(unshift(&ins, 2), 2);
     }
 }

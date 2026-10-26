@@ -1,20 +1,25 @@
 //! App state and the event loop. The network thread sends `Event`s; we
 //! apply them to the `Store` and redraw. Input goes back as `Command`s.
 
-use crate::input::{Submit, TextInput, VimEvent};
+use crate::input::{self, Submit, TextInput, VimEvent};
+use crate::links;
 use crate::metrics::{Columns, Metrics, Shape};
 use crate::scroll::{self, Pos};
 use crate::theme::{self, Palette, palette};
+use crate::views::selection::{self, Mark, Selection};
 use crate::views::{buffer, sidebar, viewport};
 use crate::vim::{self, Effect, Ex, Nav, Scroll};
-use gpui::{App, Context, Entity, Focusable, KeyBinding, ListAlignment, ListState, ScrollHandle, SharedString, Window, actions, div, list, prelude::*, px};
+use gpui::{
+    App, ClipboardItem, Context, Entity, Focusable, KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, ScrollHandle,
+    SharedString, Window, actions, div, list, prelude::*, px,
+};
 use hirc_core::command::{self, Input, WindowAction};
 use hirc_core::display;
 use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::layout::{self, Layout};
 use hirc_core::store::{Applied, Buffer, LineKind, Network, Store};
 use hirc_core::theme::Theme;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -120,6 +125,19 @@ pub struct HircApp {
     /// (logical px): a link opens only on a click, not at the end of a
     /// drag.
     pub press: Rc<Cell<Option<(f32, f32)>>>,
+    /// How many clicks that press made (a double click is 2): only a
+    /// single one opens a link, the others select.
+    pub clicks: Rc<Cell<usize>>,
+    /// Where each line's text was drawn this frame, top to bottom: what a
+    /// press or drag hit-tests (see `buffer::hit`).
+    pub spots: Rc<RefCell<Vec<buffer::Spot>>>,
+    /// The selected message text, if any (see `selection`).
+    selection: Option<Selection>,
+    /// Where a drag that may select began, while the button is down.
+    drag: Option<Mark>,
+    /// The selection resolved against the shown buffer's lines at the
+    /// last render: the first and last point, in order.
+    selected_span: Option<(selection::At, selection::At)>,
     /// Print what a link click would open instead of opening it.
     pub dry_open: bool,
     /// The links drawn this frame (their text's layout, ranges and
@@ -198,6 +216,15 @@ impl HircApp {
             })
             .detach();
         }
+        // Any key but the copy chord puts a selection away (it never
+        // reaches the input's own handling of the key).
+        let this = cx.weak_entity();
+        cx.intercept_keystrokes(move |ev, _, cx| {
+            if !selection::keeps(&ev.keystroke.key, ev.keystroke.modifiers.platform) {
+                _ = this.update(cx, |app, cx| app.clear_selection(cx));
+            }
+        })
+        .detach();
         let mut events = init.events;
         cx.spawn(async move |this, cx| {
             while let Some(ev) = events.recv().await {
@@ -237,6 +264,11 @@ impl HircApp {
             pending_join: None,
             marker: None,
             press: Rc::default(),
+            clicks: Rc::default(),
+            spots: Rc::default(),
+            selection: None,
+            drag: None,
+            selected_span: None,
             dry_open: init.dry_open,
             #[cfg(feature = "snapshot")]
             link_spots: Default::default(),
@@ -261,6 +293,8 @@ impl HircApp {
             }
         }
         if self.selected != Some((n, b)) {
+            self.selection = None;
+            self.drag = None;
             let buf = &self.store.networks[n].buffers[b];
             self.marker = buf.first_unread().map(|ix| (n, b, buf.lines[ix].seq));
         }
@@ -673,6 +707,98 @@ impl HircApp {
         self.hint.as_deref()
     }
 
+    /// Put the selection away.
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.drag = None;
+        if self.selection.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The text under `at` (see `buffer::hit`).
+    fn hit(&self, at: gpui::Point<gpui::Pixels>) -> Option<Mark> {
+        buffer::hit(&self.spots.borrow(), at)
+    }
+
+    /// The primary button went down over the message view: one click puts
+    /// any selection away and may start a drag; two select the word under
+    /// it, three its whole line. Focus stays in the input.
+    fn press_text(&mut self, e: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.press.set(Some((f32::from(e.position.x), f32::from(e.position.y))));
+        self.clicks.set(e.click_count);
+        self.selection = None;
+        self.drag = None;
+        let (Some(buffer), Some(at)) = (self.selected, self.hit(e.position)) else {
+            cx.notify();
+            return;
+        };
+        if e.click_count <= 1 {
+            self.drag = Some(at);
+            cx.notify();
+            return;
+        }
+        // The line's text as drawn, to find the word in.
+        let text = self
+            .current()
+            .and_then(|(net, buf)| Some((net, buf.lines.iter().find(|l| l.seq == at.seq)?)))
+            .map(|(net, line)| buffer::log(self, line, &self.copy_context(net.nick.as_deref())).text)
+            .unwrap_or_default();
+        let r = if e.click_count == 2 { selection::word(&text, at.byte) } else { 0..text.len() };
+        self.selection = Some(Selection { buffer, anchor: Mark { seq: at.seq, byte: r.start }, head: Mark { seq: at.seq, byte: r.end } });
+        cx.notify();
+    }
+
+    /// The mouse moved with the primary button down: once past a click's
+    /// slop, the selection runs from where it went down to here.
+    fn drag_text(&mut self, e: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if e.pressed_button != Some(MouseButton::Left) {
+            self.drag = None;
+            return;
+        }
+        let (Some(anchor), Some(buffer), Some(down)) = (self.drag, self.selected, self.press.get()) else { return };
+        if self.selection.is_none() && links::is_click(down, (f32::from(e.position.x), f32::from(e.position.y)), self.metrics.cell / 2.) {
+            return;
+        }
+        if let Some(head) = self.hit(e.position) {
+            self.selection = Some(Selection { buffer, anchor, head });
+            cx.notify();
+        }
+    }
+
+    /// A line context for copying: our nick, no colours.
+    fn copy_context<'a>(&self, me: Option<&'a str>) -> buffer::Context<'a> {
+        static EMPTY: std::sync::LazyLock<HashMap<String, usize>> = std::sync::LazyLock::new(HashMap::new);
+        buffer::Context { me, cols: self.cols, slots: &EMPTY, selected: None }
+    }
+
+    /// The selection, resolved against the shown buffer: its first and
+    /// last point in order, or `None` when there is none here.
+    fn resolve_selection(&self) -> Option<(selection::At, selection::At)> {
+        let sel = self.selection.filter(|s| Some(s.buffer) == self.selected)?;
+        let (_, buf) = self.current()?;
+        let ix = |m: Mark| buf.lines.iter().position(|l| l.seq == m.seq).map(|i| (i, m.byte));
+        Some(selection::order(ix(sel.anchor)?, ix(sel.head)?))
+    }
+
+    /// What a copy takes from the selection (see `selection::copy`), when
+    /// it has any text.
+    fn selection_text(&self) -> Option<String> {
+        let (start, end) = self.resolve_selection()?;
+        let (net, buf) = self.current()?;
+        let cx = self.copy_context(net.nick.as_deref());
+        let lines: Vec<_> = buf.lines[start.0..=end.0].iter().map(|line| buffer::log(self, line, &cx)).collect();
+        Some(selection::copy(&lines, start, end)).filter(|s| !s.is_empty())
+    }
+
+    /// `⌘C` with message text selected copies it (before the input's own
+    /// copy, which runs only when nothing here is selected).
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selection_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            cx.stop_propagation();
+        }
+    }
+
     fn line_element(&mut self, ix: usize, window: &Window) -> gpui::AnyElement {
         self.refresh_nick_slots();
         let slots = self.selected.and_then(|key| self.nick_slots.get(&key)).map(|(_, s)| s);
@@ -680,7 +806,8 @@ impl HircApp {
         let slots = slots.unwrap_or(&empty);
         match self.current().and_then(|(net, buf)| Some((net, buf.lines.get(ix)?))) {
             Some((net, line)) => {
-                let line_el = buffer::line(self, window, line, &buffer::Context { me: net.nick.as_deref(), cols: self.cols, slots });
+                let selected = self.selected_span.and_then(|(start, end)| selection::span(ix, usize::MAX, start, end));
+                let line_el = buffer::line(self, window, line, &buffer::Context { me: net.nick.as_deref(), cols: self.cols, slots, selected });
                 let server = self.current().is_some_and(|(_, buf)| buf.target == Target::Server);
                 match self.marker {
                     Some((n, b, seq)) if self.selected == Some((n, b)) && line.seq == seq => buffer::with_marker(self, line_el),
@@ -701,6 +828,8 @@ impl Render for HircApp {
         let m = self.metrics;
         #[cfg(feature = "snapshot")]
         self.link_spots.borrow_mut().clear();
+        self.spots.borrow_mut().clear();
+        self.selected_span = self.resolve_selection();
         let width = f32::from(window.viewport_size().width);
         self.sidebar_width = m.sidebar_width(width);
         self.sidebar_height = f32::from(window.viewport_size().height);
@@ -737,7 +866,12 @@ impl Render for HircApp {
             .flatten()
             .and_then(|ix| self.current().and_then(|(_, buf)| buf.lines.get(ix)).map(|line| buffer::sticky(self, line, cols)));
         let lines = list(self.lines.clone(), cx.processor(|this, ix: usize, window, _cx| this.line_element(ix, window))).size_full();
-        let mut root = div().size_full();
+        let mut root = div()
+            .size_full()
+            .capture_action(cx.listener(|this, _: &input::Copy, _, cx| this.copy_selection(cx)))
+            // A drag goes on over the whole window, and ends anywhere.
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| this.drag_text(e, cx)))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.drag = None));
         macro_rules! window_keys {
             ($($action:ident => $n:expr),*) => {
                 $(root = root.on_action(cx.listener(|this, _: &$action, _, cx| this.goto_window($n, cx)));)*
@@ -763,12 +897,9 @@ impl Render for HircApp {
                     .child(buffer::title(self, window, width - self.sidebar_width))
                     .child(
                         div()
-                            // A link opens on a click; this is where the
-                            // press began (see `buffer::line`).
-                            .on_mouse_down(gpui::MouseButton::Left, {
-                                let press = self.press.clone();
-                                move |e, _, _| press.set(Some((f32::from(e.position.x), f32::from(e.position.y))))
-                            })
+                            // A link opens on a click, a drag selects; this
+                            // is where the press began (see `buffer::line`).
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, cx| this.press_text(e, cx)))
                             .relative()
                             .flex_1()
                             .min_h(px(0.))

@@ -18,14 +18,21 @@
 //! colour, on every row they wrap onto, with a pointer over them; a
 //! click (a press that does not drag) opens one, and never takes focus
 //! from the input or changes its mode.
+//!
+//! Text can be selected as in a terminal (see `selection`): the selected
+//! part of each line is drawn on the input's selection fill, and every
+//! line's text registers where it was drawn (`Spot`), so a press or a
+//! drag finds the character under it.
 
 use crate::app::HircApp;
 use crate::links;
 use crate::metrics::{Columns, Metrics};
 use crate::theme::Palette;
+use crate::views::selection::{self, Log, Mark};
 use crate::wrap;
 use gpui::{
-    AnyElement, FontWeight, HighlightStyle, Hsla, InteractiveText, IntoElement, SharedString, StyledText, TextRun, UnderlineStyle, Window, div, prelude::*, px,
+    AnyElement, FontWeight, HighlightStyle, Hsla, InteractiveText, IntoElement, Pixels, Point, SharedString, StyledText, TextLayout, TextRun, UnderlineStyle,
+    Window, div, prelude::*, px,
 };
 use hirc_core::display::{self, Part};
 use hirc_core::event::{ConnStatus, Target};
@@ -280,14 +287,48 @@ pub struct Context<'a> {
     pub cols: Columns,
     /// Each nick's colour slot in this buffer (`theme::slots`).
     pub slots: &'a HashMap<String, usize>,
+    /// What of the line's text is selected (bytes of it unwrapped).
+    pub selected: Option<std::ops::Range<usize>>,
 }
 
-/// Text with coloured (and possibly bold) runs, and the links in it.
+/// A line's text as drawn this frame: its layout (laid out and placed),
+/// where wrapping inserted breaks (`wrap::inserted`) and its length
+/// unwrapped. A press or drag finds its character here (`hit`).
+#[derive(Clone)]
+pub struct Spot {
+    pub seq: u64,
+    pub layout: TextLayout,
+    pub inserted: Vec<usize>,
+    pub len: usize,
+}
+
+/// The point of the text under `pos` (window px), among the lines drawn
+/// (`spots`, top to bottom): on a line's rows, the character boundary
+/// there (left of the text is its row's start, right its end); between
+/// lines (a rule), the start of the next; below them all, the end of the
+/// last.
+pub fn hit(spots: &[Spot], pos: Point<Pixels>) -> Option<Mark> {
+    let last = spots.last()?;
+    let Some(spot) = spots.iter().find(|s| pos.y < s.layout.bounds().bottom()) else {
+        return Some(Mark { seq: last.seq, byte: last.len });
+    };
+    let bounds = spot.layout.bounds();
+    if pos.y < bounds.top() {
+        return Some(Mark { seq: spot.seq, byte: 0 });
+    }
+    let at = Point { x: pos.x.max(bounds.left()), y: pos.y };
+    let ix = spot.layout.index_for_position(at).unwrap_or_else(|ix| ix);
+    Some(Mark { seq: spot.seq, byte: wrap::unshift(&spot.inserted, ix).min(spot.len) })
+}
+
+/// Text with coloured (and possibly bold) runs, the links in it, and
+/// once wrapped, where it inserted breaks (`wrap::inserted`).
 #[derive(Default)]
 struct Runs {
     text: String,
     runs: Vec<(std::ops::Range<usize>, HighlightStyle)>,
     links: Vec<(std::ops::Range<usize>, String)>,
+    inserted: Vec<usize>,
 }
 
 impl Runs {
@@ -324,24 +365,36 @@ impl Runs {
         StyledText::new(self.text).with_highlights(self.runs)
     }
 
+    /// Bytes `sel` of the text as it was before wrapping on the
+    /// selection fill `color`.
+    fn select(&mut self, sel: std::ops::Range<usize>, color: Hsla) {
+        let shift = |i: usize| i + self.inserted.iter().filter(|at| **at <= i).count();
+        let sel = shift(sel.start)..shift(sel.end);
+        let runs = std::mem::take(&mut self.runs);
+        self.runs = selection::overlay(runs, sel, |style| HighlightStyle { background_color: Some(color), ..*style });
+    }
+
     /// The text, its links clickable: a press and release in one link,
     /// with no drag between (`links::is_click`, against where the message
     /// view last saw the button go down), opens it. `id` keeps the
-    /// element's press state from frame to frame.
-    fn linked(self, app: &HircApp, id: SharedString) -> AnyElement {
+    /// element's press state from frame to frame. A double or triple
+    /// click selects (see `selection`), so only a single one opens.
+    /// Returns the text's layout too, for hit-testing.
+    fn linked(self, app: &HircApp, id: SharedString) -> (AnyElement, TextLayout) {
+        let text = StyledText::new(self.text).with_highlights(self.runs);
+        let layout = text.layout().clone();
         if self.links.is_empty() {
-            return self.element().into_any_element();
+            return (text.into_any_element(), layout);
         }
         let (ranges, urls): (Vec<_>, Vec<_>) = self.links.into_iter().unzip();
-        let text = StyledText::new(self.text).with_highlights(self.runs);
         #[cfg(feature = "snapshot")]
         app.link_spots.borrow_mut().push((text.layout().clone(), ranges.clone(), urls.clone()));
-        let (press, dry) = (app.press.clone(), app.dry_open);
+        let (press, clicks, dry) = (app.press.clone(), app.clicks.clone(), app.dry_open);
         let slop = app.metrics.cell / 2.;
-        InteractiveText::new(id, text)
+        let element = InteractiveText::new(id, text)
             .on_click(ranges, move |ix, window, cx| {
                 let up = window.mouse_position();
-                let still = press.get().is_some_and(|down| links::is_click(down, (f32::from(up.x), f32::from(up.y)), slop));
+                let still = clicks.get() <= 1 && press.get().is_some_and(|down| links::is_click(down, (f32::from(up.x), f32::from(up.y)), slop));
                 if let Some(url) = urls.get(ix).filter(|url| still && links::openable(url)) {
                     if dry {
                         println!("snapshot: open {url}");
@@ -350,7 +403,8 @@ impl Runs {
                     }
                 }
             })
-            .into_any_element()
+            .into_any_element();
+        (element, layout)
     }
 
     /// The text broken onto lines `width` wide (see `wrap`), in the
@@ -382,7 +436,7 @@ impl Runs {
         let runs = self.runs.into_iter().map(|(r, style)| (shift(r.start)..shift(r.end), style)).collect();
         // A link keeps its whole range, across the rows it wraps onto.
         let links = self.links.into_iter().map(|(r, url)| (shift(r.start)..shift(r.end), url)).collect();
-        Runs { text, runs, links }
+        Runs { text, runs, links, inserted: wrap::inserted(&breaks) }
     }
 }
 
@@ -398,10 +452,40 @@ fn nick_run(runs: &mut Runs, p: &Palette, shown: &str, nick: &str, cx: &Context,
     }
 }
 
-pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyElement {
+/// A line's columns before they are laid out: the nick column's runs,
+/// the text's, the whole of a nick cut to fit, and whether it mentions us.
+struct Composed {
+    prefix: Runs,
+    body: Runs,
+    cut: Option<String>,
+    mention: bool,
+}
+
+/// The time a line shows (`HH:MM`, local).
+fn clock(line: &Line) -> String {
+    line.time.with_timezone(&chrono::Local).format("%H:%M").to_string()
+}
+
+/// A line as a copy takes it (see `selection::copy`): its time, its nick
+/// column in full and its text as drawn.
+pub fn log(app: &HircApp, line: &Line, cx: &Context) -> Log {
+    Log { time: clock(line), who: who(line), text: compose(app, line, cx).body.text }
+}
+
+/// What a line's nick column says, in full: the nick, `-nick-` for a
+/// notice, `*` for an action, else the event's marker.
+fn who(line: &Line) -> String {
+    let nick = line.nick.as_deref().unwrap_or_default();
+    match line.kind {
+        LineKind::Privmsg => nick.to_owned(),
+        LineKind::Notice if !nick.is_empty() => format!("-{nick}-"),
+        LineKind::Action => "*".to_owned(),
+        kind => display::marker(kind).to_owned(),
+    }
+}
+
+fn compose(app: &HircApp, line: &Line, cx: &Context) -> Composed {
     let p = &app.palette;
-    let m = &app.metrics;
-    let time = line.time.with_timezone(&chrono::Local).format("%H:%M").to_string();
     let nick = line.nick.as_deref().unwrap_or_default();
     let cols = cx.cols;
     let own = line.own || cx.me.is_some_and(|me| me.eq_ignore_ascii_case(nick));
@@ -492,6 +576,15 @@ pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyEle
             }
         }
     }
+    Composed { prefix, body, cut, mention }
+}
+
+pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyElement {
+    let p = &app.palette;
+    let m = &app.metrics;
+    let cols = cx.cols;
+    let time = clock(line);
+    let Composed { prefix, body, cut, mention } = compose(app, line, cx);
     // The time cell says where a line we sent stands until the server
     // has it: an empty clock (`··:··`, the time it will show) while it
     // waits for the echo, `✕` once the connection dropped first (it may
@@ -505,7 +598,16 @@ pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyEle
     // and an auto-width flex root would size to its content and never wrap.
     // Rows have no vertical padding: every row is whole text lines, so the
     // view scrolls on one line grid, as a terminal does.
-    let body = body.wrap(app, window, app.pane() - 2. * m.gutter - m.text_column(cols));
+    let len = body.text.len();
+    let mut body = body.wrap(app, window, app.pane() - 2. * m.gutter - m.text_column(cols));
+    if let Some(sel) = cx.selected.clone() {
+        body.select(sel, p.selection);
+    }
+    let inserted = body.inserted.clone();
+    let (text, layout) = body.linked(app, SharedString::from(format!("text-{}", line.seq)));
+    // Once placed, the text says where it is, for a press or a drag.
+    let spot = Spot { seq: line.seq, layout, inserted, len };
+    let spots = app.spots.clone();
     div()
         .flex()
         .w_full()
@@ -514,8 +616,17 @@ pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyEle
         .when(mention, |d| d.bg(p.highlight))
         .when(cols.time > 0, |d| d.child(div().flex_none().w(px(m.grid(cols.time))).whitespace_nowrap().text_color(time_color).child(time)))
         .child(nick_column(app, cols, prefix, cut.map(|full| (full, line.seq))))
-        .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).child(body.linked(app, SharedString::from(format!("text-{}", line.seq)))))
+        .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).on_children_prepainted(move |_, _, _| push_spot(&spots, spot.clone())).child(text))
         .into_any_element()
+}
+
+/// Register where a line's text was drawn, once per frame (a line laid
+/// out twice keeps its last place).
+fn push_spot(spots: &std::cell::RefCell<Vec<Spot>>, spot: Spot) {
+    let mut spots = spots.borrow_mut();
+    spots.retain(|s| s.seq != spot.seq);
+    spots.push(spot);
+    spots.sort_by(|a, b| a.layout.bounds().top().partial_cmp(&b.layout.bounds().top()).unwrap_or(std::cmp::Ordering::Equal));
 }
 
 /// `line` with the read marker above it: where the unread lines began
@@ -555,13 +666,7 @@ pub fn sticky(app: &HircApp, line: &Line, cols: Columns) -> gpui::AnyElement {
     let p = &app.palette;
     let m = &app.metrics;
     let time = line.time.with_timezone(&chrono::Local).format("%H:%M").to_string();
-    let nick = line.nick.as_deref().unwrap_or_default();
-    let who = match line.kind {
-        LineKind::Privmsg => nick.to_owned(),
-        LineKind::Notice if !nick.is_empty() => format!("-{nick}-"),
-        LineKind::Action => "*".to_owned(),
-        kind => display::marker(kind).to_owned(),
-    };
+    let who = who(line);
     // The arrow when it fits beside the whole of who it is (a buffer's
     // nick column is only as wide as its nicks); else who, cut to the
     // column, in the quiet role, which already says it is no new line.

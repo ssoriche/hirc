@@ -41,6 +41,9 @@
 //! | `at:x,y` | Primary mouse down and up at logical (x, y). |
 //! | `hover:x,y` | Mouse move to (x, y). |
 //! | `scroll:<px>` | Scroll wheel over the buffer view; negative scrolls down. |
+//! | `drag:x1,y1,x2,y2` | Primary mouse down at (x1, y1), moved with the button held to (x2, y2) and up there: selects message text. |
+//! | `dclick:x,y`, `tclick:x,y` | A double or triple primary click at (x, y): selects a word or a line. |
+//! | `copy` | `⌘C` through the normal key path, then prints what the clipboard holds as `snapshot: clipboard <text>` on stdout (`\` and newlines escaped). |
 //! | `delay:<ms>` | From now on the fake server holds its echo of our messages this long (simulated time offscreen), so a shot can show a line waiting for its echo. `delay:0` answers at once again. |
 //!
 //! A click on a link never opens it here: it prints `snapshot: open <url>`
@@ -124,6 +127,10 @@ pub enum Step {
     At(f32, f32),
     Hover(f32, f32),
     Scroll(f32),
+    Drag(f32, f32, f32, f32),
+    /// A click `n` times over, at (x, y).
+    Clicks(usize, f32, f32),
+    Copy,
     Delay(u64),
     Unknown(String),
 }
@@ -146,6 +153,9 @@ pub fn parse_script(script: &str) -> Vec<Step> {
         .filter(|s| !s.is_empty())
         .map(|s| {
             let unknown = || Step::Unknown(s.to_owned());
+            if s == "copy" {
+                return Step::Copy;
+            }
             match s.split_once(':') {
                 Some(("window", n)) => n.trim().parse().map_or_else(|_| unknown(), Step::Window),
                 // github-rs writes `cmd+k`; gpui writes `cmd-k`.
@@ -158,6 +168,17 @@ pub fn parse_script(script: &str) -> Vec<Step> {
                 Some(("link", l)) if !l.trim().is_empty() => Step::Link(l.trim().to_owned()),
                 Some(("at", p)) => parse_point(p).map_or_else(unknown, |(x, y)| Step::At(x, y)),
                 Some(("hover", p)) => parse_point(p).map_or_else(unknown, |(x, y)| Step::Hover(x, y)),
+                Some(("dclick", p)) => parse_point(p).map_or_else(unknown, |(x, y)| Step::Clicks(2, x, y)),
+                Some(("tclick", p)) => parse_point(p).map_or_else(unknown, |(x, y)| Step::Clicks(3, x, y)),
+                Some(("drag", p)) => p
+                    .split_once(',')
+                    .and_then(|(x, rest)| rest.split_once(',').map(|(y, rest)| (x, y, rest)))
+                    .and_then(|(x, y, rest)| {
+                        let (a, b) = parse_point(&format!("{x},{y}"))?;
+                        let (c, d) = parse_point(rest)?;
+                        Some(Step::Drag(a, b, c, d))
+                    })
+                    .unwrap_or_else(unknown),
                 Some(("scroll", d)) => d.trim().parse().ok().filter(|d: &f32| d.is_finite()).map_or_else(unknown, Step::Scroll),
                 _ => unknown(),
             }
@@ -508,11 +529,19 @@ fn inject<C: AppContext>(step: &Step, cx: &mut C, handle: WindowHandle<HircApp>)
     };
     let at = |x: f32, y: f32| point(px(x), px(y));
     let modifiers = Modifiers::default();
-    let click = |cx: &mut C, position| -> Result<(), String> {
-        send(cx, PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers }))?;
-        send(cx, PlatformInput::MouseDown(MouseDownEvent { position, modifiers, button: MouseButton::Left, click_count: 1, first_mouse: false }))?;
-        send(cx, PlatformInput::MouseUp(MouseUpEvent { position, modifiers, button: MouseButton::Left, click_count: 1 }))
+    let down = |cx: &mut C, position, click_count| {
+        send(cx, PlatformInput::MouseDown(MouseDownEvent { position, modifiers, button: MouseButton::Left, click_count, first_mouse: false }))
     };
+    let up = |cx: &mut C, position, click_count| send(cx, PlatformInput::MouseUp(MouseUpEvent { position, modifiers, button: MouseButton::Left, click_count }));
+    let clicks = |cx: &mut C, position, n: usize| -> Result<(), String> {
+        send(cx, PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers }))?;
+        for count in 1..=n {
+            down(cx, position, count)?;
+            up(cx, position, count)?;
+        }
+        Ok(())
+    };
+    let click = |cx: &mut C, position| clicks(cx, position, 1);
     match step {
         Step::Window(n) => handle.update(cx, |app, _, cx| app.goto_window(*n, cx)).map_err(gone),
         Step::Key(k) => {
@@ -539,6 +568,29 @@ fn inject<C: AppContext>(step: &Step, cx: &mut C, handle: WindowHandle<HircApp>)
             }
         },
         Step::At(x, y) => click(cx, at(*x, *y)),
+        Step::Clicks(n, x, y) => clicks(cx, at(*x, *y), *n),
+        Step::Drag(x1, y1, x2, y2) => {
+            let (from, to) = (at(*x1, *y1), at(*x2, *y2));
+            send(cx, PlatformInput::MouseMove(MouseMoveEvent { position: from, pressed_button: None, modifiers }))?;
+            down(cx, from, 1)?;
+            // Through the middle, as a hand moves.
+            for position in [at((x1 + x2) / 2., (y1 + y2) / 2.), to] {
+                send(cx, PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: Some(MouseButton::Left), modifiers }))?;
+            }
+            up(cx, to, 1)
+        }
+        Step::Copy => {
+            let ks = Keystroke::parse("cmd-c").map_err(|e| format!("bad key cmd-c: {e}"))?;
+            let text = cx
+                .update_window(handle.into(), |_, window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(String::new()));
+                    window.dispatch_keystroke(ks, cx);
+                    cx.read_from_clipboard().and_then(|item| item.text()).unwrap_or_default()
+                })
+                .map_err(gone)?;
+            println!("snapshot: clipboard {}", escape(&text));
+            Ok(())
+        }
         Step::Hover(x, y) => send(cx, PlatformInput::MouseMove(MouseMoveEvent { position: at(*x, *y), pressed_button: None, modifiers })),
         Step::Scroll(d) => {
             // Over the buffer view: right of the sidebar, mid-height.
@@ -554,6 +606,11 @@ fn inject<C: AppContext>(step: &Step, cx: &mut C, handle: WindowHandle<HircApp>)
         }
         Step::Wait(_) | Step::Shot(_) | Step::Delay(_) => Ok(()),
     }
+}
+
+/// `text` on one line: `\` and newlines escaped.
+fn escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('\n', "\\n")
 }
 
 async fn apply(step: &Step, cx: &mut AsyncApp, handle: WindowHandle<HircApp>) -> Result<(), String> {
@@ -744,6 +801,18 @@ mod tests {
         assert_eq!(parse_script("delay:1500;delay:x"), [Step::Delay(1500), Step::Unknown("delay:x".into())]);
         assert_eq!(parse_script("click:  my chan "), [Step::Click("my chan".into())]);
         assert_eq!(parse_script("link: Example.org ;link:"), [Step::Link("Example.org".into()), Step::Unknown("link:".into())]);
+        assert_eq!(
+            parse_script("drag:1,2,3.5,4;dclick:5,6;tclick:7,8;copy;drag:1,2,3;copyx"),
+            [
+                Step::Drag(1., 2., 3.5, 4.),
+                Step::Clicks(2, 5., 6.),
+                Step::Clicks(3, 7., 8.),
+                Step::Copy,
+                Step::Unknown("drag:1,2,3".into()),
+                Step::Unknown("copyx".into())
+            ]
+        );
+        assert_eq!(escape("a\\b\nc"), "a\\\\b\\nc");
     }
 
     #[test]
