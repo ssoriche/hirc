@@ -22,6 +22,9 @@ pub const TARGETS: &str = "*";
 pub const DEFAULT_PAGE: usize = 100;
 /// How far back TARGETS looks when nothing has been seen yet.
 pub const DISCOVERY_DAYS: i64 = 7;
+/// TARGETS requests per connection at most: a full answer asks on from
+/// its last name, so a server always answering in full can't loop us.
+pub const MAX_TARGETS_PAGES: usize = 10;
 
 /// The page size: the configured one (else `DEFAULT_PAGE`), never more
 /// than the server's `CHATHISTORY` limit, and at least 1.
@@ -127,6 +130,9 @@ pub struct Known {
 #[derive(Clone, Debug, Default)]
 pub struct Book {
     known: HashMap<String, Known>,
+    /// Every target with activity up to this time has been found (by
+    /// TARGETS answered in full): where the next TARGETS may start.
+    discovered: Option<DateTime<Utc>>,
 }
 
 impl Book {
@@ -197,9 +203,18 @@ impl Book {
         names
     }
 
-    /// The newest time seen anywhere: where TARGETS starts looking.
+    /// The newest time seen anywhere.
     pub fn last_seen(&self) -> Option<DateTime<Utc>> {
         self.known.values().filter_map(|k| k.newest.as_ref().map(|a| a.time)).max()
+    }
+
+    /// Up to when every target with activity has been found.
+    pub fn discovered(&self) -> Option<DateTime<Utc>> {
+        self.discovered
+    }
+
+    pub fn set_discovered(&mut self, time: DateTime<Utc>) {
+        self.discovered = Some(time);
     }
 }
 

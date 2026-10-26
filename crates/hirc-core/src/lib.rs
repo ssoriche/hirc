@@ -16,6 +16,7 @@ pub mod layout;
 pub mod multiline;
 pub mod proto;
 pub mod sasl;
+pub mod services;
 pub mod session;
 pub mod split;
 pub mod store;
