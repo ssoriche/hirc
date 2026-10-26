@@ -3,6 +3,7 @@
 //! and routing logic lives here so it can be unit-tested; `conn` just
 //! moves bytes.
 
+use crate::batch::Batches;
 use crate::caps::Caps;
 use crate::event::{Command, ConnStatus, Event, PeerChange, Target};
 use crate::isupport::Isupport;
@@ -95,6 +96,8 @@ pub struct Session {
     closing: Option<String>,
     /// `draft/multiline` batches still arriving, by ref, oldest first.
     incoming: Vec<(String, Incoming)>,
+    /// Every open batch: how they nest, and the labels they answer.
+    batches: Batches,
     /// Numbers the batches we send, so each ref is new on the connection.
     batch_seq: u64,
     /// The multiline limits last told to the UI.
@@ -137,6 +140,7 @@ impl Session {
             authed: false,
             closing: None,
             incoming: Vec::new(),
+            batches: Batches::default(),
             batch_seq: 0,
             multiline_said: None,
         }
@@ -167,6 +171,7 @@ impl Session {
         self.alt = 0;
         self.authed = false;
         self.incoming.clear();
+        self.batches.clear();
         self.multiline_said = None;
         let mut out = Vec::new();
         if let Some(p) = &self.cfg.password {
@@ -312,23 +317,29 @@ impl Session {
         }
     }
 
-    /// `BATCH +ref type ...` / `BATCH -ref`. Only `draft/multiline` batches
-    /// are collected; the lines of any other type are handled as they come.
+    /// `BATCH +ref type ...` / `BATCH -ref`. Every batch is tracked (see
+    /// `batch`); `draft/multiline` ones are collected into one message, and
+    /// the lines of any other type are handled as they come.
     fn on_batch(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
         let Some(r) = msg.params.first() else { return };
         let (open, r) = match (r.strip_prefix('+'), r.strip_prefix('-')) {
-            (Some(r), _) => (true, r),
-            (_, Some(r)) => (false, r),
+            (Some(r), _) => (true, r.to_owned()),
+            (_, Some(r)) => (false, r.to_owned()),
             _ => return,
         };
         // A close, or a ref opened again while its batch never closed: show
         // what it got.
-        if let Some(i) = self.incoming.iter().position(|(k, _)| k == r) {
+        if let Some(i) = self.incoming.iter().position(|(k, _)| *k == r) {
             let (_, batch) = self.incoming.remove(i);
             self.finish(batch, now, out);
         }
-        if open && msg.params.get(1).map(String::as_str) == Some(multiline::CAP) {
-            self.incoming.push((r.to_owned(), Incoming { open: msg.clone(), lines: Vec::new() }));
+        self.batches.close(&r);
+        if !open {
+            return;
+        }
+        self.batches.open(msg);
+        if msg.params.get(1).map(String::as_str) == Some(multiline::CAP) {
+            self.incoming.push((r, Incoming { open: msg.clone(), lines: Vec::new() }));
         }
     }
 
@@ -1130,6 +1141,21 @@ mod tests {
         feed(&mut s, ":srv BATCH +n netsplit irc.a irc.b");
         assert_eq!(lines(&feed(&mut s, "@batch=n :bob!b@h PRIVMSG #test :still here")).len(), 1);
         assert!(lines(&feed(&mut s, ":srv BATCH -n")).is_empty());
+    }
+
+    #[test]
+    fn every_batch_is_tracked_with_its_nesting() {
+        let mut s = multiline("max-bytes=4096");
+        feed(&mut s, "@label=hl1 :srv BATCH +lr labeled-response");
+        feed(&mut s, "@batch=lr :srv BATCH +h chathistory #test");
+        assert_eq!(s.batches.enclosing("h", "chathistory").as_deref(), Some("h"));
+        assert_eq!(s.batches.label("h").as_deref(), Some("hl1"));
+        feed(&mut s, ":srv BATCH -h");
+        assert_eq!(s.batches.get("h"), None);
+        assert!(s.batches.get("lr").is_some());
+        // A new connection forgets them all.
+        s.start();
+        assert_eq!(s.batches.get("lr"), None);
     }
 
     #[test]
