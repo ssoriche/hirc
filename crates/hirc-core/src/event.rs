@@ -142,14 +142,52 @@ pub enum PeerChange {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    Say { network: String, target: String, text: String },
-    Action { network: String, target: String, text: String },
-    Join { network: String, channel: String, key: Option<String> },
-    Part { network: String, channel: String, reason: Option<String> },
-    Nick { network: String, nick: String },
-    Raw { network: String, line: String },
-    Disconnect { network: String, reason: Option<String> },
-    Reconnect { network: String },
+    Say {
+        network: String,
+        target: String,
+        text: String,
+    },
+    Action {
+        network: String,
+        target: String,
+        text: String,
+    },
+    Join {
+        network: String,
+        channel: String,
+        key: Option<String>,
+    },
+    Part {
+        network: String,
+        channel: String,
+        reason: Option<String>,
+    },
+    Nick {
+        network: String,
+        nick: String,
+    },
+    Raw {
+        network: String,
+        line: String,
+    },
+    Disconnect {
+        network: String,
+        reason: Option<String>,
+    },
+    Reconnect {
+        network: String,
+    },
+    /// The user is at the top of `target`'s window: show older lines.
+    Older {
+        network: String,
+        target: String,
+    },
+    /// A window for `target` is open (a query from last time, or one the
+    /// user just opened): keep its history up to date.
+    Open {
+        network: String,
+        target: String,
+    },
 }
 
 impl Command {
@@ -162,7 +200,9 @@ impl Command {
             | Command::Nick { network, .. }
             | Command::Raw { network, .. }
             | Command::Disconnect { network, .. }
-            | Command::Reconnect { network } => network,
+            | Command::Reconnect { network }
+            | Command::Older { network, .. }
+            | Command::Open { network, .. } => network,
         }
     }
 }

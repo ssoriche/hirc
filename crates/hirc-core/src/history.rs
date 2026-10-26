@@ -48,8 +48,10 @@ pub struct Anchor {
 }
 
 impl Anchor {
+    /// A line's place. An empty msgid is no msgid: `msgid=` would name
+    /// nothing, so the line is found by its time.
     pub fn of(line: &Line) -> Anchor {
-        Anchor { msgid: line.msgid.clone(), time: line.time }
+        Anchor { msgid: line.msgid.clone().filter(|m| !m.is_empty()), time: line.time }
     }
 
     /// From a raw message's `time` and `msgid` tags; `None` without a
@@ -152,11 +154,13 @@ impl Book {
 
     /// Lines shown for `name` widen what we hold. Lines without a msgid
     /// (ours waiting for the echo, hirc's own notes) are not the server's,
-    /// so they are skipped.
+    /// so they are skipped. Many lines can share a millisecond, so a tie
+    /// is settled by order: a live line, arriving last, is the newest; a
+    /// replayed one may be from a page before, so it must be newer.
     pub fn note(&mut self, name: &str, query: bool, lines: &[Line]) {
         let k = self.entry(name, query);
         for l in lines.iter().filter(|l| l.msgid.is_some()) {
-            if k.newest.as_ref().is_none_or(|a| l.time >= a.time) {
+            if k.newest.as_ref().is_none_or(|a| l.time > a.time || (!l.replayed && l.time == a.time)) {
                 k.newest = Some(Anchor::of(l));
             }
             if k.oldest.as_ref().is_none_or(|a| l.time < a.time) {
@@ -165,15 +169,21 @@ impl Book {
         }
     }
 
-    /// A page's first and last item widen what we hold, even when none of
-    /// its items show as a line (a page of reactions), so the next page
-    /// always starts further on.
-    pub fn reach(&mut self, name: &str, query: bool, first: &Anchor, last: &Anchor) {
+    /// A page's first item (a page before) or last item (a page after)
+    /// widens what we hold, even when none of its items show as a line (a
+    /// page of reactions), so the next page always starts further on. On
+    /// a tie in time the page's end wins: it was asked for past what is
+    /// held, so it is further on.
+    pub fn reach(&mut self, name: &str, query: bool, first: Option<&Anchor>, last: Option<&Anchor>) {
         let k = self.entry(name, query);
-        if k.oldest.as_ref().is_none_or(|a| first.time < a.time) {
+        if let Some(first) = first
+            && k.oldest.as_ref().is_none_or(|a| first.time <= a.time)
+        {
             k.oldest = Some(first.clone());
         }
-        if k.newest.as_ref().is_none_or(|a| last.time >= a.time) {
+        if let Some(last) = last
+            && k.newest.as_ref().is_none_or(|a| last.time >= a.time)
+        {
             k.newest = Some(last.clone());
         }
     }
@@ -251,6 +261,13 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_msgid_is_never_an_anchor() {
+        let a = Anchor::of(&line(5, Some("")));
+        assert_eq!(a.msgid, None);
+        assert_eq!(a.param(), timestamp(at(5)));
+    }
+
+    #[test]
     fn the_book_widens_with_what_is_shown() {
         let mut b = Book::default();
         b.note("#A", false, &[line(5, Some("m5")), line(9, None), line(3, Some("m3"))]);
@@ -261,9 +278,31 @@ mod tests {
         assert_eq!(b.oldest("#a").map(|a| a.time), Some(at(1)));
         assert_eq!(b.newest("#a").map(|a| a.time), Some(at(5)));
         // A page's raw ends widen it too (a page of reactions shows no lines).
-        b.reach("#a", false, &Anchor { msgid: Some("r0".into()), time: at(0) }, &Anchor { msgid: Some("r7".into()), time: at(7) });
+        b.reach("#a", false, Some(&Anchor { msgid: Some("r0".into()), time: at(0) }), Some(&Anchor { msgid: Some("r7".into()), time: at(7) }));
         assert_eq!((b.oldest("#a").map(|a| a.time), b.newest("#a").map(|a| a.time)), (Some(at(0)), Some(at(7))));
         assert_eq!(b.get("#a").map(|k| k.name.as_str()), Some("#A"));
+    }
+
+    #[test]
+    fn ties_in_time_go_to_the_page_not_the_replay() {
+        // A burst inside one millisecond: only order tells the lines apart.
+        let a = |id: &str| Anchor { msgid: Some(id.into()), time: at(5) };
+        let mut b = Book::default();
+        b.reach("#a", false, Some(&a("n100")), Some(&a("n199")));
+        // The page before ends where it began: its first is now the oldest.
+        b.reach("#a", false, Some(&a("n0")), None);
+        assert_eq!(b.oldest("#a").and_then(|a| a.msgid.as_deref()), Some("n0"));
+        assert_eq!(b.newest("#a").and_then(|a| a.msgid.as_deref()), Some("n199"));
+        // Its lines are replayed: at the same time, they are not newer.
+        let old = Line { replayed: true, ..line(5, Some("n99")) };
+        b.note("#a", false, &[old]);
+        assert_eq!(b.newest("#a").and_then(|a| a.msgid.as_deref()), Some("n199"));
+        // A page after does move the newest on a tie, and so does a live line.
+        b.reach("#a", false, None, Some(&a("n299")));
+        assert_eq!(b.newest("#a").and_then(|a| a.msgid.as_deref()), Some("n299"));
+        b.note("#a", false, &[line(5, Some("live"))]);
+        assert_eq!(b.newest("#a").and_then(|a| a.msgid.as_deref()), Some("live"));
+        assert_eq!(b.oldest("#a").and_then(|a| a.msgid.as_deref()), Some("n0"));
     }
 
     #[test]

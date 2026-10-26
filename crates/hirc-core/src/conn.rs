@@ -4,6 +4,7 @@
 
 use crate::config::{self, Config, ConfigError, Sasl, Server};
 use crate::event::{Command, ConnStatus, Event};
+use crate::history::Book;
 use crate::proto::Message;
 use crate::session::{Output, SaslPlain, Session, SessionConfig};
 use crate::wire::LineReader;
@@ -75,6 +76,15 @@ enum End {
     Closed(Option<String>),
 }
 
+/// What outlives one connection.
+#[derive(Default)]
+struct Carry {
+    /// Channels joined at runtime, rejoined after a reconnect.
+    rejoin: Vec<String>,
+    /// What history each target holds, so a reconnect asks only for the gap.
+    book: Book,
+}
+
 /// The delay before the next attempt and the backoff to carry forward. A
 /// session that got as far as registering resets the backoff, however it
 /// ended (clean close, reset, TLS error, idle timeout).
@@ -91,19 +101,18 @@ async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Co
     // Resolved secrets live for the process so reconnects don't re-run
     // `password_command` (each run can prompt). A Stop clears them.
     let mut cached: Option<SessionConfig> = None;
-    // Channels joined at runtime, rejoined after a reconnect.
-    let mut rejoin: Vec<String> = Vec::new();
+    let mut carry = Carry::default();
     loop {
         status(ConnStatus::Connecting);
         let mut registered = false;
-        let reason = match connect_once(&name, &server, &mut cached, &mut rejoin, &mut registered, &mut cmds, &events).await {
+        let reason = match connect_once(&name, &server, &mut cached, &mut carry, &mut registered, &mut cmds, &events).await {
             Ok(end @ (End::Stopped(_) | End::Quit)) => {
                 cached = None;
                 status(match end {
                     End::Stopped(reason) => ConnStatus::Failed { reason },
                     _ => ConnStatus::Offline,
                 });
-                if wait_reconnect(&mut cmds).await.is_none() {
+                if wait_reconnect(&mut cmds, &mut carry.book).await.is_none() {
                     return;
                 }
                 backoff = MIN_BACKOFF;
@@ -117,7 +126,7 @@ async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Co
         status(ConnStatus::Disconnected { reason, retry: delay });
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
-            r = wait_reconnect(&mut cmds) => {
+            r = wait_reconnect(&mut cmds, &mut carry.book) => {
                 if r.is_none() {
                     return;
                 }
@@ -127,11 +136,13 @@ async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Co
 }
 
 /// Waits for /reconnect, dropping other commands (there's nowhere to send
-/// them). `None` when the app is shutting down.
-async fn wait_reconnect(cmds: &mut UnboundedReceiver<Command>) -> Option<()> {
+/// them). A window opened meanwhile is kept, for the next connection to
+/// backfill. `None` when the app is shutting down.
+async fn wait_reconnect(cmds: &mut UnboundedReceiver<Command>, book: &mut Book) -> Option<()> {
     loop {
         match cmds.recv().await? {
             Command::Reconnect { .. } => return Some(()),
+            Command::Open { target, .. } => book.open(&target, !target.starts_with(['#', '&'])),
             _ => continue,
         }
     }
@@ -167,6 +178,8 @@ fn session_config(s: &Server) -> Result<SessionConfig, ConfigError> {
         sasl,
         channels: s.channels.clone(),
         bridges: s.bridges.clone(),
+        chathistory: s.chathistory,
+        history_page: s.history_page_size,
     })
 }
 
@@ -196,7 +209,7 @@ async fn connect_once(
     name: &str,
     server: &Server,
     cached: &mut Option<SessionConfig>,
-    rejoin: &mut Vec<String>,
+    carry: &mut Carry,
     registered: &mut bool,
     cmds: &mut UnboundedReceiver<Command>,
     events: &UnboundedSender<Event>,
@@ -242,8 +255,8 @@ async fn connect_once(
     let (r, mut w) = tokio::io::split(stream);
     let mut reader = LineReader::new(BufReader::new(r));
     let mut cfg = cfg;
-    cfg.channels = merge_channels(&cfg.channels, rejoin);
-    let mut session = Session::new(name, cfg);
+    cfg.channels = merge_channels(&cfg.channels, &carry.rejoin);
+    let mut session = Session::new(name, cfg).with_book(std::mem::take(&mut carry.book));
     let mut outs = session.start();
     let mut last_rx = Instant::now();
     let mut pinged = false;
@@ -261,8 +274,10 @@ async fn connect_once(
                             *registered = true;
                         }
                         match &e {
-                            Event::Joined { channel, .. } if !rejoin.iter().any(|c| c.eq_ignore_ascii_case(channel)) => rejoin.push(channel.clone()),
-                            Event::Parted { channel, .. } => rejoin.retain(|c| !c.eq_ignore_ascii_case(channel)),
+                            Event::Joined { channel, .. } if !carry.rejoin.iter().any(|c| c.eq_ignore_ascii_case(channel)) => {
+                                carry.rejoin.push(channel.clone())
+                            }
+                            Event::Parted { channel, .. } => carry.rejoin.retain(|c| !c.eq_ignore_ascii_case(channel)),
                             _ => {}
                         }
                         let _ = events.send(e);
@@ -317,6 +332,7 @@ async fn connect_once(
             let _ = events.send(e);
         }
     }
+    carry.book = session.take_book();
     end
 }
 

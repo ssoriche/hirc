@@ -72,7 +72,8 @@ history:
     client-length: 256
     autoresize-window: 3d
     autoreplay-on-join: 0
-    chathistory-maxmessages: 1000
+    # small, so paging tests run fast; tests read it from ISUPPORT
+    chathistory-maxmessages: 100
     znc-maxmessages: 2048
     restrictions:
         expire-time: 1w

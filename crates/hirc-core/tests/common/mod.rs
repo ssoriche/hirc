@@ -111,6 +111,16 @@ impl Raw {
     }
 }
 
+impl Raw {
+    /// The value of ISUPPORT token `name` (`CHATHISTORY=100` -> `"100"`),
+    /// reading on from where the connection is (right after 001, the 005s).
+    pub async fn isupport_value(&mut self, name: &str) -> String {
+        let line = self.expect(&format!(" {name}=")).await;
+        let token = line.split_whitespace().find_map(|t| t.strip_prefix(&format!("{name}="))).unwrap_or_default();
+        token.to_owned()
+    }
+}
+
 /// Registers `nick` with NickServ, then disconnects.
 pub async fn register_account(port: u16, nick: &str, password: &str) {
     let mut c = Raw::connect(port, nick).await;

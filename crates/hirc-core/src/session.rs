@@ -6,6 +6,7 @@
 use crate::batch::Batches;
 use crate::caps::Caps;
 use crate::event::{Command, ConnStatus, Event, PeerChange, Target};
+use crate::history::{self, Anchor, Book, Kind, Request};
 use crate::isupport::Isupport;
 use crate::multiline::{self, Limits};
 use crate::proto::Message;
@@ -43,6 +44,10 @@ pub struct SessionConfig {
     pub channels: Vec<String>,
     /// Relay bots whose lines are unwrapped to their authors (`bridge`).
     pub bridges: Vec<String>,
+    /// Ask the server for history (the config's `chathistory`).
+    pub chathistory: bool,
+    /// Lines per history page as configured (`history_page_size`).
+    pub history_page: Option<usize>,
 }
 
 impl std::fmt::Debug for SaslPlain {
@@ -63,6 +68,8 @@ impl std::fmt::Debug for SessionConfig {
             .field("sasl", &self.sasl)
             .field("channels", &self.channels)
             .field("bridges", &self.bridges)
+            .field("chathistory", &self.chathistory)
+            .field("history_page", &self.history_page)
             .finish()
     }
 }
@@ -98,6 +105,19 @@ pub struct Session {
     incoming: Vec<(String, Incoming)>,
     /// Every open batch: how they nest, and the labels they answer.
     batches: Batches,
+    /// History pages arriving, by batch ref.
+    pages: HashMap<String, Page>,
+    /// The history request out for each lowercased target
+    /// (`history::TARGETS` for TARGETS): one at a time.
+    inflight: HashMap<String, Inflight>,
+    /// Our labels, to the in-flight key each answers.
+    labels: HashMap<String, String>,
+    label_seq: u64,
+    /// What history is held per target. The network task carries it from
+    /// one connection to the next.
+    book: Book,
+    /// Registration finished (end of MOTD) and open queries were synced.
+    synced: bool,
     /// Numbers the batches we send, so each ref is new on the connection.
     batch_seq: u64,
     /// The multiline limits last told to the UI.
@@ -111,6 +131,30 @@ struct Incoming {
     /// time and msgid when the server tags them here.
     open: Message,
     lines: Vec<Message>,
+    /// The history page this batch is part of, if any.
+    history: Option<String>,
+}
+
+/// A page of history being received (a `chathistory` batch).
+#[derive(Debug)]
+struct Page {
+    /// The target the batch names.
+    target: String,
+    /// The label it answers.
+    label: Option<String>,
+    lines: Vec<Line>,
+    /// Messages in it, shown or not (a multiline batch is one). The limit
+    /// counts these, so a page with `limit` of them may have more after it.
+    items: usize,
+    first: Option<Anchor>,
+    last: Option<Anchor>,
+}
+
+#[derive(Clone, Debug)]
+struct Inflight {
+    request: Request,
+    /// Asked again by time after the server couldn't find the msgid.
+    retried: bool,
 }
 
 fn send<I, S>(command: &str, params: I) -> Output
@@ -141,6 +185,12 @@ impl Session {
             closing: None,
             incoming: Vec::new(),
             batches: Batches::default(),
+            pages: HashMap::new(),
+            inflight: HashMap::new(),
+            labels: HashMap::new(),
+            label_seq: 0,
+            book: Book::default(),
+            synced: false,
             batch_seq: 0,
             multiline_said: None,
         }
@@ -160,6 +210,26 @@ impl Session {
         &self.nick
     }
 
+    /// Start from what earlier connections (or the cache) hold.
+    pub fn with_book(mut self, book: Book) -> Session {
+        self.book = book;
+        self
+    }
+
+    /// What this session holds, for the next connection.
+    pub fn take_book(&mut self) -> Book {
+        std::mem::take(&mut self.book)
+    }
+
+    pub fn book(&self) -> &Book {
+        &self.book
+    }
+
+    /// Lines per history page: the configured size, capped by the server.
+    pub fn page(&self) -> usize {
+        history::page_size(self.cfg.history_page, self.isupport.chathistory)
+    }
+
     /// The first lines of a fresh connection. PASS goes first: bouncers
     /// such as IRCCloud read it before anything else.
     pub fn start(&mut self) -> Vec<Output> {
@@ -172,6 +242,10 @@ impl Session {
         self.authed = false;
         self.incoming.clear();
         self.batches.clear();
+        self.pages.clear();
+        self.inflight.clear();
+        self.labels.clear();
+        self.synced = false;
         self.multiline_said = None;
         let mut out = Vec::new();
         if let Some(p) = &self.cfg.password {
@@ -190,6 +264,13 @@ impl Session {
         for (_, batch) in std::mem::take(&mut self.incoming) {
             self.finish(batch, now, &mut out);
         }
+        // Pages cut off by the drop: what came is still history.
+        for (_, page) in std::mem::take(&mut self.pages) {
+            if !page.lines.is_empty() {
+                out.push(self.history_event(&page.target, page.lines, false));
+            }
+        }
+        self.note(&out);
         out
     }
 
@@ -201,20 +282,38 @@ impl Session {
 
     pub fn handle(&mut self, msg: Message, now: DateTime<Utc>) -> Vec<Output> {
         let mut out = Vec::new();
-        if matches!(msg.command.as_str(), "PRIVMSG" | "NOTICE")
-            && let Some(r) = msg.tag("batch")
-            && let Some(i) = self.incoming.iter().position(|(k, _)| k == r)
-        {
-            self.incoming[i].1.lines.push(msg);
-            return out;
+        let end_of_motd = matches!(msg.command.as_str(), "376" | "422");
+        self.dispatch(msg, now, &mut out);
+        if end_of_motd && self.reg == Reg::Done && !self.synced {
+            self.synced = true;
+            self.sync(now, &mut out);
+        }
+        self.note(&out);
+        out
+    }
+
+    fn dispatch(&mut self, msg: Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        if let Some(r) = msg.tag("batch").map(str::to_owned) {
+            if matches!(msg.command.as_str(), "PRIVMSG" | "NOTICE")
+                && let Some(i) = self.incoming.iter().position(|(k, _)| *k == r)
+            {
+                self.incoming[i].1.lines.push(msg);
+                return;
+            }
+            // Inside a chathistory batch, however deep: history, not news.
+            if msg.command != "BATCH"
+                && let Some(h) = self.batches.enclosing(&r, history::BATCH).filter(|h| self.pages.contains_key(h))
+            {
+                return self.replay(&h, &msg, now);
+            }
         }
         match msg.command.as_str() {
             "PING" => out.push(send("PONG", msg.params.clone())),
-            "CAP" => self.on_cap(&msg, &mut out),
-            "AUTHENTICATE" => self.on_authenticate(&msg, &mut out),
+            "CAP" => self.on_cap(&msg, out),
+            "AUTHENTICATE" => self.on_authenticate(&msg, out),
             "903" | "907" if self.reg == Reg::Sasl => {
                 self.authed = true;
-                self.end_cap(&mut out);
+                self.end_cap(out);
             }
             "902" | "904" | "905" | "906" => out.push(Output::Stop(format!("SASL authentication failed: {}", last(&msg)))),
             "432" | "433" if self.reg != Reg::Done => match self.next_nick(msg.command == "433") {
@@ -224,21 +323,21 @@ impl Session {
                 }
                 None => out.push(Output::Stop("no usable nickname".into())),
             },
-            "001" => self.on_welcome(&msg, now, &mut out),
+            "001" => self.on_welcome(&msg, now, out),
             "005" => self.isupport.apply(&msg.params),
-            "PRIVMSG" | "NOTICE" => self.on_message(&msg, now, &mut out),
-            "JOIN" => self.on_join(&msg, now, &mut out),
-            "PART" => self.on_part(&msg, now, &mut out),
-            "KICK" => self.on_kick(&msg, now, &mut out),
-            "QUIT" => self.on_quit(&msg, now, &mut out),
-            "NICK" => self.on_nick(&msg, now, &mut out),
-            "TOPIC" => self.on_topic(&msg, now, &mut out),
+            "PRIVMSG" | "NOTICE" => self.on_message(&msg, now, out),
+            "JOIN" => self.on_join(&msg, now, out),
+            "PART" => self.on_part(&msg, now, out),
+            "KICK" => self.on_kick(&msg, now, out),
+            "QUIT" => self.on_quit(&msg, now, out),
+            "NICK" => self.on_nick(&msg, now, out),
+            "TOPIC" => self.on_topic(&msg, now, out),
             "332" => {
                 if let [_, chan, topic, ..] = msg.params.as_slice() {
                     out.push(Output::Event(Event::Topic { network: self.network.clone(), channel: chan.clone(), topic: Some(topic.clone()) }));
                 }
             }
-            "353" => self.on_names(&msg, &mut out),
+            "353" => self.on_names(&msg, out),
             // away-notify: someone in a channel we share went away or came back.
             "AWAY" => {
                 if let Some(nick) = msg.nick().filter(|n| !self.is_me(n)) {
@@ -255,11 +354,13 @@ impl Session {
                 let line = self.line(&msg, now, LineKind::Server, None, text, false);
                 out.push(self.event_line(Target::Server, line));
             }
-            "MODE" => self.on_mode(&msg, now, &mut out),
+            "MODE" => self.on_mode(&msg, now, out),
             // No line of its own: the close follows, and its status line
             // gives this text as the reason.
             "ERROR" => self.closing = Some(last(&msg).to_owned()).filter(|t| !t.is_empty()),
-            "BATCH" => self.on_batch(&msg, now, &mut out),
+            "BATCH" => self.on_batch(&msg, now, out),
+            "FAIL" if msg.params.first().map(String::as_str) == Some("CHATHISTORY") => self.on_fail(&msg, now, out),
+            "ACK" => self.on_ack(&msg, out),
             "TAGMSG" | "366" => {}
             c if c.len() == 3 && c.bytes().all(|b| b.is_ascii_digit()) => {
                 let text = msg.params.get(1..).unwrap_or_default().join(" ");
@@ -268,7 +369,6 @@ impl Session {
             }
             _ => {}
         }
-        out
     }
 
     /// Next nickname to try: alt_nicks in order, then (only when the nick
@@ -334,12 +434,27 @@ impl Session {
             self.finish(batch, now, out);
         }
         self.batches.close(&r);
+        if let Some(page) = self.pages.remove(&r) {
+            self.finish_page(page, out);
+        }
         if !open {
             return;
         }
-        self.batches.open(msg);
-        if msg.params.get(1).map(String::as_str) == Some(multiline::CAP) {
-            self.incoming.push((r, Incoming { open: msg.clone(), lines: Vec::new() }));
+        let tracked = self.batches.open(msg);
+        match msg.params.get(1).map(String::as_str) {
+            // Collected even when the tracker is full (`batch::MAX_OPEN`),
+            // so its page is found from the batch line's own `batch` tag.
+            Some(multiline::CAP) => {
+                let history = msg.tag("batch").and_then(|p| self.batches.enclosing(p, history::BATCH)).filter(|h| self.pages.contains_key(h));
+                self.incoming.push((r, Incoming { open: msg.clone(), lines: Vec::new(), history }));
+            }
+            // Untracked, it is no page: its lines show as they come.
+            Some(history::BATCH) if tracked => {
+                let target = msg.params.get(2).cloned().unwrap_or_default();
+                let label = self.batches.label(&r);
+                self.pages.insert(r, Page { target, label, lines: Vec::new(), items: 0, first: None, last: None });
+            }
+            _ => {}
         }
     }
 
@@ -356,7 +471,174 @@ impl Session {
         let target = batch.open.params.get(2).or(first.params.first()).cloned().unwrap_or_default();
         let source = batch.open.source.clone().or_else(|| first.source.clone());
         let msg = Message { tags, source, command: first.command.clone(), params: vec![target, text] };
-        self.on_message(&msg, now, out);
+        match batch.history {
+            Some(h) if self.pages.contains_key(&h) => self.replay(&h, &msg, now),
+            _ => self.on_message(&msg, now, out),
+        }
+    }
+
+    /// History can be asked for: the user wants it, and the server has
+    /// batches and chathistory.
+    fn history_on(&self) -> bool {
+        self.cfg.chathistory && self.caps.is_enabled("batch") && self.caps.is_enabled(history::CAP)
+    }
+
+    /// Ask for a page, unless one is out for `target` already. Labeled,
+    /// when the server labels its answers, so each page finds its request.
+    fn request(&mut self, target: &str, kind: Kind, out: &mut Vec<Output>) {
+        let key = target.to_ascii_lowercase();
+        if self.inflight.contains_key(&key) {
+            return;
+        }
+        let request = Request { target: target.to_owned(), kind, limit: self.page() };
+        let mut msg = request.message();
+        if self.caps.is_enabled("labeled-response") {
+            self.label_seq += 1;
+            let label = format!("hl{}", self.label_seq);
+            msg.tags.push(("label".into(), Some(label.clone())));
+            self.labels.insert(label, key.clone());
+        }
+        self.inflight.insert(key, Inflight { request, retried: false });
+        out.push(Output::Send(msg));
+    }
+
+    /// What `target` missed: everything after the newest line held, else
+    /// the latest page.
+    fn backfill(&mut self, target: &str, out: &mut Vec<Output>) {
+        if !self.history_on() {
+            return;
+        }
+        let kind = self.book.newest(target).map_or(Kind::Latest, |a| Kind::After(a.clone()));
+        self.request(target, kind, out);
+    }
+
+    /// The page before the oldest line held. Without history the window
+    /// is told at once that nothing older will come.
+    fn older(&mut self, target: &str, out: &mut Vec<Output>) {
+        if !self.history_on() {
+            out.push(self.history_event(target, Vec::new(), true));
+            return;
+        }
+        let kind = self.book.oldest(target).map_or(Kind::Latest, |a| Kind::Before(a.clone()));
+        self.request(target, kind, out);
+    }
+
+    /// A window for `target` is open: keep it in the book, and bring a
+    /// query up to date now if registered (later, `sync` does).
+    fn open(&mut self, target: &str, out: &mut Vec<Output>) {
+        let query = !self.isupport.is_channel(target);
+        self.book.open(target, query);
+        if query && self.synced {
+            self.sync_query(target, out);
+        }
+    }
+
+    /// A query's history since we last had it.
+    fn sync_query(&mut self, nick: &str, out: &mut Vec<Output>) {
+        self.backfill(nick, out);
+    }
+
+    /// Registered, with ISUPPORT known: bring every open query up to
+    /// date. Channels do so as they are joined.
+    fn sync(&mut self, _now: DateTime<Utc>, out: &mut Vec<Output>) {
+        for nick in self.book.queries() {
+            self.sync_query(&nick, out);
+        }
+    }
+
+    /// One message of history page `h`: shown as its live copy would be,
+    /// but only its line goes in the page, flagged `replayed`. Nothing
+    /// else the live one does (peers, members, the topic) happens.
+    fn replay(&mut self, h: &str, msg: &Message, now: DateTime<Utc>) {
+        let mut shown = Vec::new();
+        if matches!(msg.command.as_str(), "PRIVMSG" | "NOTICE") {
+            self.on_message(msg, now, &mut shown);
+        }
+        let anchor = Anchor::from_tags(msg);
+        let Some(page) = self.pages.get_mut(h) else { return };
+        page.items += 1;
+        if let Some(a) = anchor {
+            page.first.get_or_insert_with(|| a.clone());
+            page.last = Some(a);
+        }
+        page.lines.extend(shown.into_iter().filter_map(|o| match o {
+            Output::Event(Event::Line { line, .. }) => Some(Line { replayed: true, ..line }),
+            _ => None,
+        }));
+    }
+
+    /// A page is in. It answers the request with its label (else the one
+    /// for its target); one nobody asked for (a bouncer's replay) is shown
+    /// all the same. Empty, before the oldest, it is the start of history;
+    /// full, after the newest, there is more to fetch.
+    fn finish_page(&mut self, page: Page, out: &mut Vec<Output>) {
+        let key = page.label.as_ref().and_then(|l| self.labels.remove(l)).unwrap_or_else(|| page.target.to_ascii_lowercase());
+        let Some(Inflight { request, .. }) = self.inflight.remove(&key) else {
+            if !page.lines.is_empty() {
+                out.push(self.history_event(&page.target, page.lines, false));
+            }
+            return;
+        };
+        self.labels.retain(|_, k| *k != key);
+        // Only the end the request moves: a page before can tie in time
+        // with the newest held, and must not pull it back.
+        let (first, last) = match request.kind {
+            Kind::Before(_) => (page.first.as_ref(), None),
+            Kind::After(_) => (None, page.last.as_ref()),
+            Kind::Latest | Kind::Targets { .. } => (page.first.as_ref(), page.last.as_ref()),
+        };
+        if first.is_some() || last.is_some() {
+            let query = !self.isupport.is_channel(&request.target);
+            self.book.reach(&request.target, query, first, last);
+        }
+        let start = page.items == 0 && matches!(request.kind, Kind::Latest | Kind::Before(_));
+        let full = page.items >= request.limit;
+        out.push(self.history_event(&request.target, page.lines, start));
+        if full
+            && matches!(request.kind, Kind::After(_))
+            && let Some(last) = page.last
+        {
+            self.request(&request.target, Kind::After(last), out);
+        }
+    }
+
+    /// A labeled request answered with a bare ACK: nothing there.
+    fn on_ack(&mut self, msg: &Message, out: &mut Vec<Output>) {
+        let Some(key) = msg.tag("label").and_then(|l| self.labels.remove(l)) else { return };
+        let Some(Inflight { request, .. }) = self.inflight.remove(&key) else { return };
+        if key != history::TARGETS {
+            let start = matches!(request.kind, Kind::Latest | Kind::Before(_));
+            out.push(self.history_event(&request.target, Vec::new(), start));
+        }
+    }
+
+    /// `FAIL CHATHISTORY <code> <subcommand> <target> :why`. A msgid the
+    /// server can't find is asked for again by its time, once; after that
+    /// the window stops waiting, and the server buffer says why.
+    fn on_fail(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let by_label = msg.tag("label").and_then(|l| self.labels.remove(l));
+        let key = by_label.or_else(|| msg.params.get(3).map(|t| t.to_ascii_lowercase()).filter(|k| self.inflight.contains_key(k)));
+        let Some(key) = key else { return };
+        let Some(Inflight { request, retried }) = self.inflight.remove(&key) else { return };
+        self.labels.retain(|_, k| *k != key);
+        let again = match &request.kind {
+            Kind::Before(a) if a.msgid.is_some() && !retried => Some(Kind::Before(a.by_time())),
+            Kind::After(a) if a.msgid.is_some() && !retried => Some(Kind::After(a.by_time())),
+            _ => None,
+        };
+        if let Some(kind) = again {
+            self.request(&request.target, kind, out);
+            if let Some(i) = self.inflight.get_mut(&key) {
+                i.retried = true;
+            }
+            return;
+        }
+        let text = format!("Can't get history for {}: {}", request.target, last(msg));
+        let line = self.line(msg, now, LineKind::Error, None, text, false);
+        out.push(self.event_line(Target::Server, line));
+        if key != history::TARGETS {
+            out.push(self.history_event(&request.target, Vec::new(), false));
+        }
     }
 
     fn request_caps(&mut self, out: &mut Vec<Output>) {
@@ -458,6 +740,30 @@ impl Session {
         nick.eq_ignore_ascii_case(&self.nick)
     }
 
+    /// A channel or a nick, as a buffer target.
+    fn dest(&self, name: &str) -> Target {
+        if self.isupport.is_channel(name) { Target::Channel(name.to_owned()) } else { Target::Query(name.to_owned()) }
+    }
+
+    fn history_event(&self, target: &str, lines: Vec<Line>, start: bool) -> Output {
+        Output::Event(Event::History { network: self.network.clone(), target: self.dest(target), lines, start })
+    }
+
+    /// Every line shown widens the book, so the next request starts past
+    /// what is held.
+    fn note(&mut self, out: &[Output]) {
+        for o in out {
+            let (target, lines) = match o {
+                Output::Event(Event::Line { target, line, .. }) => (target, std::slice::from_ref(line)),
+                Output::Event(Event::History { target, lines, .. }) => (target, lines.as_slice()),
+                _ => continue,
+            };
+            if let Some(name) = target.name() {
+                self.book.note(name, matches!(target, Target::Query(_)), lines);
+            }
+        }
+    }
+
     fn on_message(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
         let Some(to) = msg.params.first() else { return };
         let mut text = msg.params.get(1).map_or("", String::as_str);
@@ -528,8 +834,13 @@ impl Session {
             out.push(self.seen(msg, &nick));
         }
         self.members_of(&chan).insert(nick.to_ascii_lowercase());
-        let line = self.line(msg, now, LineKind::Join, Some(&nick), format!("{nick} joined"), self.is_me(&nick));
-        out.push(self.event_line(Target::Channel(chan), line));
+        let me = self.is_me(&nick);
+        let line = self.line(msg, now, LineKind::Join, Some(&nick), format!("{nick} joined"), me);
+        out.push(self.event_line(Target::Channel(chan.clone()), line));
+        if me {
+            self.book.open(&chan, false);
+            self.backfill(&chan, out);
+        }
     }
 
     fn left(&mut self, chan: &str, nick: &str, out: &mut Vec<Output>) {
@@ -652,6 +963,16 @@ impl Session {
             Command::Disconnect { reason, .. } => {
                 vec![send("QUIT", reason.into_iter().collect::<Vec<_>>()), Output::Quit]
             }
+            Command::Older { target, .. } => {
+                let mut out = Vec::new();
+                self.older(&target, &mut out);
+                out
+            }
+            Command::Open { target, .. } => {
+                let mut out = Vec::new();
+                self.open(&target, &mut out);
+                out
+            }
             Command::Reconnect { .. } => Vec::new(),
         }
     }
@@ -721,6 +1042,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::Book;
 
     pub(super) fn now() -> DateTime<Utc> {
         "2026-10-22T12:00:00Z".parse().unwrap()
@@ -736,6 +1058,8 @@ mod tests {
             sasl: None,
             channels: vec!["#test".into()],
             bridges: vec![],
+            chathistory: true,
+            history_page: None,
         }
     }
 
@@ -1156,6 +1480,266 @@ mod tests {
         // A new connection forgets them all.
         s.start();
         assert_eq!(s.batches.get("lr"), None);
+    }
+
+    /// Registered with history on: batch, labeled-response and chathistory
+    /// (plus `extra` caps), a page of 20, the server's `CHATHISTORY=limit`,
+    /// and `book` carried in. What registration sends is dropped.
+    fn historied(extra: &str, limit: usize, book: Book) -> Session {
+        let mut s = Session::new("net", SessionConfig { history_page: Some(20), ..cfg() }).with_book(book);
+        s.start();
+        let ls = format!("message-tags server-time echo-message batch labeled-response draft/chathistory {extra}");
+        let ack: Vec<&str> = ls.split_whitespace().map(|c| c.split_once('=').map_or(c, |(k, _)| k)).collect();
+        feed(&mut s, &format!(":srv CAP * LS :{}", ls.trim()));
+        feed(&mut s, &format!(":srv CAP alice ACK :{}", ack.join(" ")));
+        feed(&mut s, ":srv 001 alice :hi");
+        feed(&mut s, &format!(":srv 005 alice CHANTYPES=# CHATHISTORY={limit} :are supported"));
+        feed(&mut s, ":srv 376 alice :End of MOTD");
+        s
+    }
+
+    /// The one CHATHISTORY line in `out`, without its label, and the label.
+    fn asked(out: &[Output]) -> (String, String) {
+        let ms: Vec<&Message> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::Send(m) if m.command == "CHATHISTORY" => Some(m),
+                _ => None,
+            })
+            .collect();
+        let [m] = ms.as_slice() else { panic!("want one CHATHISTORY in {out:?}") };
+        let label = m.tag("label").unwrap_or_default().to_owned();
+        let bare = Message { tags: m.tags.iter().filter(|(k, _)| k != "label").cloned().collect(), ..(*m).clone() };
+        (bare.to_wire(), label)
+    }
+
+    fn histories(out: &[Output]) -> Vec<(Target, Vec<Line>, bool)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Event(Event::History { target, lines, start, .. }) => Some((target.clone(), lines.clone(), *start)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn texts(lines: &[Line]) -> Vec<&str> {
+        lines.iter().map(|l| l.text.as_str()).collect()
+    }
+
+    fn older(s: &mut Session, target: &str) -> Vec<Output> {
+        s.command(Command::Older { network: "net".into(), target: target.into() }, now())
+    }
+
+    #[test]
+    fn our_join_asks_for_the_latest_page_with_a_label() {
+        let mut s = historied("", 50, Book::default());
+        let out = feed(&mut s, ":alice!a@h JOIN #test");
+        let (wire, label) = asked(&out);
+        assert_eq!(wire, "CHATHISTORY LATEST #test * 20");
+        assert!(label.starts_with("hl"), "{label:?}");
+        // The page is the server's limit when that is smaller.
+        let mut s = historied("", 5, Book::default());
+        assert_eq!(asked(&feed(&mut s, ":alice!a@h JOIN #test")).0, "CHATHISTORY LATEST #test * 5");
+    }
+
+    #[test]
+    fn a_history_batch_is_one_page_of_replayed_lines() {
+        let mut s = historied("", 50, Book::default());
+        let (_, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        feed(&mut s, &format!("@label={label} :srv BATCH +h chathistory #test"));
+        for (i, text) in ["one", "two"].iter().enumerate() {
+            let out = feed(&mut s, &format!("@batch=h;time=2026-10-22T10:00:0{i}.000Z;msgid=m{i} :bob!b@h PRIVMSG #test :{text}"));
+            assert!(out.is_empty(), "history is not news: {out:?}");
+        }
+        let got = histories(&feed(&mut s, ":srv BATCH -h"));
+        let [(target, lines, start)] = got.as_slice() else { panic!("{got:?}") };
+        assert_eq!((target, *start), (&Target::Channel("#test".into()), false));
+        assert_eq!(texts(lines), ["one", "two"]);
+        assert!(lines.iter().all(|l| l.replayed));
+        // Scrolling up asks for what is before the oldest.
+        assert_eq!(asked(&older(&mut s, "#test")).0, "CHATHISTORY BEFORE #test msgid=m0 20");
+    }
+
+    #[test]
+    fn pages_in_one_millisecond_still_walk_back() {
+        let mut s = historied("", 2, Book::default());
+        let (_, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        let page = |s: &mut Session, label: &str, r: &str, ids: [&str; 2]| {
+            feed(s, &format!("@label={label} :srv BATCH +{r} chathistory #test"));
+            for id in ids {
+                feed(s, &format!("@batch={r};time=2026-10-22T10:00:00.000Z;msgid={id} :bob!b@h PRIVMSG #test :{id}"));
+            }
+            feed(s, &format!(":srv BATCH -{r}"));
+        };
+        page(&mut s, &label, "a", ["n2", "n3"]);
+        let (wire, label) = asked(&older(&mut s, "#test"));
+        assert_eq!(wire, "CHATHISTORY BEFORE #test msgid=n2 2");
+        page(&mut s, &label, "b", ["n0", "n1"]);
+        // Same time as everything held: still the page before n0, not n2 again.
+        assert_eq!(asked(&older(&mut s, "#test")).0, "CHATHISTORY BEFORE #test msgid=n0 2");
+        assert_eq!(s.book().newest("#test").and_then(|a| a.msgid.as_deref()), Some("n3"));
+    }
+
+    #[test]
+    fn one_request_at_a_time_per_target() {
+        let mut s = historied("", 50, Book::default());
+        feed(&mut s, ":alice!a@h JOIN #test");
+        assert!(sent(&older(&mut s, "#TEST")).is_empty());
+    }
+
+    #[test]
+    fn a_reconnect_fills_the_gap_page_by_page() {
+        let mut s = historied("", 2, Book::default());
+        feed(&mut s, "@time=2026-10-22T10:00:00.000Z;msgid=m0 :bob!b@h PRIVMSG #test :before the drop");
+        let book = s.take_book();
+        // The next connection carries the book, and asks only for what is newer.
+        let mut s = historied("", 2, book);
+        let (wire, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        assert_eq!(wire, "CHATHISTORY AFTER #test msgid=m0 2");
+        feed(&mut s, &format!("@label={label} :srv BATCH +h chathistory #test"));
+        feed(&mut s, "@batch=h;time=2026-10-22T10:01:00.000Z;msgid=m1 :bob!b@h PRIVMSG #test :gap one");
+        feed(&mut s, "@batch=h;time=2026-10-22T10:02:00.000Z;msgid=m2 :bob!b@h PRIVMSG #test :gap two");
+        // A live line lands while the gap is filling: the next page still
+        // starts where this one ended, not after the live line.
+        feed(&mut s, "@time=2026-10-22T11:00:00.000Z;msgid=m9 :bob!b@h PRIVMSG #test :live");
+        let out = feed(&mut s, ":srv BATCH -h");
+        assert_eq!(texts(&histories(&out)[0].1), ["gap one", "gap two"]);
+        // A full page: there may be more.
+        let (wire, label) = asked(&out);
+        assert_eq!(wire, "CHATHISTORY AFTER #test msgid=m2 2");
+        feed(&mut s, &format!("@label={label} :srv BATCH +h2 chathistory #test"));
+        feed(&mut s, "@batch=h2;time=2026-10-22T10:03:00.000Z;msgid=m3 :bob!b@h PRIVMSG #test :gap three");
+        let out = feed(&mut s, ":srv BATCH -h2");
+        assert_eq!(texts(&histories(&out)[0].1), ["gap three"]);
+        // A short page: the gap is closed.
+        assert!(sent(&out).is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn an_empty_page_before_the_oldest_is_the_start() {
+        let mut s = historied("", 50, Book::default());
+        let (_, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        // A labeled ACK is an empty answer.
+        let got = histories(&feed(&mut s, &format!("@label={label} :srv ACK")));
+        assert_eq!(got, [(Target::Channel("#test".into()), vec![], true)]);
+        // So is an empty batch.
+        let (_, label) = asked(&older(&mut s, "#test"));
+        feed(&mut s, &format!("@label={label} :srv BATCH +e chathistory #test"));
+        assert_eq!(histories(&feed(&mut s, ":srv BATCH -e")), [(Target::Channel("#test".into()), vec![], true)]);
+    }
+
+    #[test]
+    fn a_msgid_the_server_cannot_find_is_asked_again_by_time_once() {
+        let mut book = Book::default();
+        book.note("#test", false, &[Line { msgid: Some("gone".into()), time: "2026-10-22T10:00:00Z".parse().unwrap(), ..local_line() }]);
+        let mut s = historied("", 50, book);
+        let (wire, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        assert_eq!(wire, "CHATHISTORY AFTER #test msgid=gone 20");
+        let out = feed(&mut s, &format!("@label={label} :srv FAIL CHATHISTORY MESSAGE_ERROR AFTER #test :Unknown msgid"));
+        let (wire, label) = asked(&out);
+        assert_eq!(wire, "CHATHISTORY AFTER #test timestamp=2026-10-22T10:00:00.000Z 20");
+        let out = feed(&mut s, &format!("@label={label} :srv FAIL CHATHISTORY MESSAGE_ERROR AFTER #test :Still no"));
+        // Given up: an empty page (not the start), a note, nothing sent.
+        assert_eq!(histories(&out), [(Target::Channel("#test".into()), vec![], false)]);
+        assert!(lines(&out).iter().any(|(t, l)| *t == Target::Server && l.text.contains("Still no")), "{out:?}");
+        assert!(sent(&out).is_empty());
+    }
+
+    #[test]
+    fn history_off_asks_for_nothing_and_says_so_at_once() {
+        let mut s = Session::new("net", SessionConfig { chathistory: false, ..cfg() });
+        s.start();
+        feed(&mut s, ":srv CAP * LS :batch labeled-response draft/chathistory");
+        feed(&mut s, ":srv CAP alice ACK :batch labeled-response draft/chathistory");
+        feed(&mut s, ":srv 001 alice :hi");
+        assert!(sent(&feed(&mut s, ":alice!a@h JOIN #test")).is_empty());
+        // Nothing more will come, so the window says it is the start.
+        assert_eq!(histories(&older(&mut s, "#test")), [(Target::Channel("#test".into()), vec![], true)]);
+    }
+
+    #[test]
+    fn a_multiline_message_in_history_is_one_line() {
+        let mut s = historied("draft/multiline=max-bytes=4096", 1, Book::default());
+        let (_, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        feed(&mut s, &format!("@label={label} :srv BATCH +h chathistory #test"));
+        feed(&mut s, "@batch=h;time=2026-10-22T10:00:00.000Z;msgid=ml1 :bob!b@h BATCH +ml draft/multiline #test");
+        feed(&mut s, "@batch=ml :bob!b@h PRIVMSG #test :first");
+        feed(&mut s, "@batch=ml :bob!b@h PRIVMSG #test :second");
+        assert!(feed(&mut s, ":srv BATCH -ml").is_empty());
+        let got = histories(&feed(&mut s, ":srv BATCH -h"));
+        let lines = &got[0].1;
+        assert_eq!(texts(lines), ["first\nsecond"]);
+        assert_eq!((lines[0].msgid.as_deref(), lines[0].replayed), (Some("ml1"), true));
+    }
+
+    #[test]
+    fn a_multiline_message_past_the_batch_limit_is_still_history() {
+        let mut s = historied("draft/multiline=max-bytes=4096", 50, Book::default());
+        let (_, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        feed(&mut s, &format!("@label={label} :srv BATCH +h chathistory #test"));
+        for i in 1..crate::batch::MAX_OPEN {
+            feed(&mut s, &format!(":srv BATCH +n{i} netsplit a b"));
+        }
+        // The tracker is full, so this one isn't tracked, but it is still
+        // collected, and still part of the page around it.
+        feed(&mut s, "@batch=h;time=2026-10-22T10:00:00.000Z;msgid=ml1 :bob!b@h BATCH +ml draft/multiline #test");
+        assert_eq!(s.batches.get("ml"), None);
+        assert!(feed(&mut s, "@batch=ml :bob!b@h PRIVMSG #test :first").is_empty());
+        assert!(feed(&mut s, "@batch=ml :bob!b@h PRIVMSG #test :second").is_empty());
+        assert!(feed(&mut s, ":srv BATCH -ml").is_empty());
+        let got = histories(&feed(&mut s, ":srv BATCH -h"));
+        assert_eq!(texts(&got[0].1), ["first\nsecond"]);
+        // A history batch past the limit isn't a page: its lines are shown live.
+        feed(&mut s, ":srv BATCH +h2 netsplit a b");
+        feed(&mut s, ":srv BATCH +h3 chathistory #test");
+        let out = feed(&mut s, "@batch=h3;msgid=x :bob!b@h PRIVMSG #test :untracked");
+        assert_eq!(lines(&out).len(), 1);
+        assert!(histories(&feed(&mut s, ":srv BATCH -h3")).is_empty());
+    }
+
+    #[test]
+    fn a_history_batch_nobody_asked_for_is_still_history() {
+        let mut s = historied("", 50, Book::default());
+        feed(&mut s, ":srv BATCH +z chathistory #other");
+        feed(&mut s, "@batch=z;time=2026-10-22T10:00:00.000Z;msgid=z1 :bob!b@h PRIVMSG #other :replayed on join");
+        let got = histories(&feed(&mut s, ":srv BATCH -z"));
+        assert_eq!(got.len(), 1);
+        assert_eq!(texts(&got[0].1), ["replayed on join"]);
+    }
+
+    #[test]
+    fn open_queries_are_backfilled_once_registered() {
+        let mut book = Book::default();
+        book.open("bob", true);
+        let mut s = Session::new("net", cfg()).with_book(book);
+        s.start();
+        feed(&mut s, ":srv CAP * LS :batch draft/chathistory");
+        feed(&mut s, ":srv CAP alice ACK :batch draft/chathistory");
+        feed(&mut s, ":srv 001 alice :hi");
+        feed(&mut s, ":srv 005 alice CHANTYPES=# CHATHISTORY=50 :are supported");
+        let out = feed(&mut s, ":srv 376 alice :End of MOTD");
+        let latest: Vec<String> = sent(&out).into_iter().filter(|l| l.contains("LATEST")).collect();
+        assert_eq!(latest, ["CHATHISTORY LATEST bob * 50"]);
+        // A query opened later is asked for at once.
+        let out = s.command(Command::Open { network: "net".into(), target: "carol".into() }, now());
+        assert_eq!(sent(&out), ["CHATHISTORY LATEST carol * 50"]);
+        assert!(s.book().get("carol").is_some_and(|k| k.query));
+    }
+
+    /// A line to build on in tests.
+    fn local_line() -> Line {
+        Line {
+            seq: 0,
+            time: now(),
+            msgid: None,
+            kind: LineKind::Privmsg,
+            nick: Some("bob".into()),
+            text: String::new(),
+            own: false,
+            delivery: Delivery::Sent,
+            boundary: false,
+            replayed: false,
+        }
     }
 
     #[test]
