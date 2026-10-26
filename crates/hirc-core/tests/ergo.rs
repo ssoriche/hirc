@@ -9,7 +9,7 @@ mod common;
 use common::{Ergo, Raw, register_account};
 use hirc_core::config::{Config, Sasl, Server};
 use hirc_core::event::{Command, ConnStatus, Event, Target};
-use hirc_core::store::{Line, LineKind};
+use hirc_core::store::{Delivery, Line, LineKind};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -63,8 +63,12 @@ async fn sasl_join_send_and_receive() {
 
     tx.send(Command::Say { network: "test".into(), target: "#test".into(), text: "hello from hirc".into() }).unwrap();
     bob.expect("PRIVMSG #test :hello from hirc").await;
-    // echo-message: exactly one copy of our own line, with a msgid.
+    // echo-message: our line shows at once as pending, then the server's
+    // echo, with a msgid, is the one copy that stays.
+    let pending = next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.own && l.text == "hello from hirc")).await;
+    assert_eq!((pending.delivery, pending.msgid.as_deref()), (Delivery::Pending, None));
     let own = next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.own && l.text == "hello from hirc")).await;
+    assert_eq!(own.delivery, Delivery::Sent);
     assert!(own.msgid.is_some());
 
     bob.send("PRIVMSG #test :hi alice").await;
