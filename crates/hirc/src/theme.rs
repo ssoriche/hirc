@@ -70,6 +70,10 @@ pub struct Palette {
     /// where the code colour is too near body text to tell apart (see
     /// `apart_from`).
     pub code: Hsla,
+    /// A link in message text (`buffer.url`), drawn underlined, so it
+    /// reads as a link on any theme, even one whose link colour is near
+    /// body text.
+    pub url: Hsla,
     pub action: Hsla,
     pub server: Hsla,
     pub topic: Hsla,
@@ -542,6 +546,7 @@ pub fn palette(t: &Theme) -> Palette {
         quiet: c(legible(bg, &quiet)),
         hint: c(legible(input, &quiet)),
         code: read(code, &[input]),
+        url: read(t.buffer.url, &[bg, highlight]),
         action: read(t.buffer.action, &[bg, highlight]),
         server: read(t.buffer.server_messages.default, &[bg, highlight]),
         topic: c(lift(t.buffer.topic, &[title, bg], QUIET_CONTRAST)),

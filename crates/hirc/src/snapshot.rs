@@ -37,10 +37,14 @@
 //! | `wait:<ms>` | Advance the simulated clock (offscreen) or sleep (window). |
 //! | `shot:<png>` | Save an image now. |
 //! | `click:<Label>` | Click the centre of the first sidebar row whose label contains `<Label>`, ignoring case. No match prints `snapshot: no click target <Label>` and the script goes on. |
+//! | `link:<text>` | Click the first character of the first link on screen whose URL contains `<text>`, ignoring case. No match prints `snapshot: no link <text>`. |
 //! | `at:x,y` | Primary mouse down and up at logical (x, y). |
 //! | `hover:x,y` | Mouse move to (x, y). |
 //! | `scroll:<px>` | Scroll wheel over the buffer view; negative scrolls down. |
 //! | `delay:<ms>` | From now on the fake server holds its echo of our messages this long (simulated time offscreen), so a shot can show a line waiting for its echo. `delay:0` answers at once again. |
+//!
+//! A click on a link never opens it here: it prints `snapshot: open <url>`
+//! on stdout, so a script can check what would open.
 //!
 //! An unknown step prints `snapshot: unknown step <s>` and the script goes on.
 //!
@@ -116,6 +120,7 @@ pub enum Step {
     Wait(u64),
     Shot(String),
     Click(String),
+    Link(String),
     At(f32, f32),
     Hover(f32, f32),
     Scroll(f32),
@@ -150,6 +155,7 @@ pub fn parse_script(script: &str) -> Vec<Step> {
                 Some(("delay", ms)) => ms.trim().parse().map_or_else(|_| unknown(), Step::Delay),
                 Some(("shot", p)) => Step::Shot(p.trim().to_owned()),
                 Some(("click", l)) if !l.trim().is_empty() => Step::Click(l.trim().to_owned()),
+                Some(("link", l)) if !l.trim().is_empty() => Step::Link(l.trim().to_owned()),
                 Some(("at", p)) => parse_point(p).map_or_else(unknown, |(x, y)| Step::At(x, y)),
                 Some(("hover", p)) => parse_point(p).map_or_else(unknown, |(x, y)| Step::Hover(x, y)),
                 Some(("scroll", d)) => d.trim().parse().ok().filter(|d: &f32| d.is_finite()).map_or_else(unknown, Step::Scroll),
@@ -525,6 +531,13 @@ fn inject<C: AppContext>(step: &Step, cx: &mut C, handle: WindowHandle<HircApp>)
                 Ok(())
             }
         },
+        Step::Link(text) => match handle.update(cx, |app, _, _| app.link_point(text)).map_err(gone)? {
+            Some((x, y)) => click(cx, at(x, y)),
+            None => {
+                eprintln!("snapshot: no link {text}");
+                Ok(())
+            }
+        },
         Step::At(x, y) => click(cx, at(*x, *y)),
         Step::Hover(x, y) => send(cx, PlatformInput::MouseMove(MouseMoveEvent { position: at(*x, *y), pressed_button: None, modifiers })),
         Step::Scroll(d) => {
@@ -730,6 +743,7 @@ mod tests {
         assert_eq!(parse_script("key:ctrl+shift+a"), [Step::Key("ctrl-shift-a".into())]);
         assert_eq!(parse_script("delay:1500;delay:x"), [Step::Delay(1500), Step::Unknown("delay:x".into())]);
         assert_eq!(parse_script("click:  my chan "), [Step::Click("my chan".into())]);
+        assert_eq!(parse_script("link: Example.org ;link:"), [Step::Link("Example.org".into()), Step::Unknown("link:".into())]);
     }
 
     #[test]

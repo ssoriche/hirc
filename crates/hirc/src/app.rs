@@ -55,7 +55,14 @@ pub struct Init {
     pub no_layout_file: bool,
     /// A fixed clock for the lines hirc writes (snapshot fixtures).
     pub clock: Option<chrono::DateTime<chrono::Utc>>,
+    /// Snapshot runs never open a link: they print what a click would
+    /// open (`snapshot: open <url>`).
+    pub dry_open: bool,
 }
+
+/// A text drawn with links: its layout, the links' ranges and URLs.
+#[cfg(feature = "snapshot")]
+pub type LinkSpot = (gpui::TextLayout, Vec<std::ops::Range<usize>>, Vec<String>);
 
 pub struct HircApp {
     pub store: Store,
@@ -109,6 +116,16 @@ pub struct HircApp {
     /// window and the first unread line's seq (a "new" rule is drawn
     /// above it until the window is left).
     marker: Option<(usize, usize, u64)>,
+    /// Where the primary button last went down in the message view
+    /// (logical px): a link opens only on a click, not at the end of a
+    /// drag.
+    pub press: Rc<Cell<Option<(f32, f32)>>>,
+    /// Print what a link click would open instead of opening it.
+    pub dry_open: bool,
+    /// The links drawn this frame (their text's layout, ranges and
+    /// URLs), for the `link:` snapshot step.
+    #[cfg(feature = "snapshot")]
+    pub link_spots: std::cell::RefCell<Vec<LinkSpot>>,
     commands: UnboundedSender<Command>,
 }
 
@@ -219,6 +236,10 @@ impl HircApp {
             fresh_below: false,
             pending_join: None,
             marker: None,
+            press: Rc::default(),
+            dry_open: init.dry_open,
+            #[cfg(feature = "snapshot")]
+            link_spots: Default::default(),
             commands: init.commands,
         }
     }
@@ -335,6 +356,18 @@ impl HircApp {
         let view = self.sidebar_scroll.bounds();
         let visible = view.size.height <= px(0.) || (px(y - self.metrics.row / 2.) >= view.top() && px(y + self.metrics.row / 2.) <= view.bottom());
         Some(if visible { Ok((x, y)) } else { Err(format!("row {} is scrolled out of view", row + 1)) })
+    }
+
+    /// Logical centre of the first character of the first link drawn
+    /// whose URL contains `text` (case-insensitive).
+    #[cfg(feature = "snapshot")]
+    pub fn link_point(&self, text: &str) -> Option<(f32, f32)> {
+        let want = text.to_lowercase();
+        self.link_spots.borrow().iter().find_map(|(layout, ranges, urls)| {
+            let ix = urls.iter().position(|url| url.to_lowercase().contains(&want))?;
+            let at = layout.position_for_index(ranges[ix].start)?;
+            Some((f32::from(at.x) + self.metrics.cell / 2., f32::from(at.y) + self.metrics.line / 2.))
+        })
     }
 
     /// The window list's width at the last render.
@@ -666,6 +699,8 @@ impl Render for HircApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette.clone();
         let m = self.metrics;
+        #[cfg(feature = "snapshot")]
+        self.link_spots.borrow_mut().clear();
         let width = f32::from(window.viewport_size().width);
         self.sidebar_width = m.sidebar_width(width);
         self.sidebar_height = f32::from(window.viewport_size().height);
@@ -728,6 +763,12 @@ impl Render for HircApp {
                     .child(buffer::title(self, window, width - self.sidebar_width))
                     .child(
                         div()
+                            // A link opens on a click; this is where the
+                            // press began (see `buffer::line`).
+                            .on_mouse_down(gpui::MouseButton::Left, {
+                                let press = self.press.clone();
+                                move |e, _, _| press.set(Some((f32::from(e.position.x), f32::from(e.position.y))))
+                            })
                             .relative()
                             .flex_1()
                             .min_h(px(0.))

@@ -13,12 +13,20 @@
 //! for a message, `-nick-` for a notice, `*` for an action, and a marker
 //! for events (`-->` joins, `<--` parts and quits, `<-x` kicks, `--` the rest, `=!=`
 //! errors).
+//!
+//! Links in what people wrote (see `links`) are underlined in the link
+//! colour, on every row they wrap onto, with a pointer over them; a
+//! click (a press that does not drag) opens one, and never takes focus
+//! from the input or changes its mode.
 
 use crate::app::HircApp;
+use crate::links;
 use crate::metrics::{Columns, Metrics};
 use crate::theme::Palette;
 use crate::wrap;
-use gpui::{AnyElement, FontWeight, HighlightStyle, Hsla, IntoElement, SharedString, StyledText, TextRun, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, FontWeight, HighlightStyle, Hsla, InteractiveText, IntoElement, SharedString, StyledText, TextRun, UnderlineStyle, Window, div, prelude::*, px,
+};
 use hirc_core::display::{self, Part};
 use hirc_core::event::{ConnStatus, Target};
 use hirc_core::store::{Delivery, Line, LineKind, Peer, Presence};
@@ -274,11 +282,12 @@ pub struct Context<'a> {
     pub slots: &'a HashMap<String, usize>,
 }
 
-/// Text with coloured (and possibly bold) runs.
+/// Text with coloured (and possibly bold) runs, and the links in it.
 #[derive(Default)]
 struct Runs {
     text: String,
     runs: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    links: Vec<(std::ops::Range<usize>, String)>,
 }
 
 impl Runs {
@@ -290,8 +299,58 @@ impl Runs {
         self
     }
 
+    /// What someone wrote, in `color`, its links (see `links`) in `link`
+    /// and underlined.
+    fn push_text(&mut self, s: &str, color: Hsla, link: Hsla) -> &mut Runs {
+        let mut at = 0;
+        for l in links::find(s) {
+            if l.range.start > at {
+                self.push(&s[at..l.range.start], color, false);
+            }
+            let start = self.text.len();
+            self.text.push_str(&s[l.range.clone()]);
+            let underline = UnderlineStyle { thickness: px(1.), color: Some(link), wavy: false };
+            self.runs.push((start..self.text.len(), HighlightStyle { color: Some(link), underline: Some(underline), ..Default::default() }));
+            self.links.push((start..self.text.len(), l.url));
+            at = l.range.end;
+        }
+        if at < s.len() || s.is_empty() {
+            self.push(&s[at..], color, false);
+        }
+        self
+    }
+
     fn element(self) -> StyledText {
         StyledText::new(self.text).with_highlights(self.runs)
+    }
+
+    /// The text, its links clickable: a press and release in one link,
+    /// with no drag between (`links::is_click`, against where the message
+    /// view last saw the button go down), opens it. `id` keeps the
+    /// element's press state from frame to frame.
+    fn linked(self, app: &HircApp, id: SharedString) -> AnyElement {
+        if self.links.is_empty() {
+            return self.element().into_any_element();
+        }
+        let (ranges, urls): (Vec<_>, Vec<_>) = self.links.into_iter().unzip();
+        let text = StyledText::new(self.text).with_highlights(self.runs);
+        #[cfg(feature = "snapshot")]
+        app.link_spots.borrow_mut().push((text.layout().clone(), ranges.clone(), urls.clone()));
+        let (press, dry) = (app.press.clone(), app.dry_open);
+        let slop = app.metrics.cell / 2.;
+        InteractiveText::new(id, text)
+            .on_click(ranges, move |ix, window, cx| {
+                let up = window.mouse_position();
+                let still = press.get().is_some_and(|down| links::is_click(down, (f32::from(up.x), f32::from(up.y)), slop));
+                if let Some(url) = urls.get(ix).filter(|url| still && links::openable(url)) {
+                    if dry {
+                        println!("snapshot: open {url}");
+                    } else {
+                        cx.open_url(url);
+                    }
+                }
+            })
+            .into_any_element()
     }
 
     /// The text broken onto lines `width` wide (see `wrap`), in the
@@ -321,7 +380,9 @@ impl Runs {
         }
         let (text, shift) = wrap::apply(&self.text, &breaks);
         let runs = self.runs.into_iter().map(|(r, style)| (shift(r.start)..shift(r.end), style)).collect();
-        Runs { text, runs }
+        // A link keeps its whole range, across the rows it wraps onto.
+        let links = self.links.into_iter().map(|(r, url)| (shift(r.start)..shift(r.end), url)).collect();
+        Runs { text, runs, links }
     }
 }
 
@@ -368,10 +429,12 @@ pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyEle
     // and the text reads as said. Without a time cell, the text is in the
     // quiet role until it is confirmed.
     let pending = line.delivery != Delivery::Sent && cols.time == 0;
+    // A link in a line still on its way reads as quiet as its text.
+    let link = if pending { p.quiet } else { p.url };
     match line.kind {
         LineKind::Privmsg => {
             nick_run(&mut prefix, p, &fit_nick(0), nick, cx, mention);
-            body.push(&line.text, if pending { p.quiet } else { p.text }, false);
+            body.push_text(&line.text, if pending { p.quiet } else { p.text }, link);
         }
         // A notice: irssi's `-nick-`, the dashes in the event colour so
         // they read as a marker, and the text a step below conversation.
@@ -379,30 +442,30 @@ pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyEle
             prefix.push("-", p.server, false);
             nick_run(&mut prefix, p, &fit_nick(2), nick, cx, mention);
             prefix.push("-", p.server, false);
-            body.push(&line.text, p.text_dim, false);
+            body.push_text(&line.text, p.text_dim, link);
         }
         LineKind::Action => {
             prefix.push("*", p.action, false);
             nick_run(&mut body, p, nick, nick, cx, mention);
             let color = if pending { p.quiet } else { p.action };
-            body.push(" ", color, false).push(&line.text, color, false);
+            body.push(" ", color, false).push_text(&line.text, color, link);
         }
         // The marker carries the error, as arrows carry joins; the
         // sentence is text, so red never covers a whole line.
         LineKind::Error => {
             prefix.push(display::marker(line.kind), p.error, false);
-            body.push(&line.text, p.text, false);
+            body.push_text(&line.text, p.text, link);
         }
         // hirc's own voice (a quit, an answer to a command): irssi's
         // `-!-`, so it never reads as the server's `--` chatter, and the
         // text a step below conversation.
         LineKind::Status => {
             prefix.push(display::marker(line.kind), p.server, false);
-            body.push(&line.text, p.text_dim, false);
+            body.push_text(&line.text, p.text_dim, link);
         }
         LineKind::Server | LineKind::Notice => {
             prefix.push(display::marker(line.kind), p.server, false);
-            body.push(&line.text, p.text_dim, false);
+            body.push_text(&line.text, p.text_dim, link);
         }
         kind => {
             prefix.push(display::marker(kind), p.server, false);
@@ -421,7 +484,7 @@ pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyEle
                         match part {
                             Part::Nick => nick_run(&mut body, p, &s, &s, cx, false),
                             Part::Verb | Part::Channel => _ = body.push(&s, verb, false),
-                            Part::Free => _ = body.push(&s, free, false),
+                            Part::Free => _ = body.push_text(&s, free, link),
                         }
                     }
                 }
@@ -451,7 +514,7 @@ pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyEle
         .when(mention, |d| d.bg(p.highlight))
         .when(cols.time > 0, |d| d.child(div().flex_none().w(px(m.grid(cols.time))).whitespace_nowrap().text_color(time_color).child(time)))
         .child(nick_column(app, cols, prefix, cut.map(|full| (full, line.seq))))
-        .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).child(body.element()))
+        .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).child(body.linked(app, SharedString::from(format!("text-{}", line.seq)))))
         .into_any_element()
 }
 

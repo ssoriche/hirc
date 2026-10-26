@@ -1,6 +1,7 @@
 //! The UI never waits on the network: see app.rs.
 mod app;
 mod input;
+mod links;
 mod metrics;
 mod scroll;
 #[cfg(feature = "snapshot")]
@@ -86,7 +87,9 @@ fn main() {
     let clock = snap.as_ref().map(|p| p.clock);
     #[cfg(not(feature = "snapshot"))]
     let clock = None;
-    let init = Init { networks, servers, theme, font_family, font_size, banner, hint, commands, events, no_layout_file, clock };
+    // A snapshot run (the same test) never opens a browser.
+    let dry_open = no_layout_file;
+    let init = Init { networks, servers, theme, font_family, font_size, banner, hint, commands, events, no_layout_file, clock, dry_open };
     #[cfg(feature = "snapshot")]
     if let Some(plan) = snap.take_if(|p| p.offscreen) {
         snapshot::run_offscreen(plan, init);

@@ -61,6 +61,8 @@ lines = [
   ":erin!e@h PRIVMSG #design :does the sidebar need more contrast?",
   ":frank!f@h PRIVMSG #design :\u0001ACTION squints at the screen\u0001",
   ":erin!e@h PRIVMSG #design :try 4.5:1 for the text",
+  ":frank!f@h PRIVMSG #design :the contrast rules are at https://www.w3.org/TR/WCAG21/#contrast-minimum.",
+  ":erin!e@h PRIVMSG #design :and (see https://en.wikipedia.org/wiki/Contrast_(vision)) for why; or www.example.org, not foo.bar",
   ":carol!c@h PRIVMSG me :a direct message, just for you",
   ":carol!c@h PRIVMSG me :are you around later?",
 ]
@@ -83,5 +85,6 @@ lines = [
   ":IrcBot!bot@relay PRIVMSG #rust :* ivy nods slowly",
   ":IrcBot!bot@relay PRIVMSG #rust :<a_rather_long_discord_name> long names are cut like any other",
   ":IrcBot!bot@relay PRIVMSG #rust :<ivy> me: are you coming to the meetup?",
+  ":IrcBot!bot@relay PRIVMSG #rust :<\u0002kai\u0002> bridges that bold the name unwrap too",
   ":IrcBot!bot@relay PRIVMSG #rust :Relay reconnected",
 ]
