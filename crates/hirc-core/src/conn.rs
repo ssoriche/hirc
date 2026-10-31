@@ -196,15 +196,24 @@ fn seed(name: &str, server: &Server, cache: &Shared, book: &mut Book) -> Vec<Eve
 /// oldest shown that follow on from it, then the server's. Where the cache
 /// stops at a break, or runs short, the server is asked for what is before
 /// the cache's oldest at once: the lines between are never skipped.
-/// Without server history the cache is read past its breaks, and the
-/// session says "start" only once the cache has nothing older.
+/// Without server history, or once the server has nothing older on this
+/// connection (its history ends before a break), the cache is read past
+/// its breaks, and the session says "start" only once the cache has
+/// nothing older. A break alone is never the start.
 fn older(session: &mut Session, cache: Option<&Shared>, network: &str, cmd: Command) -> Vec<Output> {
     if let (Some(cache), Command::Older { target, .. }) = (cache, &cmd)
-        && let Some(anchor) = session.book().oldest(target).and_then(|a| a.msgid.clone())
+        && let Some(anchor) = session.book().oldest(target).cloned()
+        && let Some(id) = anchor.msgid.clone()
     {
         let page = session.page();
-        let reach = if session.history_off() { Reach::All } else { Reach::ToBreak };
-        match cache.read(|c| c.before(network, target, &anchor, page, reach)) {
+        let reach = if session.history_off() || session.server_ended(target) { Reach::All } else { Reach::ToBreak };
+        // Read past breaks, an anchor not held (a page the writer hasn't
+        // put in yet) is read from by its time.
+        let read = |c: &crate::cache::Cache| match c.before(network, target, &id, page, reach)? {
+            o if o.broke && reach == Reach::All => c.before_time(network, target, anchor.time, page),
+            o => Ok(o),
+        };
+        match cache.read(read) {
             Ok(older) if !older.lines.is_empty() => {
                 let more = older.broke || older.lines.len() < page;
                 let mut out = session.cached(target, older.lines);
@@ -218,6 +227,20 @@ fn older(session: &mut Session, cache: Option<&Shared>, network: &str, cmd: Comm
         }
     }
     session.command(cmd, Utc::now())
+}
+
+/// The session's outputs, with each `CacheOlder` answered: the server's
+/// history for that target ended, so the cache is read past its breaks,
+/// and "start" is said only when it has nothing older either.
+fn resolve(session: &mut Session, cache: Option<&Shared>, network: &str, outs: Vec<Output>) -> Vec<Output> {
+    let mut done = Vec::with_capacity(outs.len());
+    for out in outs {
+        match out {
+            Output::CacheOlder(target) => done.extend(older(session, cache, network, Command::Older { network: network.to_owned(), target })),
+            out => done.push(out),
+        }
+    }
+    done
 }
 
 /// What the session says to keep goes to the cache's writer.
@@ -435,7 +458,7 @@ async fn connect_once(
     let mut tick = tokio::time::interval(Duration::from_secs(30));
     let end = async {
         loop {
-            for out in outs.drain(..) {
+            for out in resolve(&mut session, carry.cache.as_ref(), name, std::mem::take(&mut outs)) {
                 match out {
                     Output::Send(m) => {
                         w.write_all(m.to_wire().as_bytes()).await?;
@@ -466,6 +489,8 @@ async fn connect_once(
                         let _ = w.flush().await;
                         return Ok(End::Quit);
                     }
+                    // Answered by `resolve`.
+                    Output::CacheOlder(_) => {}
                 }
             }
             keep(carry.cache.as_ref(), &mut session);
@@ -528,7 +553,7 @@ async fn connect_once(
 mod tests {
     use super::*;
     use crate::cache::{Above, Below, Cache, Entry};
-    use crate::session::tests::{asked, feed, historied, histories, now};
+    use crate::session::tests::{asked, feed, historied, histories, now, sent};
 
     fn line(id: &str, secs: i64) -> Line {
         Line {
@@ -836,6 +861,87 @@ mod tests {
         live(&mut s, "#test", "l1", 1);
         live(&mut s, "#test", "l2", 2);
         assert_eq!(kept_ids(&mut s), [(vec!["l1".to_owned()], Below::Breaks), (vec!["l2".to_owned()], Below::Joins("l1".into()))]);
+    }
+
+    /// What the network task makes of `outs`, the session's answer to a
+    /// server line.
+    fn served(s: &mut Session, cache: &Shared, outs: Vec<Output>) -> Vec<Output> {
+        resolve(s, Some(cache), "net", outs)
+    }
+
+    /// `ids` (with their seconds, as `line` has them) as one labeled
+    /// `chathistory` page for `#test`.
+    fn page_at(s: &mut Session, cache: &Shared, label: &str, ids: &[(&str, i64)]) -> Vec<Output> {
+        feed(s, &format!("@label={label} :srv BATCH +p chathistory #test"));
+        for (id, secs) in ids {
+            let t = line(id, *secs).time.format("%Y-%m-%dT%H:%M:%S%.3fZ");
+            feed(s, &format!("@batch=p;time={t};msgid={id} :bob!b@h PRIVMSG #test :{id}"));
+        }
+        let outs = feed(s, ":srv BATCH -p");
+        served(s, cache, outs)
+    }
+
+    fn got(out: &[Output]) -> Vec<(Vec<String>, bool)> {
+        histories(out).into_iter().map(|(_, l, start)| (l.into_iter().map(|l| l.text).collect(), start)).collect()
+    }
+
+    /// Ten days away on a server that keeps a week: the fill's first line
+    /// is a break, and the server has nothing before it. The months of
+    /// cached lines below it are still history, and the start is only
+    /// where the cache ends too.
+    #[test]
+    fn a_break_older_than_the_servers_history_never_hides_the_cache_below_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let chan = || Target::Channel("#test".into());
+        let old: Vec<Line> = (1..=6).map(|i| line(&format!("o{i}"), i)).collect();
+        let fill = vec![line("f1", 1000), line("f2", 1001), line("f3", 1002)];
+        let cache = cache_with(&dir, vec![(chan(), old), (chan(), fill)]);
+        let mut s = restart(&cache, &["#test"]);
+        // The break stops the cache: the server is asked.
+        let (wire, label) = asked(&older_of(&mut s, &cache, "#test"));
+        assert_eq!(wire, "CHATHISTORY BEFORE #test msgid=f1 3");
+        // It has nothing that old: the cache goes on past the break.
+        let out = page_at(&mut s, &cache, &label, &[]);
+        assert_eq!(got(&out), [(vec!["o4".to_owned(), "o5".to_owned(), "o6".to_owned()], false)]);
+        assert!(sent(&out).is_empty(), "{out:?}");
+        // Further up, still the cache, never the server again.
+        let out = older_of(&mut s, &cache, "#test");
+        assert_eq!(got(&out), [(vec!["o1".to_owned(), "o2".to_owned(), "o3".to_owned()], false)]);
+        assert!(sent(&out).is_empty(), "{out:?}");
+        // Both have nothing older: now it is the start.
+        let out = older_of(&mut s, &cache, "#test");
+        assert_eq!(got(&out), [(vec![], true)]);
+        assert!(sent(&out).is_empty(), "{out:?}");
+    }
+
+    /// A short page before a break is where the server's history ends:
+    /// what is older comes from the cache, past the break.
+    #[test]
+    fn a_short_page_before_a_break_goes_on_in_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let chan = || Target::Channel("#test".into());
+        let old: Vec<Line> = (1..=3).map(|i| line(&format!("o{i}"), i)).collect();
+        let cache = cache_with(&dir, vec![(chan(), old), (chan(), vec![line("f1", 1000)])]);
+        let mut s = restart(&cache, &["#test"]);
+        let (_, label) = asked(&older_of(&mut s, &cache, "#test"));
+        let out = page_at(&mut s, &cache, &label, &[("s1", 500)]);
+        assert_eq!(got(&out), [(vec!["s1".to_owned()], false)]);
+        // s1 isn't written yet (the writer runs on its own): read by its time.
+        let out = older_of(&mut s, &cache, "#test");
+        assert_eq!(got(&out), [(vec!["o1".to_owned(), "o2".to_owned(), "o3".to_owned()], false)]);
+        assert!(sent(&out).is_empty(), "{out:?}");
+        assert_eq!(got(&older_of(&mut s, &cache, "#test")), [(vec![], true)]);
+    }
+
+    /// With the server's history in full, its start is the start when the
+    /// cache has nothing older either.
+    #[test]
+    fn an_empty_page_is_the_start_when_the_cache_has_nothing_older() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with(&dir, vec![(Target::Channel("#test".into()), vec![line("f1", 1000)])]);
+        let mut s = restart(&cache, &["#test"]);
+        let (_, label) = asked(&older_of(&mut s, &cache, "#test"));
+        assert_eq!(got(&page_at(&mut s, &cache, &label, &[])), [(vec![], true)]);
     }
 
     #[test]

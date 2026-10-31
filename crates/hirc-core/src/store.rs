@@ -113,6 +113,9 @@ pub struct Buffer {
     /// then hirc doesn't send its own, which could mark unread history
     /// read before the "new" divider shows.
     pub read_synced: bool,
+    /// This connection's history for it is in (`Event::Filled`). Until
+    /// then a marker sent could mark lines read that are still coming.
+    pub filled: bool,
     pub history: HistoryState,
     msgids: HashSet<String>,
 }
@@ -128,6 +131,7 @@ impl Buffer {
             mentions: 0,
             read: None,
             read_synced: false,
+            filled: false,
             history: HistoryState::Idle,
             msgids: HashSet::new(),
         }
@@ -431,6 +435,7 @@ impl Store {
                         // A request that was out is gone with the socket,
                         // and the next server will say its marker again.
                         b.read_synced = false;
+                        b.filled = false;
                         if b.history == HistoryState::Loading {
                             b.history = HistoryState::Idle;
                         }
@@ -467,6 +472,12 @@ impl Store {
             Event::Peer { network, nick, change } => {
                 let n = self.network_ix(&network);
                 self.networks[n].see(&nick, change);
+                Applied::Changed
+            }
+            Event::Filled { network, target } => {
+                let n = self.network_ix(&network);
+                let b = self.buffer_ix(n, &target);
+                self.networks[n].buffers[b].filled = true;
                 Applied::Changed
             }
             Event::Joined { network, channel } => self.set_joined(&network, channel, true),

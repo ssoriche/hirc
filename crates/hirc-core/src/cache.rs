@@ -271,6 +271,12 @@ impl Cache {
         }
     }
 
+    /// The `limit` lines of `target` older than `time`, oldest first, past
+    /// every break: for an anchor not held (yet), with `Reach::All`.
+    pub fn before_time(&self, network: &str, target: &str, time: DateTime<Utc>, limit: usize) -> Result<Older, CacheError> {
+        self.query(network, &target.to_ascii_lowercase(), time.timestamp_millis(), i64::MIN, limit, Reach::All)
+    }
+
     fn query(&self, network: &str, target: &str, time: i64, rowid: i64, limit: usize, reach: Reach) -> Result<Older, CacheError> {
         let mut st = self.db.prepare_cached(
             "SELECT msgid, time, kind, nick, text, own, brk FROM lines WHERE network = ?1 AND target = ?2 AND (time < ?3 OR (time = ?3 AND rowid < ?4)) ORDER BY time DESC, rowid DESC LIMIT ?5",

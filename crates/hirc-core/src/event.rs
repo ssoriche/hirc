@@ -93,6 +93,13 @@ pub enum Event {
         target: Target,
         time: Option<DateTime<Utc>>,
     },
+    /// `target`'s history is up to date on this connection: its latest
+    /// page or gap fill is in, the server gave up on it, or history can't
+    /// come. Until then hirc never moves its read marker.
+    Filled {
+        network: String,
+        target: Target,
+    },
     Joined {
         network: String,
         channel: String,

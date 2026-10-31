@@ -27,6 +27,12 @@ pub enum Output {
     Stop(String),
     /// The user quit: close and don't reconnect until they ask.
     Quit,
+    /// The server has no history before the oldest line held for this
+    /// target: its window ended, which is not the start of history. The
+    /// network task reads the cache past its breaks, and says "start"
+    /// only when the cache has nothing older either (`conn::resolve`).
+    /// Only said while keeping a cache.
+    CacheOlder(String),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -130,9 +136,17 @@ pub struct Session {
     /// Lowercased targets whose page before gave up on this connection:
     /// asking again would only fail again.
     gave_up: HashSet<String>,
-    /// `Older` for a target that had a request out, by lowercased target:
-    /// sent once that request is done.
+    /// `Older` for a target that had a request out, or that came before
+    /// registration ended, by lowercased target: sent once that request
+    /// is done (or at `sync`).
     queued_older: HashMap<String, String>,
+    /// A request that met one in flight for its target, by lowercased
+    /// target: sent as asked once that one is done, never dropped.
+    queued: HashMap<String, (String, Kind)>,
+    /// Lowercased targets whose server history ended on this connection
+    /// (an empty or short page before, while keeping a cache): what is
+    /// older comes from the cache alone.
+    ended: HashSet<String>,
     /// Names (with their latest activity) in TARGETS answers still
     /// arriving, by batch ref.
     found: HashMap<String, Vec<Found>>,
@@ -275,6 +289,8 @@ impl Session {
             gaps: HashMap::new(),
             gave_up: HashSet::new(),
             queued_older: HashMap::new(),
+            queued: HashMap::new(),
+            ended: HashSet::new(),
             found: HashMap::new(),
             discovering: None,
             targets_pages: 0,
@@ -393,6 +409,12 @@ impl Session {
         !self.cfg.chathistory || (self.reg == Reg::Done && !self.history_on())
     }
 
+    /// The server has nothing before the oldest held for `target` on this
+    /// connection: older lines come from the cache, read past its breaks.
+    pub fn server_ended(&self, target: &str) -> bool {
+        self.ended.contains(&target.to_ascii_lowercase())
+    }
+
     /// What the server said it supports, as of this connection.
     pub fn isupport(&self) -> &Isupport {
         &self.isupport
@@ -417,6 +439,8 @@ impl Session {
         self.gaps.clear();
         self.gave_up.clear();
         self.queued_older.clear();
+        self.queued.clear();
+        self.ended.clear();
         self.found.clear();
         self.discovering = None;
         self.targets_pages = 0;
@@ -736,15 +760,17 @@ impl Session {
     /// when the server labels its answers, so each page finds its request.
     fn request(&mut self, target: &str, kind: Kind, out: &mut Vec<Output>) {
         let key = target.to_ascii_lowercase();
-        // A gap opens even if the request can't go now: until it is
-        // filled, the newest held stays where it is.
+        // One out already: this one goes once that is done (`settled`),
+        // as asked, and opens its gap only then.
+        if self.inflight.contains_key(&key) {
+            self.queued.entry(key).or_insert_with(|| (target.to_owned(), kind));
+            return;
+        }
+        // Until the gap is filled, the newest held stays where it is.
         if matches!(kind, Kind::After(_)) && !self.gaps.contains_key(&key) {
             self.gaps.insert(key.clone(), None);
             // Live lines from here are past the hole until it is filled.
             self.tail.remove(&key);
-        }
-        if self.inflight.contains_key(&key) {
-            return;
         }
         let request = Request { target: target.to_owned(), kind, limit: self.page() };
         let mut msg = request.message();
@@ -762,6 +788,7 @@ impl Session {
     /// the latest page.
     fn backfill(&mut self, target: &str, out: &mut Vec<Output>) {
         if !self.history_on() {
+            out.push(self.filled(target));
             return;
         }
         let kind = self.book.newest(target).map_or(Kind::Latest, |a| Kind::After(a.clone()));
@@ -770,13 +797,24 @@ impl Session {
 
     /// The page before the oldest line held. Without history the window
     /// is told at once that nothing older will come; after giving up, that
-    /// nothing comes now. With a request out, it waits for that one.
+    /// nothing comes now. Before registration ends (the server's page
+    /// limit, and every gap fill, come first), or with a request out, it
+    /// waits. Once the server's history ended, the cache has been read
+    /// already (`conn::older`): this is the start.
     fn older(&mut self, target: &str, out: &mut Vec<Output>) {
         if !self.history_on() {
             out.push(self.history_event(target, Vec::new(), true));
             return;
         }
         let key = target.to_ascii_lowercase();
+        if !self.synced {
+            self.queued_older.insert(key, target.to_owned());
+            return;
+        }
+        if self.ended.contains(&key) {
+            out.push(self.history_event(target, Vec::new(), true));
+            return;
+        }
         if self.gave_up.contains(&key) {
             out.push(self.history_event(target, Vec::new(), false));
             return;
@@ -826,6 +864,13 @@ impl Session {
             self.close_gap(&key, &name);
         }
         self.discover(now, out);
+        // `Older` asked before now: after the gap fills it waited for.
+        let waiting: Vec<String> = self.queued_older.keys().filter(|k| !self.inflight.contains_key(*k)).cloned().collect();
+        for key in waiting {
+            if let Some(target) = self.queued_older.remove(&key) {
+                self.older(&target, out);
+            }
+        }
     }
 
     /// `CHATHISTORY TARGETS` to a little past now (the server's clock may
@@ -1002,10 +1047,22 @@ impl Session {
         }
         let start = page.items == 0 && matches!(request.kind, Kind::Latest | Kind::Before(_));
         let full = page.items >= request.limit;
-        out.push(self.history_event(&request.target, page.lines, start));
+        // Short before: the server's history ends here, the cache's may not.
+        let ended = matches!(request.kind, Kind::Before(_)) && !full && self.keep.is_some();
+        if ended {
+            self.ended.insert(key.clone());
+        }
+        if start && ended {
+            out.push(Output::CacheOlder(request.target.clone()));
+        } else {
+            out.push(self.history_event(&request.target, page.lines, start));
+        }
         // The page reaches the live end: live lines follow on from it.
-        if matches!(request.kind, Kind::Latest) && !partial {
-            self.tail_unless_known(&request.target, newest_kept.clone());
+        if matches!(request.kind, Kind::Latest) {
+            if !partial {
+                self.tail_unless_known(&request.target, newest_kept.clone());
+            }
+            out.push(self.filled(&request.target));
         }
         if let Kind::After(from) = &request.kind {
             match page.last.filter(|l| full && l != from) {
@@ -1015,9 +1072,11 @@ impl Session {
                         self.tail_unless_known(&request.target, newest_kept.or_else(|| from.msgid.clone()));
                     }
                     self.close_gap(&key, &request.target);
+                    out.push(self.filled(&request.target));
                 }
-                // Full but no further on: the gap stays open for next time.
-                None => {}
+                // Full but no further on: the gap stays open for next time,
+                // and this connection has all it will get.
+                None => out.push(self.filled(&request.target)),
             }
         }
         self.settled(&key, out);
@@ -1048,13 +1107,24 @@ impl Session {
         }
     }
 
-    /// The request for `key` is done: send an `Older` that waited for it.
+    /// The request for `key` is done: send the request that met it, then
+    /// an `Older` that waited for it (behind that one, if it went).
     fn settled(&mut self, key: &str, out: &mut Vec<Output>) {
-        if !self.inflight.contains_key(key)
-            && let Some(target) = self.queued_older.remove(key)
-        {
+        if self.inflight.contains_key(key) {
+            return;
+        }
+        if let Some((target, kind)) = self.queued.remove(key) {
+            self.request(&target, kind, out);
+        }
+        if let Some(target) = self.queued_older.remove(key) {
             self.older(&target, out);
         }
+    }
+
+    /// `target`'s history for this connection is in: its latest page or
+    /// gap fill answered, given up on, or history can't come.
+    fn filled(&self, target: &str) -> Output {
+        Output::Event(Event::Filled { network: self.network.clone(), target: self.dest(target) })
     }
 
     /// A labeled request answered with a bare ACK: nothing there.
@@ -1067,10 +1137,18 @@ impl Session {
             return;
         }
         let start = matches!(request.kind, Kind::Latest | Kind::Before(_));
-        out.push(self.history_event(&request.target, Vec::new(), start));
+        if matches!(request.kind, Kind::Before(_)) && self.keep.is_some() {
+            self.ended.insert(key.clone());
+            out.push(Output::CacheOlder(request.target.clone()));
+        } else {
+            out.push(self.history_event(&request.target, Vec::new(), start));
+        }
         if let Kind::After(from) = &request.kind {
             self.tail_unless_known(&request.target, from.msgid.clone());
             self.close_gap(&key, &request.target);
+        }
+        if matches!(request.kind, Kind::Latest | Kind::After(_)) {
+            out.push(self.filled(&request.target));
         }
         self.settled(&key, out);
     }
@@ -1107,6 +1185,9 @@ impl Session {
             self.gave_up.insert(key.clone());
         }
         out.push(self.history_event(&request.target, Vec::new(), false));
+        if matches!(request.kind, Kind::Latest | Kind::After(_)) {
+            out.push(self.filled(&request.target));
+        }
         self.settled(&key, out);
     }
 
@@ -2423,6 +2504,93 @@ pub(crate) mod tests {
         // A new connection tries again.
         s.start();
         assert!(s.inflight.is_empty() && s.gave_up.is_empty());
+    }
+
+    /// A query window on screen that fits asks `Older` as soon as the UI
+    /// hears 001. It waits for the end of registration and the gap fill:
+    /// the PMs that came while away still arrive, and the page before is
+    /// held to the server's limit.
+    #[test]
+    fn older_at_001_waits_for_the_gap_fill() {
+        let mut book = Book::default();
+        book.note("bob", true, &[Line { msgid: Some("q0".into()), time: "2026-10-22T10:00:00Z".parse().unwrap(), ..local_line() }]);
+        let mut s = Session::new("net", SessionConfig { history_page: Some(20), ..cfg() }).with_book(book);
+        s.start();
+        let caps = "message-tags server-time batch labeled-response draft/chathistory";
+        feed(&mut s, &format!(":srv CAP * LS :{caps}"));
+        feed(&mut s, &format!(":srv CAP alice ACK :{caps}"));
+        feed(&mut s, ":srv 001 alice :hi");
+        assert!(sent(&older(&mut s, "bob")).is_empty(), "nothing before the gap fill");
+        feed(&mut s, ":srv 005 alice CHANTYPES=# CHATHISTORY=5 :are supported");
+        let out = feed(&mut s, ":srv 376 alice :End of MOTD");
+        let asks: Vec<String> = sent(&out).into_iter().filter(|m| m.contains("CHATHISTORY") && !m.contains("TARGETS")).collect();
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        assert!(asks[0].ends_with("CHATHISTORY AFTER bob msgid=q0 5"), "{asks:?}");
+        let label = out
+            .iter()
+            .find_map(|o| match o {
+                Output::Send(m) if m.params.first().map(String::as_str) == Some("AFTER") => m.tag("label").map(str::to_owned),
+                _ => None,
+            })
+            .unwrap();
+        feed(&mut s, &format!("@label={label} :srv BATCH +a chathistory bob"));
+        feed(&mut s, "@batch=a;time=2026-10-22T10:30:00.000Z;msgid=q1 :bob!b@h PRIVMSG alice :while you were away");
+        let out = feed(&mut s, ":srv BATCH -a");
+        let got = histories(&out);
+        assert_eq!(texts(&got[0].1), ["while you were away"]);
+        // Then the page before, at the server's limit.
+        assert_eq!(asked(&out).0, "CHATHISTORY BEFORE bob msgid=q0 5");
+        assert_eq!(s.book().newest("bob").and_then(|a| a.msgid.as_deref()), Some("q1"));
+    }
+
+    /// A gap fill asked while a page before is out is sent once that one
+    /// is in, never dropped, and opens its gap only when it goes.
+    #[test]
+    fn a_request_that_meets_one_in_flight_goes_after_it() {
+        let mut s = historied("", 3, held());
+        let (wire, label) = asked(&older(&mut s, "#test"));
+        assert_eq!(wire, "CHATHISTORY BEFORE #test msgid=m0 3");
+        assert!(sent(&feed(&mut s, OUR_JOIN)).is_empty());
+        assert!(!s.gaps.contains_key("#test"), "no gap while it waits");
+        let out = page(&mut s, Some(&label), "b", &[]);
+        assert_eq!(asked(&out).0, "CHATHISTORY AFTER #test msgid=m0 3");
+        assert!(s.gaps.contains_key("#test"));
+    }
+
+    fn filled(out: &[Output]) -> Vec<Target> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Event(Event::Filled { target, .. }) => Some(target.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The UI moves no read marker until a window's history is in: the
+    /// session says when, after the page.
+    #[test]
+    fn a_window_is_filled_once_its_latest_page_or_gap_fill_is_in() {
+        let chan = || Target::Channel("#test".into());
+        let mut s = historied("", 3, Book::default());
+        let (_, label) = asked(&feed(&mut s, OUR_JOIN));
+        let out = page(&mut s, Some(&label), "l", &["m1"]);
+        assert_eq!(filled(&out), [chan()]);
+        let at = out.iter().position(|o| matches!(o, Output::Event(Event::Filled { .. }))).unwrap();
+        assert!(out[..at].iter().any(|o| matches!(o, Output::Event(Event::History { .. }))), "after the page: {out:?}");
+        // A gap fill: only its last page.
+        let mut s = historied("", 2, held());
+        let (_, label) = asked(&feed(&mut s, OUR_JOIN));
+        let out = page(&mut s, Some(&label), "a", &["m1", "m2"]);
+        assert!(filled(&out).is_empty(), "more to come: {out:?}");
+        let (_, label) = asked(&out);
+        assert_eq!(filled(&feed(&mut s, &format!("@label={label} :srv ACK"))), [chan()]);
+        // No history: at once.
+        let mut s = Session::new("net", cfg());
+        s.start();
+        feed(&mut s, ":srv CAP * LS :batch");
+        feed(&mut s, ":srv CAP alice ACK :batch");
+        feed(&mut s, ":srv 001 alice :hi");
+        assert_eq!(filled(&feed(&mut s, ":alice!a@h JOIN #test")), [chan()]);
     }
 
     #[test]

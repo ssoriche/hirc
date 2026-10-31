@@ -373,7 +373,8 @@ fn take(fake: &mut Fake, network: &str, msg: Message, now: DateTime<Utc>, events
                     }
                 }
             }
-            Output::Send(_) => {}
+            // Never said: the fake keeps no cache.
+            Output::Send(_) | Output::CacheOlder(_) => {}
         }
     }
     if error {
@@ -531,6 +532,7 @@ fn answer(session: &mut Fake, cmd: Command, now: DateTime<Utc>, echoes: &mut u64
                 events.push(ended(&network, out));
                 return (events, true);
             }
+            Output::CacheOlder(_) => {}
         }
     }
     (events, false)
@@ -544,9 +546,10 @@ fn is_echo(e: &Event) -> bool {
 
 /// What `delay:` holds back: the fake server's echo of a message we sent,
 /// and its history pages, so a shot can show a line waiting for its echo
-/// or "loading older messages".
+/// or "loading older messages". A page's `Filled` waits with it: it never
+/// lets a marker go before the page is in.
 fn held(e: &Event) -> bool {
-    is_echo(e) || matches!(e, Event::History { .. })
+    is_echo(e) || matches!(e, Event::History { .. } | Event::Filled { .. })
 }
 
 /// One UI command, for both command loops (window thread, offscreen task).
