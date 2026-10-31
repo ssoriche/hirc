@@ -106,7 +106,7 @@ HIRC_SCREENSHOT=out.png \
 
 | Variable | Effect |
 |---|---|
-| `HIRC_FIXTURE=<file.toml>` | Canned servers and lines; enables snapshot mode. One `[[server]]` table per network (`name`, `nick`, optional `echo_message`, `lines` as raw IRC lines, optionally with an `@time=` tag), plus an optional top-level `base_time`. See `crates/hirc/fixtures/demo.toml`. |
+| `HIRC_FIXTURE=<file.toml>` | Canned servers and lines; enables snapshot mode. One `[[server]]` table per network (`name`, `nick`, optional `echo_message`, `lines` as raw IRC lines, optionally with an `@time=` tag; optional `chathistory`, `read_marker` and `history_page_size` for a server with history, and `[[server.history]]` tables of made-up history per target: `target`, `start`, `count`, optional `nicks` and `events`), plus an optional top-level `base_time`. See `crates/hirc/fixtures/demo.toml` and `crates/hirc/fixtures/history.toml`. |
 | `HIRC_SCRIPT="step;step"` | Steps, below. |
 | `HIRC_SCREENSHOT=<out.png>` | Final image, taken after the script. |
 | `HIRC_OFFSCREEN=1` | Offscreen mode. Exits 0 when done; on failure prints `snapshot: <reason>` and exits 1. |
@@ -133,6 +133,12 @@ An unknown step prints `snapshot: unknown step <s>` and continues.
 
 Fixture runs never read or write the layout file. Theme and font still come
 from the normal config dir.
+
+`crates/hirc/fixtures/history.toml` has a fake server with history. The run below saves the history states: the "new" divider at the server's read marker, "loading older messages" while a page is on its way (`delay:` holds the page back), "start of history", and replayed joins, parts and nick changes:
+
+    HIRC_FIXTURE=crates/hirc/fixtures/history.toml HIRC_OFFSCREEN=1 \
+    HIRC_SCRIPT="window:2;shot:target/history-review/1-divider.png;delay:1500;scroll:5000;wait:100;shot:target/history-review/2-loading.png;wait:1600;delay:0;scroll:5000;wait:200;scroll:5000;wait:200;scroll:5000;wait:200;scroll:5000;wait:200;scroll:5000;wait:200;shot:target/history-review/3-start.png;window:3;shot:target/history-review/4-events.png" \
+    cargo run -p hirc --features snapshot
 
 The offscreen smoke test needs a Metal device and runs the real binary (AppKit
 wants the process main thread), so it is ignored by default:

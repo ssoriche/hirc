@@ -18,7 +18,7 @@
 //!
 //! | Variable | Effect |
 //! |---|---|
-//! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` never leaves the process; a faked server answers some sends through the session: a JOIN comes back as our JOIN plus a NAMES of just us (no topic), a PART as our PART, and on an `echo_message` server a PRIVMSG/NOTICE as its echo, a `draft/multiline` batch (a server with `multiline`) as the whole batch. Everything else is dropped. Connection status follows conn.rs: an `Output::Quit` (`/quit`) is `Offline`, an `Output::Stop` (e.g. a SASL failure) is `Failed { reason }`, and a server `ERROR` line closes the connection as `Disconnected { reason: <the ERROR text>, retry }`, with conn.rs's first retry delay. Either way that network reads no more fixture lines and later commands to it go nowhere (no reconnect is faked). |
+//! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` never leaves the process; a faked server answers some sends through the session: a JOIN comes back as our JOIN plus a NAMES of just us (no topic), a PART as our PART, and on an `echo_message` server a PRIVMSG/NOTICE as its echo, a `draft/multiline` batch (a server with `multiline`) as the whole batch. Everything else is dropped. Connection status follows conn.rs: an `Output::Quit` (`/quit`) is `Offline`, an `Output::Stop` (e.g. a SASL failure) is `Failed { reason }`, and a server `ERROR` line closes the connection as `Disconnected { reason: <the ERROR text>, retry }`, with conn.rs's first retry delay. Either way that network reads no more fixture lines and later commands to it go nowhere (no reconnect is faked). On a `chathistory` server it also answers the session's `CHATHISTORY` from the fixture's `history` (LATEST, BEFORE and AFTER pages; TARGETS finds nothing). |
 //! | `HIRC_SCREENSHOT=<out.png>` | Final image, taken after the script. Window mode waits 300 ms for layout, captures, quits. |
 //! | `HIRC_OFFSCREEN=1` | Offscreen mode (above). Exits 0 when done; on failure prints `snapshot: <reason>` and exits 1. |
 //! | `HIRC_SIZE=WxH` | Logical size (default `1200x800`). |
@@ -45,7 +45,7 @@
 //! | `dclick:x,y`, `tclick:x,y` | A double or triple primary click at (x, y): selects a word or a line. |
 //! | `paste:<text>` | Put `<text>` on the clipboard (`\n` a line break, `\r` a carriage return, `\\` a backslash) and `⌘V` it through the normal key path. |
 //! | `copy` | `⌘C` through the normal key path, then prints what the clipboard holds as `snapshot: clipboard <text>` on stdout (`\` and newlines escaped). |
-//! | `delay:<ms>` | From now on the fake server holds its echo of our messages this long (simulated time offscreen), so a shot can show a line waiting for its echo. `delay:0` answers at once again. |
+//! | `delay:<ms>` | From now on the fake server holds its echo of our messages, and its history pages, this long (simulated time offscreen), so a shot can show a line waiting for its echo or "loading older messages". `delay:0` answers at once again. |
 //!
 //! A click on a link never opens it here: it prints `snapshot: open <url>`
 //! on stdout, so a script can check what would open.
@@ -77,6 +77,7 @@ use gpui::{
 use hirc_core::config::{Config, Server};
 use hirc_core::conn;
 use hirc_core::event::{Command, ConnStatus, Event};
+use hirc_core::history;
 use hirc_core::proto::Message;
 use hirc_core::session::{Output, Session, SessionConfig};
 use serde::Deserialize;
@@ -88,7 +89,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// What `Plan::channels` leaves for the offscreen runner to serve on the
 /// foreground executor (no thread, so frames stay deterministic).
-type Serve = (HashMap<String, Session>, UnboundedReceiver<Command>, UnboundedSender<Event>);
+type Serve = (HashMap<String, Fake>, UnboundedReceiver<Command>, UnboundedSender<Event>);
 
 const DEFAULT_BASE: &str = "2026-01-01T12:00:00Z";
 /// Time between steps, so each one renders before the next.
@@ -118,6 +119,54 @@ pub struct FixtureServer {
     /// `batch` and `message-tags`), e.g. `max-bytes=4096,max-lines=24`.
     #[serde(default)]
     pub multiline: Option<String>,
+    /// Pretend the server ACKed batch, labeled-response, chathistory and
+    /// event-playback: the session asks for history, and the fake server
+    /// answers from `history`.
+    #[serde(default)]
+    pub chathistory: bool,
+    /// And draft/read-marker (a `MARKREAD` line in `lines` places it).
+    #[serde(default)]
+    pub read_marker: bool,
+    /// As the config's `history_page_size`.
+    #[serde(default)]
+    pub history_page_size: Option<usize>,
+    /// The fake server's history, by target.
+    #[serde(default)]
+    pub history: Vec<FixtureHistory>,
+}
+
+/// Made-up history for one target: `count` lines a minute apart from
+/// `start`, said by `nicks` in turn ("older message 1", ...). With
+/// `events`, some are joins, parts and nick changes instead.
+#[derive(Debug, Deserialize)]
+pub struct FixtureHistory {
+    pub target: String,
+    pub start: String,
+    pub count: usize,
+    #[serde(default)]
+    pub nicks: Vec<String>,
+    #[serde(default)]
+    pub events: bool,
+}
+
+/// A fixture server: its session, and the history it answers from (by
+/// lowercased target, oldest first).
+pub struct Fake {
+    session: Session,
+    history: HashMap<String, Vec<Message>>,
+}
+
+impl std::ops::Deref for Fake {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for Fake {
+    fn deref_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -211,28 +260,124 @@ pub fn parse_flag(s: &str) -> bool {
 }
 
 fn session_config(s: &FixtureServer) -> SessionConfig {
-    SessionConfig { nickname: s.nick.clone(), username: s.nick.clone(), realname: s.nick.clone(), bridges: s.bridges.clone(), ..Default::default() }
+    SessionConfig {
+        nickname: s.nick.clone(),
+        username: s.nick.clone(),
+        realname: s.nick.clone(),
+        bridges: s.bridges.clone(),
+        chathistory: s.chathistory,
+        history_page: s.history_page_size,
+        ..Default::default()
+    }
+}
+
+/// `h` as the server lines it replays.
+fn history_lines(h: &FixtureHistory) -> Result<Vec<Message>, String> {
+    let start = DateTime::parse_from_rfc3339(&h.start).map_err(|e| format!("bad history start {:?}: {e}", h.start))?.with_timezone(&Utc);
+    let nicks = if h.nicks.is_empty() { vec!["alice".to_owned(), "bob".to_owned()] } else { h.nicks.clone() };
+    let id = h.target.trim_start_matches(['#', '&']).to_owned();
+    Ok((0..h.count)
+        .map(|i| {
+            let nick = &nicks[i % nicks.len()];
+            let (command, params) = match (h.events, i % 10) {
+                (true, 3) => ("JOIN", vec![h.target.clone()]),
+                (true, 4) => ("NICK", vec![format!("{nick}_")]),
+                (true, 7) => ("PART", vec![h.target.clone(), "see you".into()]),
+                _ => ("PRIVMSG", vec![h.target.clone(), format!("older message {}", i + 1)]),
+            };
+            let mut m = Message::new(command, params);
+            m.source = Some(format!("{nick}!u@fixture"));
+            let time = start + Delta::minutes(i as i64);
+            m.tags = vec![("time".into(), Some(time.to_rfc3339_opts(SecondsFormat::Millis, true))), ("msgid".into(), Some(format!("h-{id}-{}", i + 1)))];
+            m
+        })
+        .collect())
+}
+
+fn time_of(m: &Message) -> Option<DateTime<Utc>> {
+    m.tag("time").and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map(|t| t.with_timezone(&Utc))
+}
+
+/// The fake server's answer to a CHATHISTORY request: a `chathistory`
+/// batch (with the request's label) of what it asks for from `history`.
+/// TARGETS gets an empty targets batch.
+fn fake_history(sent: &Message, history: &HashMap<String, Vec<Message>>) -> Vec<Message> {
+    let p = |i: usize| sent.params.get(i).map_or("", String::as_str);
+    let limit: usize = sent.params.last().and_then(|l| l.parse().ok()).unwrap_or(0);
+    let batch = |kind: &str, target: Option<&str>, lines: &[Message]| {
+        let r = "fake-history".to_owned();
+        let mut open = Message::new("BATCH", std::iter::once(format!("+{r}")).chain(std::iter::once(kind.to_owned())).chain(target.map(str::to_owned)));
+        open.source = Some("irc.fixture".into());
+        if let Some(l) = sent.tag("label") {
+            open.tags.push(("label".into(), Some(l.to_owned())));
+        }
+        let mut out = vec![open];
+        out.extend(lines.iter().map(|m| {
+            let mut m = m.clone();
+            m.tags.push(("batch".into(), Some(r.clone())));
+            m
+        }));
+        let mut close = Message::new("BATCH", [format!("-{r}")]);
+        close.source = Some("irc.fixture".into());
+        out.push(close);
+        out
+    };
+    if p(0) == "TARGETS" {
+        return batch(history::TARGETS_BATCH, None, &[]);
+    }
+    let all = history.get(&p(1).to_ascii_lowercase()).map_or(&[][..], Vec::as_slice);
+    // Where an anchor is: the index of its line (msgid), else of the first
+    // line at or after its time; and of the first line after it.
+    let at = |a: &str| match a.strip_prefix("msgid=") {
+        Some(id) => all.iter().position(|m| m.tag("msgid") == Some(id)).map(|i| (i, i + 1)),
+        None => history::parse_timestamp(a).map(|t| {
+            let at = all.iter().position(|m| time_of(m) >= Some(t)).unwrap_or(all.len());
+            let after = all.iter().position(|m| time_of(m) > Some(t)).unwrap_or(all.len());
+            (at, after)
+        }),
+    };
+    let lines = match p(0) {
+        "LATEST" => &all[all.len().saturating_sub(limit)..],
+        "BEFORE" => {
+            let end = at(p(2)).map_or(0, |(i, _)| i);
+            &all[end.saturating_sub(limit)..end]
+        }
+        "AFTER" => {
+            let from = at(p(2)).map_or(all.len(), |(_, i)| i);
+            &all[from..(from + limit).min(all.len())]
+        }
+        _ => &[][..],
+    };
+    batch(history::BATCH, Some(p(1)), lines)
 }
 
 /// Hand one server line to the session, as conn.rs's read loop does, and
 /// collect the `Event`s it passes on. Returns whether the connection is over:
 /// a `Stop` ends it there (later outputs are dropped, as live) with the
 /// status conn.rs reports, and after an `ERROR` the server closes the
-/// socket. `Send`s go nowhere.
-fn take(session: &mut Session, network: &str, msg: Message, now: DateTime<Utc>, events: &mut Vec<Event>) -> bool {
+/// socket. A history request is answered from the fixture; other `Send`s
+/// go nowhere.
+fn take(fake: &mut Fake, network: &str, msg: Message, now: DateTime<Utc>, events: &mut Vec<Event>) -> bool {
     let error = msg.command == "ERROR";
-    for out in session.handle(msg, now) {
+    for out in fake.session.handle(msg, now) {
         match out {
             Output::Event(e) => events.push(e),
             Output::Stop(_) | Output::Quit => {
                 events.push(ended(network, out));
                 return true;
             }
+            Output::Send(sent) if sent.command == "CHATHISTORY" => {
+                for reply in fake_history(&sent, &fake.history) {
+                    if take(fake, network, reply, now, events) {
+                        return true;
+                    }
+                }
+            }
             Output::Send(_) => {}
         }
     }
     if error {
-        events.push(closed(network, session));
+        events.push(closed(network, &fake.session));
     }
     error
 }
@@ -255,7 +400,7 @@ fn closed(network: &str, session: &Session) -> Event {
     Event::Status { network: network.to_owned(), status: ConnStatus::Disconnected { reason, retry } }
 }
 
-fn feed_line(session: &mut Session, network: &str, line: &str, now: DateTime<Utc>, events: &mut Vec<Event>) -> Result<bool, String> {
+fn feed_line(session: &mut Fake, network: &str, line: &str, now: DateTime<Utc>, events: &mut Vec<Event>) -> Result<bool, String> {
     let msg = Message::parse(line).map_err(|e| format!("bad fixture line {line:?}: {e}"))?;
     Ok(take(session, network, msg, now, events))
 }
@@ -276,12 +421,19 @@ fn clock(fx: &Fixture) -> Result<DateTime<Utc>, String> {
 /// thread would. Returns the events for the UI and the sessions, which keep
 /// answering commands afterwards. A server whose connection ended (`Stop`,
 /// `ERROR`) reads no further lines and has no session left.
-pub fn feed(fx: &Fixture) -> Result<(Vec<Event>, HashMap<String, Session>), String> {
+pub fn feed(fx: &Fixture) -> Result<(Vec<Event>, HashMap<String, Fake>), String> {
     let base = DateTime::parse_from_rfc3339(fx.base_time.as_deref().unwrap_or(DEFAULT_BASE)).map_err(|e| format!("bad base_time: {e}"))?.with_timezone(&Utc);
     let mut events = Vec::new();
     let mut sessions = HashMap::new();
     'servers: for srv in &fx.server {
-        let mut session = Session::new(&srv.name, session_config(srv));
+        let mut history: HashMap<String, Vec<Message>> = HashMap::new();
+        for h in &srv.history {
+            history.entry(h.target.to_ascii_lowercase()).or_default().extend(history_lines(h)?);
+        }
+        for lines in history.values_mut() {
+            lines.sort_by_key(time_of);
+        }
+        let mut session = Fake { session: Session::new(&srv.name, session_config(srv)), history };
         session.start(); // its sends go nowhere
         // Through `handle`, so no private API is needed.
         let caps: Vec<String> = srv
@@ -289,6 +441,8 @@ pub fn feed(fx: &Fixture) -> Result<(Vec<Event>, HashMap<String, Session>), Stri
             .then(|| "echo-message".to_owned())
             .into_iter()
             .chain(srv.multiline.iter().map(|v| format!("batch message-tags draft/multiline={v}")))
+            .chain(srv.chathistory.then(|| "batch message-tags server-time labeled-response draft/chathistory draft/event-playback".to_owned()))
+            .chain(srv.read_marker.then(|| "draft/read-marker".to_owned()))
             .collect();
         if !caps.is_empty() {
             let ls = caps.join(" ");
@@ -354,7 +508,7 @@ fn fake_replies(sent: &Message, nick: &str, echo_message: bool, now: DateTime<Ut
 /// the server's replies to them (`fake_replies`) go back through the
 /// session, so on an `echo-message` session the PRIVMSG/NOTICE echo is the
 /// copy the UI shows.
-fn answer(session: &mut Session, cmd: Command, now: DateTime<Utc>, echoes: &mut u64) -> (Vec<Event>, bool) {
+fn answer(session: &mut Fake, cmd: Command, now: DateTime<Utc>, echoes: &mut u64) -> (Vec<Event>, bool) {
     let network = cmd.network().to_owned();
     let mut events = Vec::new();
     for out in session.command(cmd, now) {
@@ -362,7 +516,12 @@ fn answer(session: &mut Session, cmd: Command, now: DateTime<Utc>, echoes: &mut 
             Output::Event(e) => events.push(e),
             Output::Send(sent) => {
                 *echoes += 1;
-                for reply in fake_replies(&sent, session.nick(), session.caps().is_enabled("echo-message"), now, *echoes) {
+                let replies = if sent.command == "CHATHISTORY" {
+                    fake_history(&sent, &session.history)
+                } else {
+                    fake_replies(&sent, session.nick(), session.caps().is_enabled("echo-message"), now, *echoes)
+                };
+                for reply in replies {
                     if take(session, &network, reply, now, &mut events) {
                         return (events, true);
                     }
@@ -383,10 +542,17 @@ fn is_echo(e: &Event) -> bool {
     matches!(e, Event::Line { line, .. } if line.own && line.msgid.as_deref().is_some_and(|m| m.starts_with("echo-")))
 }
 
+/// What `delay:` holds back: the fake server's echo of a message we sent,
+/// and its history pages, so a shot can show a line waiting for its echo
+/// or "loading older messages".
+fn held(e: &Event) -> bool {
+    is_echo(e) || matches!(e, Event::History { .. })
+}
+
 /// One UI command, for both command loops (window thread, offscreen task).
 /// A network whose connection ended loses its session, so later commands to
 /// it go nowhere, as conn.rs drops them until /reconnect.
-fn serve(sessions: &mut HashMap<String, Session>, cmd: Command, now: DateTime<Utc>, echoes: &mut u64) -> Vec<Event> {
+fn serve(sessions: &mut HashMap<String, Fake>, cmd: Command, now: DateTime<Utc>, echoes: &mut u64) -> Vec<Event> {
     let network = cmd.network().to_owned();
     let Some(session) = sessions.get_mut(&network) else { return Vec::new() };
     let (events, over) = answer(session, cmd, now, echoes);
@@ -401,7 +567,7 @@ pub struct Plan {
     fixture: Fixture,
     script: Vec<Step>,
     shot: Option<String>,
-    canned: Option<(Vec<Event>, HashMap<String, Session>)>,
+    canned: Option<(Vec<Event>, HashMap<String, Fake>)>,
     /// Set once the feeder has sent every canned event.
     fed: Arc<AtomicBool>,
     pub offscreen: bool,
@@ -493,7 +659,7 @@ impl Plan {
             fed.store(true, Ordering::SeqCst);
             let mut echoes = 0;
             while let Some(cmd) = cmd_rx.blocking_recv() {
-                let (later, now): (Vec<Event>, Vec<Event>) = serve(&mut sessions, cmd, clock, &mut echoes).into_iter().partition(is_echo);
+                let (later, now): (Vec<Event>, Vec<Event>) = serve(&mut sessions, cmd, clock, &mut echoes).into_iter().partition(held);
                 for e in now {
                     let _ = ev_tx.send(e);
                 }
@@ -738,7 +904,7 @@ fn offscreen(mut plan: Plan, init: Init) -> Result<(), String> {
             cx.spawn(async move |cx| {
                 let mut echoes = 0;
                 while let Some(cmd) = cmd_rx.recv().await {
-                    let (later, now): (Vec<Event>, Vec<Event>) = serve(&mut sessions, cmd, clock, &mut echoes).into_iter().partition(is_echo);
+                    let (later, now): (Vec<Event>, Vec<Event>) = serve(&mut sessions, cmd, clock, &mut echoes).into_iter().partition(held);
                     for e in now {
                         let _ = ev_tx.send(e);
                     }
@@ -819,8 +985,72 @@ mod tests {
     use super::*;
     use hirc_core::event::Target;
     use hirc_core::store::LineKind;
+    use hirc_core::store::Store;
 
     const DEMO: &str = include_str!("../fixtures/demo.toml");
+    const HISTORY: &str = include_str!("../fixtures/history.toml");
+
+    fn store_of(events: Vec<Event>) -> Store {
+        let mut store = Store::new(["demo".to_string()]);
+        for e in events {
+            store.apply(e);
+        }
+        store
+    }
+
+    #[test]
+    fn the_history_fixture_opens_on_its_latest_page_with_the_divider_at_the_marker() {
+        let (events, _) = feed(&parse_fixture(HISTORY).unwrap()).unwrap();
+        let mut store = store_of(events);
+        let b = store.buffer_ix(0, &Target::Channel("#general".into()));
+        let buf = &store.networks[0].buffers[b];
+        let old: Vec<&str> = buf.lines.iter().filter(|l| l.replayed).map(|l| l.text.as_str()).collect();
+        assert_eq!((old.len(), old[0], old[19]), (20, "older message 71", "older message 90"));
+        let ix = buf.first_unread().unwrap();
+        assert_eq!(buf.lines[ix].text, "older message 82");
+    }
+
+    #[test]
+    fn scrolling_up_the_history_fixture_pages_back_to_the_start() {
+        let (_, mut sessions) = feed(&parse_fixture(HISTORY).unwrap()).unwrap();
+        let mut n = 0;
+        let mut sizes = Vec::new();
+        loop {
+            let events = serve(&mut sessions, Command::Older { network: "demo".into(), target: "#general".into() }, Utc::now(), &mut n);
+            let [Event::History { lines, start, .. }] = events.as_slice() else { panic!("{events:?}") };
+            sizes.push(lines.len());
+            if *start {
+                break;
+            }
+            assert!(sizes.len() < 10, "{sizes:?}");
+        }
+        assert_eq!(sizes, [20, 20, 20, 10, 0]);
+    }
+
+    #[test]
+    fn replayed_events_in_the_history_fixture_are_event_lines() {
+        let (events, _) = feed(&parse_fixture(HISTORY).unwrap()).unwrap();
+        let mut store = store_of(events);
+        let b = store.buffer_ix(0, &Target::Channel("#design".into()));
+        let kinds: Vec<LineKind> = store.networks[0].buffers[b].lines.iter().filter(|l| l.replayed).map(|l| l.kind).collect();
+        for k in [LineKind::Join, LineKind::Nick, LineKind::Part, LineKind::Privmsg] {
+            assert!(kinds.contains(&k), "{k:?} not in {kinds:?}");
+        }
+    }
+
+    #[test]
+    fn the_fake_server_answers_after_and_targets() {
+        let h = FixtureHistory { target: "#a".into(), start: "2026-01-01T10:00:00Z".into(), count: 5, nicks: vec![], events: false };
+        let history = HashMap::from([("#a".to_owned(), history_lines(&h).unwrap())]);
+        let ask = |line: &str| fake_history(&Message::parse(line).unwrap(), &history);
+        let texts = |ms: Vec<Message>| ms.iter().filter(|m| m.command == "PRIVMSG").map(|m| m.params[1].clone()).collect::<Vec<_>>();
+        assert_eq!(texts(ask("CHATHISTORY AFTER #a msgid=h-a-3 10")), ["older message 4", "older message 5"]);
+        assert_eq!(texts(ask("CHATHISTORY AFTER #a timestamp=2026-01-01T10:03:00.000Z 10")), ["older message 5"]);
+        assert_eq!(texts(ask("CHATHISTORY BEFORE #a msgid=h-a-3 1")), ["older message 2"]);
+        let reply = ask("@label=hl9 CHATHISTORY TARGETS timestamp=2026-01-01T00:00:00.000Z timestamp=2026-01-02T00:00:00.000Z 10");
+        assert_eq!(reply.len(), 2);
+        assert_eq!((reply[0].tag("label"), reply[0].params[1].as_str()), (Some("hl9"), history::TARGETS_BATCH));
+    }
 
     #[test]
     fn script_steps_parse() {

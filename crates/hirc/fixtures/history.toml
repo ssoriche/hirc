@@ -1,0 +1,43 @@
+# Invented history for `snapshot` runs (see src/snapshot.rs and README.md).
+# No real nicks, servers or channels belong here.
+#
+# #general has 90 older messages on the fake server, a minute apart from
+# 10:15, and its read marker is at 11:35 ("older message 81"), so the
+# divider sits above "older message 82". Pages are 20 lines (the config's
+# size; the server allows 50), so scrolling up loads 20, 20, 20 and 10 lines,
+# then says "start of history". #design's history has joins, parts and
+# nick changes among its lines.
+base_time = "2026-01-01T12:00:00Z"
+
+[[server]]
+name = "demo"
+nick = "me"
+echo_message = true
+chathistory = true
+read_marker = true
+history_page_size = 20
+lines = [
+  ":irc.example 001 me :Welcome to the Demo network",
+  ":irc.example 005 me CHANTYPES=# PREFIX=(ov)@+ NETWORK=Demo CHATHISTORY=50 :are supported by this server",
+  ":irc.example 376 me :End of /MOTD command.",
+  ":me!u@h JOIN #general",
+  ":irc.example 353 me = #general :me alice bob",
+  ":irc.example 366 me #general :End of /NAMES list.",
+  ":irc.example MARKREAD #general timestamp=2026-01-01T11:35:00.000Z",
+  ":me!u@h JOIN #design",
+  ":irc.example 353 me = #design :me erin frank",
+  ":irc.example 366 me #design :End of /NAMES list.",
+  "@time=2026-01-01T12:00:05.000Z;msgid=live1 :alice!a@h PRIVMSG #general :back to the present",
+]
+
+[[server.history]]
+target = "#general"
+start = "2026-01-01T10:15:00Z"
+count = 90
+
+[[server.history]]
+target = "#design"
+start = "2026-01-01T11:00:00Z"
+count = 30
+nicks = ["erin", "frank"]
+events = true
