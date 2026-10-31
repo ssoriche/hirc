@@ -2,7 +2,7 @@
 //! task connects, feeds lines through its `Session`, sends events to the
 //! UI, and reconnects with backoff. The UI never waits on any of it.
 
-use crate::cache::Shared;
+use crate::cache::{Reach, Shared};
 use crate::config::{self, Config, ConfigError, Sasl, Server};
 use crate::event::{Command, ConnStatus, Event, Target};
 use crate::history::{self, Anchor, Book};
@@ -155,7 +155,10 @@ fn note(text: String) -> Line {
 /// channels (one joined last time but not configured isn't rejoined, so its
 /// window would stay dead). The book learns what they hold, both ends, so
 /// the server is asked only for what is newer; and where discovery got to.
+/// A network that can't serve history (turned off, or it had none last
+/// time) opens on the cache's lines past breaks: they are all there is.
 fn seed(name: &str, server: &Server, cache: &Shared, book: &mut Book) -> Vec<Event> {
+    let reach = if !server.chathistory || matches!(cache.read(|c| c.history(name)), Ok(Some(false))) { Reach::All } else { Reach::ToBreak };
     match cache.read(|c| c.discovered(name)) {
         Ok(Some(t)) => book.set_discovered(t),
         Ok(None) => {}
@@ -172,7 +175,7 @@ fn seed(name: &str, server: &Server, cache: &Shared, book: &mut Book) -> Vec<Eve
     };
     let mut out = Vec::new();
     for (target, query) in targets.into_iter().filter(|(t, q)| if *q { !services::is_service(t) } else { configured(t) }) {
-        let lines = match cache.read(|c| c.latest(name, &target, page)) {
+        let lines = match cache.read(|c| c.latest_in(name, &target, page, reach)) {
             Ok(lines) if !lines.is_empty() => lines,
             Ok(_) => continue,
             Err(e) => {
@@ -193,12 +196,15 @@ fn seed(name: &str, server: &Server, cache: &Shared, book: &mut Book) -> Vec<Eve
 /// oldest shown that follow on from it, then the server's. Where the cache
 /// stops at a break, or runs short, the server is asked for what is before
 /// the cache's oldest at once: the lines between are never skipped.
+/// Without server history the cache is read past its breaks, and the
+/// session says "start" only once the cache has nothing older.
 fn older(session: &mut Session, cache: Option<&Shared>, network: &str, cmd: Command) -> Vec<Output> {
     if let (Some(cache), Command::Older { target, .. }) = (cache, &cmd)
         && let Some(anchor) = session.book().oldest(target).and_then(|a| a.msgid.clone())
     {
         let page = session.page();
-        match cache.read(|c| c.before(network, target, &anchor, page)) {
+        let reach = if session.history_off() { Reach::All } else { Reach::ToBreak };
+        match cache.read(|c| c.before(network, target, &anchor, page, reach)) {
             Ok(older) if !older.lines.is_empty() => {
                 let more = older.broke || older.lines.len() < page;
                 let mut out = session.cached(target, older.lines);
@@ -438,6 +444,10 @@ async fn connect_once(
                     Output::Event(e) => {
                         if matches!(e, Event::Status { status: ConnStatus::Connected { .. }, .. }) {
                             *registered = true;
+                            // For the next start's seed: read past breaks?
+                            if let Some(cache) = &carry.cache {
+                                cache.write_history(name, !session.history_off());
+                            }
                         }
                         match &e {
                             Event::Joined { channel, .. } if !carry.rejoin.iter().any(|c| c.eq_ignore_ascii_case(channel)) => {
@@ -619,6 +629,39 @@ mod tests {
         assert!(matches!(out.as_slice(), [Output::Event(Event::History { lines, start: true, .. })] if lines.is_empty()), "{out:?}");
     }
 
+    #[test]
+    fn without_server_history_the_cache_reads_past_its_breaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let chan = || Target::Channel("#a".into());
+        // Two connections' worth: c3 is a break.
+        let cache = cache_with(&dir, vec![(chan(), vec![line("c1", 1), line("c2", 2)]), (chan(), vec![line("c3", 3), line("c4", 4)])]);
+        let texts = |lines: &[Line]| lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>();
+        let seeded = |server: &Server, book: &mut Book| match seed("net", server, &cache, book).as_slice() {
+            [Event::History { lines, .. }] => texts(lines),
+            e => panic!("{e:?}"),
+        };
+        let page3 = Server { channels: vec!["#a".into()], history_page_size: Some(3), ..Server::default() };
+        // History off: the cache is all there is, breaks and all.
+        let off = Server { chathistory: false, ..page3.clone() };
+        let mut book = Book::default();
+        assert_eq!(seeded(&off, &mut book), ["c2", "c3", "c4"]);
+        let mut s = Session::new("net", SessionConfig { chathistory: false, history_page: Some(3), ..SessionConfig::default() }).with_book(book);
+        let got: Vec<(Vec<String>, bool)> = histories(&older_of(&mut s, &cache, "#a")).into_iter().map(|(_, l, start)| (texts(&l), start)).collect();
+        // Then the start: there is truly nothing older.
+        assert_eq!(got, [(vec!["c1".to_owned()], false), (vec![], true)]);
+        // History on, the same cache: the break stops it, and the server is asked.
+        let mut book = Book::default();
+        assert_eq!(seeded(&page3, &mut book), ["c3", "c4"]);
+        let mut s = historied("", 3, book).keeping();
+        let out = older_of(&mut s, &cache, "#a");
+        assert!(histories(&out).is_empty(), "{out:?}");
+        assert_eq!(asked(&out).0, "CHATHISTORY BEFORE #a msgid=c3 3");
+        // A network last seen without history is read past its breaks too.
+        cache.write_history("net", false);
+        assert!(cache.flush());
+        assert_eq!(seeded(&page3, &mut Book::default()), ["c2", "c3", "c4"]);
+    }
+
     /// A page of `items` (msgid, minutes past 09:00) for `target` as batch
     /// `r`, answering `label` (none: nobody asked for it).
     fn batch(s: &mut Session, label: Option<&str>, r: &str, target: &str, items: &[(&str, u32)]) -> Vec<Output> {
@@ -770,6 +813,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Shared::open(&dir.path().join("history.db")).unwrap();
         let mut s = joined(&cache);
+        // Our JOIN (no msgid here) came before the latest page: a hole.
+        live(&mut s, "#test", "l0", 0);
         live(&mut s, "#test", "l1", 1);
         // A line with no msgid to keep it by (ours, without echo-message, is one).
         feed(&mut s, ":carol!c@h PRIVMSG #test :no msgid on this one");
@@ -778,7 +823,7 @@ mod tests {
         feed(&mut s, ":srv CAP alice DEL :echo-message");
         s.command(Command::Say { network: "net".into(), target: "#test".into(), text: "hi".into() }, now());
         live(&mut s, "#test", "l3", 3);
-        let want = [("l1", Below::Joins("o9".into())), ("l2", Below::Breaks), ("l3", Below::Breaks)];
+        let want = [("l0", Below::Breaks), ("l1", Below::Joins("l0".into())), ("l2", Below::Breaks), ("l3", Below::Breaks)];
         assert_eq!(kept_ids(&mut s), want.map(|(id, b)| (vec![id.to_owned()], b)));
     }
 

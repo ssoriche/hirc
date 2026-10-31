@@ -43,6 +43,11 @@ CREATE TABLE IF NOT EXISTS meta (
     network    TEXT PRIMARY KEY,
     discovered INTEGER
 );
+-- Whether the network's last connection could serve history.
+CREATE TABLE IF NOT EXISTS networks (
+    network TEXT PRIMARY KEY,
+    history INTEGER NOT NULL
+);
 ";
 
 const KINDS: [(LineKind, &str); 13] = [
@@ -137,6 +142,16 @@ pub enum Above {
     Leave,
 }
 
+/// How far a read goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reach {
+    /// Down to the first break: the server fills in what is past it.
+    ToBreak,
+    /// Past breaks: for a network that can't serve history, the cache is
+    /// all the history there is. The breaks stay, for when it can.
+    All,
+}
+
 /// Lines from `Cache::before`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Older {
@@ -188,7 +203,17 @@ impl Cache {
         }
         if version == 1 {
             // Every line already held stays as it was: following on.
-            db.execute_batch(&format!("BEGIN; ALTER TABLE lines ADD COLUMN brk INTEGER NOT NULL DEFAULT 0; PRAGMA user_version = {VERSION}; COMMIT;"))?;
+            // Version 1 kept no breaks, and could have holes: what is held
+            // is taken as following on, but not what came before it.
+            db.execute_batch(&format!(
+                "BEGIN;
+                 ALTER TABLE lines ADD COLUMN brk INTEGER NOT NULL DEFAULT 0;
+                 UPDATE lines SET brk = 1 WHERE rowid IN (
+                     SELECT (SELECT i.rowid FROM lines i WHERE i.network = o.network AND i.target = o.target ORDER BY i.time, i.rowid LIMIT 1)
+                     FROM lines o GROUP BY o.network, o.target);
+                 PRAGMA user_version = {VERSION};
+                 COMMIT;"
+            ))?;
         }
         db.execute_batch(SCHEMA)?;
         db.query_row("SELECT count(brk) FROM lines", [], |_| Ok(()))?;
@@ -218,15 +243,21 @@ impl Cache {
     /// The newest `limit` lines of `target`, oldest first, down to the
     /// first break: they follow on from each other.
     pub fn latest(&self, network: &str, target: &str, limit: usize) -> Result<Vec<Line>, CacheError> {
-        Ok(self.query(network, &target.to_ascii_lowercase(), i64::MAX, i64::MIN, limit)?.lines)
+        self.latest_in(network, target, limit, Reach::ToBreak)
+    }
+
+    /// `latest`, reading past breaks with `Reach::All`.
+    pub fn latest_in(&self, network: &str, target: &str, limit: usize, reach: Reach) -> Result<Vec<Line>, CacheError> {
+        Ok(self.query(network, &target.to_ascii_lowercase(), i64::MAX, i64::MIN, limit, reach)?.lines)
     }
 
     /// The `limit` lines of `target` just older than the line with
     /// `msgid`, oldest first, down to and including the first break, never
     /// past it. Lines sharing the anchor's time that were stored before it
     /// are older. An anchor that isn't held, or is a break itself, gives
-    /// nothing: the cache can't say what comes before it.
-    pub fn before(&self, network: &str, target: &str, msgid: &str, limit: usize) -> Result<Older, CacheError> {
+    /// nothing: the cache can't say what comes before it. With
+    /// `Reach::All`, breaks are read past (and never reported).
+    pub fn before(&self, network: &str, target: &str, msgid: &str, limit: usize, reach: Reach) -> Result<Older, CacheError> {
         let target = target.to_ascii_lowercase();
         let anchor = self
             .db
@@ -234,13 +265,13 @@ impl Cache {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?))
             })
             .optional()?;
-        match anchor {
-            Some((time, rowid, false)) => self.query(network, &target, time, rowid, limit),
+        match (anchor, reach) {
+            (Some((time, rowid, false)), _) | (Some((time, rowid, true)), Reach::All) => self.query(network, &target, time, rowid, limit, reach),
             _ => Ok(Older { lines: Vec::new(), broke: true }),
         }
     }
 
-    fn query(&self, network: &str, target: &str, time: i64, rowid: i64, limit: usize) -> Result<Older, CacheError> {
+    fn query(&self, network: &str, target: &str, time: i64, rowid: i64, limit: usize, reach: Reach) -> Result<Older, CacheError> {
         let mut st = self.db.prepare_cached(
             "SELECT msgid, time, kind, nick, text, own, brk FROM lines WHERE network = ?1 AND target = ?2 AND (time < ?3 OR (time = ?3 AND rowid < ?4)) ORDER BY time DESC, rowid DESC LIMIT ?5",
         )?;
@@ -254,7 +285,7 @@ impl Cache {
             if let (Some(time), Some(kind)) = (DateTime::from_timestamp_millis(ms), kind_of(&kind)) {
                 out.lines.push(Line { seq: 0, time, msgid: Some(msgid), kind, nick, text, own, delivery: Delivery::Sent, boundary: false, replayed: true });
             }
-            if brk {
+            if brk && reach == Reach::ToBreak {
                 out.broke = true;
                 break;
             }
@@ -278,6 +309,20 @@ impl Cache {
     pub fn discovered(&self, network: &str) -> Result<Option<DateTime<Utc>>, CacheError> {
         let ms: Option<Option<i64>> = self.db.query_row("SELECT discovered FROM meta WHERE network = ?1", params![network], |r| r.get(0)).optional()?;
         Ok(ms.flatten().and_then(DateTime::from_timestamp_millis))
+    }
+
+    /// Whether `network`'s last connection could serve history, if it has
+    /// ever connected.
+    pub fn history(&self, network: &str) -> Result<Option<bool>, CacheError> {
+        Ok(self.db.query_row("SELECT history FROM networks WHERE network = ?1", params![network], |r| r.get(0)).optional()?)
+    }
+
+    pub fn set_history(&mut self, network: &str, history: bool) -> Result<(), CacheError> {
+        self.db.execute(
+            "INSERT INTO networks (network, history) VALUES (?1, ?2) ON CONFLICT (network) DO UPDATE SET history = excluded.history",
+            params![network, history],
+        )?;
+        Ok(())
     }
 
     pub fn set_discovered(&mut self, network: &str, time: DateTime<Utc>) -> Result<(), CacheError> {
@@ -431,6 +476,7 @@ fn kind_of(name: &str) -> Option<LineKind> {
 enum Job {
     Put(Entry),
     Discovered(String, DateTime<Utc>),
+    History(String, bool),
     /// Answered once every job before it is written.
     Flush(mpsc::Sender<bool>),
 }
@@ -458,11 +504,13 @@ impl Shared {
                 // Everything queued so far goes in one transaction.
                 let mut puts = Vec::new();
                 let mut marks = Vec::new();
+                let mut histories = Vec::new();
                 let mut done = Vec::new();
                 for job in std::iter::once(job).chain(rx.try_iter()) {
                     match job {
                         Job::Put(e) => puts.push(e),
                         Job::Discovered(n, t) => marks.push((n, t)),
+                        Job::History(n, h) => histories.push((n, h)),
                         Job::Flush(tx) => done.push(tx),
                     }
                 }
@@ -495,6 +543,12 @@ impl Shared {
                             ok = false;
                         }
                     }
+                    for (network, history) in histories {
+                        if let Err(e) = c.set_history(&network, history) {
+                            tracing::warn!("history cache: {e}");
+                            ok = false;
+                        }
+                    }
                 }
                 failed |= !ok;
                 if !done.is_empty() {
@@ -519,6 +573,11 @@ impl Shared {
     /// Queue the time up to which discovery is complete for `network`.
     pub fn write_discovered(&self, network: &str, time: DateTime<Utc>) {
         let _ = self.jobs.send(Job::Discovered(network.to_owned(), time));
+    }
+
+    /// Queue whether `network` can serve history now.
+    pub fn write_history(&self, network: &str, history: bool) {
+        let _ = self.jobs.send(Job::History(network.to_owned(), history));
     }
 
     /// Wait until everything queued so far is written. True if it all
@@ -608,9 +667,9 @@ mod tests {
         assert_eq!(got[1].kind, LineKind::Action);
         // Strictly before: the anchor itself never comes back. The run's
         // oldest line is a break, so paging stops there.
-        let older = c.before("net", "#A", "m2", 10).unwrap();
+        let older = c.before("net", "#A", "m2", 10, Reach::ToBreak).unwrap();
         assert_eq!((texts(&older.lines), older.broke), (vec!["one"], true));
-        assert_eq!(c.before("net", "#a", "m1", 10).unwrap(), Older { lines: Vec::new(), broke: true });
+        assert_eq!(c.before("net", "#a", "m1", 10, Reach::ToBreak).unwrap(), Older { lines: Vec::new(), broke: true });
         assert!(c.latest("other", "#a", 10).unwrap().is_empty());
     }
 
@@ -719,11 +778,11 @@ mod tests {
         let mut page = c.latest("net", "#a", 1).unwrap();
         while let Some(l) = page.pop() {
             got.push(l.text.clone());
-            page = c.before("net", "#a", l.msgid.as_deref().unwrap(), 1).unwrap().lines;
+            page = c.before("net", "#a", l.msgid.as_deref().unwrap(), 1, Reach::ToBreak).unwrap().lines;
         }
         assert_eq!(got, ["d", "c", "b", "a"]);
         // An anchor the cache doesn't hold: it can't say what is before it.
-        assert_eq!(c.before("net", "#a", "nope", 10).unwrap(), Older { lines: Vec::new(), broke: true });
+        assert_eq!(c.before("net", "#a", "nope", 10, Reach::ToBreak).unwrap(), Older { lines: Vec::new(), broke: true });
     }
 
     #[test]
@@ -732,7 +791,7 @@ mod tests {
         let mut c = Cache::open(&dir.path().join(FILE)).unwrap();
         c.put(&[entry(chan("#a"), vec![line(Some("a"), 1, "a"), line(Some("b"), 1, "b"), line(Some("c"), 1, "c")])]).unwrap();
         // Ties go by stored order: c itself never comes back.
-        let got = c.before("net", "#a", "c", 10).unwrap();
+        let got = c.before("net", "#a", "c", 10, Reach::ToBreak).unwrap();
         assert_eq!(texts(&got.lines), ["a", "b"]);
     }
 
@@ -773,11 +832,11 @@ mod tests {
         c.put(&[Entry { below: Below::Joins("a1".into()), ..entry(chan("#a"), vec![line(Some("a4"), 4, "a4")]) }]).unwrap();
         assert_eq!([brk(&path, "a1"), brk(&path, "a2"), brk(&path, "a3"), brk(&path, "a4")], [true, false, false, true]);
         // Before a break: nothing the cache can vouch for.
-        assert_eq!(c.before("net", "#a", "a4", 10).unwrap(), Older { lines: Vec::new(), broke: true });
+        assert_eq!(c.before("net", "#a", "a4", 10, Reach::ToBreak).unwrap(), Older { lines: Vec::new(), broke: true });
         // Down to and including the first break, never past it.
-        let got = c.before("net", "#a", "a3", 10).unwrap();
+        let got = c.before("net", "#a", "a3", 10, Reach::ToBreak).unwrap();
         assert_eq!((texts(&got.lines), got.broke), (vec!["a1", "a2"], true));
-        let got = c.before("net", "#a", "a3", 1).unwrap();
+        let got = c.before("net", "#a", "a3", 1, Reach::ToBreak).unwrap();
         assert_eq!((texts(&got.lines), got.broke), (vec!["a2"], false));
         // The newest page stops at a break too.
         assert_eq!(texts(&c.latest("net", "#a", 10).unwrap()), ["a4"]);
@@ -811,6 +870,35 @@ mod tests {
     }
 
     #[test]
+    fn breaks_are_read_past_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Cache::open(&dir.path().join(FILE)).unwrap();
+        c.put(&[entry(chan("#a"), vec![line(Some("a1"), 1, "a1"), line(Some("a2"), 2, "a2")])]).unwrap();
+        c.put(&[entry(chan("#a"), vec![line(Some("a3"), 3, "a3"), line(Some("a4"), 4, "a4")])]).unwrap();
+        assert_eq!(texts(&c.latest_in("net", "#a", 10, Reach::ToBreak).unwrap()), ["a3", "a4"]);
+        assert_eq!(texts(&c.latest_in("net", "#a", 10, Reach::All).unwrap()), ["a1", "a2", "a3", "a4"]);
+        assert_eq!(c.before("net", "#a", "a3", 10, Reach::ToBreak).unwrap(), Older { lines: Vec::new(), broke: true });
+        let got = c.before("net", "#a", "a3", 10, Reach::All).unwrap();
+        assert_eq!((texts(&got.lines), got.broke), (vec!["a1", "a2"], false));
+        let got = c.before("net", "#a", "a4", 2, Reach::All).unwrap();
+        assert_eq!((texts(&got.lines), got.broke), (vec!["a2", "a3"], false));
+    }
+
+    #[test]
+    fn whether_a_network_has_history_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let shared = Shared::open(&path).unwrap();
+        assert_eq!(shared.read(|c| c.history("net")).unwrap(), None);
+        shared.write_history("net", false);
+        shared.write_history("other", true);
+        assert!(shared.flush());
+        drop(shared);
+        let c = Cache::open(&path).unwrap();
+        assert_eq!((c.history("net").unwrap(), c.history("other").unwrap()), (Some(false), Some(true)));
+    }
+
+    #[test]
     fn a_failed_batch_breaks_the_next_one_written() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
@@ -829,7 +917,7 @@ mod tests {
         assert!(shared.flush());
         assert!(brk(&path, "a4"));
         // So older lines are the server's to give.
-        assert_eq!(shared.read(|c| c.before("net", "#a", "a4", 10)).unwrap(), Older { lines: Vec::new(), broke: true });
+        assert_eq!(shared.read(|c| c.before("net", "#a", "a4", 10, Reach::ToBreak)).unwrap(), Older { lines: Vec::new(), broke: true });
         // Once one batch goes in, runs join again.
         shared.write(Entry { below: Below::Joins("a4".into()), ..entry(chan("#a"), vec![line(Some("a5"), 5, "a5")]) });
         assert!(shared.flush());
@@ -855,7 +943,8 @@ mod tests {
         }
         let c = Cache::open(&path).unwrap();
         assert_eq!(texts(&c.latest("net", "#a", 10).unwrap()), ["one", "two"]);
-        assert!(!brk(&path, "o1") && !brk(&path, "o2"));
+        // What came before can't be vouched for: its oldest is a break.
+        assert!(brk(&path, "o1") && !brk(&path, "o2"));
         let v: i64 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, VERSION);
         assert!(std::fs::read_dir(dir.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains(".bad-")));

@@ -148,10 +148,19 @@ pub struct Session {
     /// Runs of lines for the history cache, each saying how it meets what
     /// the cache holds; `None` when there is no cache.
     keep: Option<Vec<Entry>>,
-    /// Per lowercased target, the msgid of the newest line kept at the live
-    /// end, which the next live line follows on from. Gone when that isn't
-    /// known: a gap opened, or a line the cache can't keep was shown.
-    tail: HashMap<String, String>,
+    /// Per lowercased target, what the next live line follows on from in
+    /// the cache. Absent: not known (a gap opened, a new connection).
+    tail: HashMap<String, Tail>,
+}
+
+/// The live end of a target, as the cache holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Tail {
+    /// The newest line kept there.
+    At(String),
+    /// A line shown since then that the cache can't keep: the next one
+    /// kept doesn't follow on, whatever a page says later.
+    Hole,
 }
 
 /// A name in a TARGETS answer, and when it was last busy.
@@ -357,22 +366,31 @@ impl Session {
         let Some(name) = target.name() else { return };
         let key = name.to_ascii_lowercase();
         if let (true, Some(id)) = (cache::cacheable(target, line), &line.msgid) {
-            let below = self.tail.get(&key).cloned().map_or(Below::Breaks, Below::Joins);
+            let below = match self.tail.get(&key) {
+                Some(Tail::At(prev)) => Below::Joins(prev.clone()),
+                Some(Tail::Hole) | None => Below::Breaks,
+            };
             if let Some(keep) = &mut self.keep {
                 keep.push(Entry { network: self.network.clone(), target: target.clone(), lines: vec![line.clone()], below, above: Above::Leave });
             }
-            self.tail.insert(key, id.clone());
+            self.tail.insert(key, Tail::At(id.clone()));
         } else if line.msgid.is_none() && line.delivery == Delivery::Sent && !line.boundary {
-            self.tail.remove(&key);
+            self.tail.insert(key, Tail::Hole);
         }
     }
 
-    /// The live end of `target` is known to be `msgid`, unless it is
-    /// already.
+    /// The live end of `target` is `msgid`, unless something is known of
+    /// it already: a line kept since, or a hole, which a page never fills.
     fn tail_unless_known(&mut self, target: &str, msgid: Option<String>) {
         if let Some(id) = msgid {
-            self.tail.entry(target.to_ascii_lowercase()).or_insert(id);
+            self.tail.entry(target.to_ascii_lowercase()).or_insert(Tail::At(id));
         }
+    }
+
+    /// History can't come from this server: the user turned it off, or it
+    /// registered us without it. The cache is all the history there is.
+    pub fn history_off(&self) -> bool {
+        !self.cfg.chathistory || (self.reg == Reg::Done && !self.history_on())
     }
 
     /// What the server said it supports, as of this connection.
@@ -936,6 +954,11 @@ impl Session {
     /// start of history; full, after the newest, there is more to fetch;
     /// short, after the newest, the gap is closed.
     fn finish_page(&mut self, page: Page, cut: bool, out: &mut Vec<Output>) {
+        // Items past the cap were dropped, next to the anchor or the live
+        // end, so the page can't be said to join either. Cut off by the
+        // drop, a page after still holds the part next to its anchor.
+        let over = page.items > page.cap;
+        let partial = cut || over;
         let answered = self.answers(page.label.as_deref(), &page.target).and_then(|k| self.inflight.remove(&k).map(|i| (k, i)));
         let Some((key, Inflight { request, .. })) = answered else {
             self.widen_unsolicited(&page);
@@ -961,8 +984,8 @@ impl Session {
             self.book.reach(&request.target, query, first, last);
         }
         // How it meets what the cache holds: as it meets what is held here.
-        let (below, above) = match (&request.kind, cut) {
-            (Kind::After(a), _) => (a.msgid.clone().map_or(Below::Breaks, Below::Joins), Above::Breaks),
+        let (below, above) = match (&request.kind, partial) {
+            (Kind::After(a), _) if !over => (a.msgid.clone().map_or(Below::Breaks, Below::Joins), Above::Breaks),
             (Kind::Before(a), false) => (Below::Breaks, a.msgid.clone().map_or(Above::Breaks, Above::Joins)),
             _ => (Below::Breaks, Above::Breaks),
         };
@@ -981,14 +1004,16 @@ impl Session {
         let full = page.items >= request.limit;
         out.push(self.history_event(&request.target, page.lines, start));
         // The page reaches the live end: live lines follow on from it.
-        if matches!(request.kind, Kind::Latest) {
+        if matches!(request.kind, Kind::Latest) && !partial {
             self.tail_unless_known(&request.target, newest_kept.clone());
         }
         if let Kind::After(from) = &request.kind {
             match page.last.filter(|l| full && l != from) {
                 Some(last) => self.request(&request.target, Kind::After(last), out),
                 None if !full => {
-                    self.tail_unless_known(&request.target, newest_kept.or_else(|| from.msgid.clone()));
+                    if !partial {
+                        self.tail_unless_known(&request.target, newest_kept.or_else(|| from.msgid.clone()));
+                    }
                     self.close_gap(&key, &request.target);
                 }
                 // Full but no further on: the gap stays open for next time.
@@ -2216,6 +2241,60 @@ pub(crate) mod tests {
         // Without history nothing fills it: the line is held at once.
         let (s, _) = query_line_before_motd("message-tags server-time batch", line);
         assert_eq!(s.book().newest("bob").and_then(|a| a.msgid.as_deref()), Some("q1"));
+    }
+
+    fn say_without_echo(s: &mut Session) {
+        feed(s, ":srv CAP alice DEL :echo-message");
+        s.command(Command::Say { network: "net".into(), target: "#test".into(), text: "hi".into() }, now());
+    }
+
+    /// The live line l1, at 11:05, and how the cache is told it meets
+    /// what it holds.
+    fn l1_kept(s: &mut Session) -> Below {
+        feed(s, "@time=2026-10-22T11:05:00.000Z;msgid=l1 :bob!b@h PRIVMSG #test :l1");
+        let last = s.kept().pop().expect("l1 kept");
+        assert_eq!(last.lines[0].msgid.as_deref(), Some("l1"));
+        last.below
+    }
+
+    #[test]
+    fn a_hole_while_the_gap_fills_is_not_filled_in_by_the_page() {
+        let mut s = historied("", 2, held()).keeping();
+        let (_, label) = asked(&feed(&mut s, OUR_JOIN));
+        say_without_echo(&mut s);
+        page(&mut s, Some(&label), "a", &["m1"]);
+        assert_eq!(l1_kept(&mut s), Below::Breaks);
+    }
+
+    #[test]
+    fn a_hole_while_the_latest_page_comes_is_not_filled_in_by_it() {
+        let mut s = historied("", 2, Book::default()).keeping();
+        let (_, label) = asked(&older(&mut s, "#test"));
+        say_without_echo(&mut s);
+        page(&mut s, Some(&label), "a", &["m1"]);
+        assert_eq!(l1_kept(&mut s), Below::Breaks);
+        // Without the hole, the page is the live end.
+        let mut s = historied("", 2, Book::default()).keeping();
+        let (_, label) = asked(&older(&mut s, "#test"));
+        page(&mut s, Some(&label), "a", &["m1"]);
+        assert_eq!(l1_kept(&mut s), Below::Joins("m1".into()));
+    }
+
+    #[test]
+    fn a_page_past_its_cap_is_kept_as_cut_off() {
+        // The latest page, three items for a limit of two: what was dropped
+        // is next to the live end.
+        let mut s = historied("", 2, Book::default()).keeping();
+        let (_, label) = asked(&older(&mut s, "#test"));
+        page(&mut s, Some(&label), "a", &["m1", "m2", "m3"]);
+        assert_eq!(l1_kept(&mut s), Below::Breaks);
+        // A page after, past its cap: it can't be said to join either.
+        let mut s = historied("", 2, held()).keeping();
+        let (_, label) = asked(&feed(&mut s, OUR_JOIN));
+        s.kept();
+        page(&mut s, Some(&label), "a", &["m1", "m2", "m3"]);
+        let runs: Vec<(Below, Above)> = s.kept().into_iter().map(|e| (e.below, e.above)).collect();
+        assert_eq!(runs, [(Below::Breaks, Above::Breaks)]);
     }
 
     #[test]
