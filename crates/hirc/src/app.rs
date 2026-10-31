@@ -16,7 +16,8 @@ use gpui::{
 use hirc_core::command::{self, Input, WindowAction};
 use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::layout::{self, Layout};
-use hirc_core::store::{Applied, Buffer, LineKind, Network, Store};
+use hirc_core::services;
+use hirc_core::store::{Applied, Buffer, HistoryState, LineKind, Network, Store};
 use hirc_core::theme::Theme;
 use hirc_core::{display, multiline, split};
 use std::cell::{Cell, RefCell};
@@ -114,6 +115,21 @@ pub struct HircApp {
     nick_slots: HashMap<(usize, usize), (usize, HashMap<String, usize>)>,
     /// Lines arrived below while the view was scrolled up.
     fresh_below: bool,
+    /// The list was reset or took a page since it was last laid out: its
+    /// heights are stale for a frame (lines not measured yet read as
+    /// none), so whether the top shows or all of it fits waits a frame.
+    settling: bool,
+    /// All of the window fits in the view, as of the last settled frame.
+    fits: bool,
+    /// The scroll note took the bottom row last frame (the list was a
+    /// row shorter).
+    noted: bool,
+    /// The window whose last page of older lines came back empty without
+    /// reaching the start (the server gave up on it for this connection):
+    /// not asked again until the connection changes or the window is
+    /// left. Only an answer sets it, so a request lost with the
+    /// connection never stops the next one.
+    dry: Option<(usize, usize)>,
     /// The channel a /join asked for, by network name: its window is
     /// focused when the server confirms the join.
     pending_join: Option<(String, String)>,
@@ -165,6 +181,9 @@ impl HircApp {
             }
         }
         changed |= layout.sync(&store);
+        for cmd in reopen(&store) {
+            let _ = init.commands.send(cmd);
+        }
         if (missing || changed)
             && !init.no_layout_file
             && let Err(e) = layout.save(&layout_path)
@@ -261,6 +280,10 @@ impl HircApp {
             bar_extra: (0., 0.),
             nick_slots: HashMap::new(),
             fresh_below: false,
+            settling: true,
+            fits: false,
+            noted: false,
+            dry: None,
             pending_join: None,
             marker: None,
             press: Rc::default(),
@@ -304,6 +327,9 @@ impl HircApp {
         buf.mentions = 0;
         self.lines.reset(buf.lines.len());
         self.fresh_below = false;
+        self.settling = true;
+        self.fits = false;
+        self.dry = None;
         self.wheel.set(0.);
         self.reveal_selected();
         cx.notify();
@@ -522,6 +548,11 @@ impl HircApp {
             }
             _ => None,
         };
+        // A new connection (or none): what the server gave up on is asked again.
+        if matches!(ev, Event::Status { .. }) {
+            self.dry = None;
+        }
+        let loading = self.selected.is_some_and(|(n, b)| self.store.networks[n].buffers[b].history == HistoryState::Loading);
         match self.store.apply(ev) {
             Applied::Line { network, buffer, index } => self.arrived(network, buffer, index),
             Applied::Lines { network, at } => at.into_iter().for_each(|(buffer, index)| self.arrived(network, buffer, index)),
@@ -533,7 +564,17 @@ impl HircApp {
                     self.arrived(network, buffer, index);
                 }
             }
-            Applied::History { network, buffer, at } => self.history_arrived(network, buffer, at),
+            Applied::History { network, buffer, at } => {
+                if self.selected == Some((network, buffer)) {
+                    let now = self.store.networks[network].buffers[buffer].history;
+                    match page_dry(loading, now, at.len()) {
+                        Some(true) => self.dry = Some((network, buffer)),
+                        Some(false) => self.dry = None,
+                        None => {}
+                    }
+                }
+                self.history_arrived(network, buffer, at)
+            }
             // The divider follows the server's marker in Task 10.
             Applied::Read { .. } => {}
             Applied::Changed | Applied::Nothing => {}
@@ -567,12 +608,28 @@ impl HircApp {
         if self.selected != Some((n, b)) {
             return;
         }
+        self.settling |= !at.is_empty();
         for ix in at {
             self.lines.splice(ix..ix, 1);
         }
         let buf = &mut self.store.networks[n].buffers[b];
         buf.unread = 0;
         buf.mentions = 0;
+    }
+
+    /// The top of the window on screen is showing: ask for the page
+    /// before it, unless one is on its way or there is none.
+    fn want_older(&mut self, up: bool) {
+        let Some((n, b)) = self.selected else { return };
+        let net = &mut self.store.networks[n];
+        let status = &net.status;
+        let buf = &mut net.buffers[b];
+        if !older_ready(buf, up, status) {
+            return;
+        }
+        let Some(target) = buf.target.name().map(str::to_owned) else { return };
+        buf.history = HistoryState::Loading;
+        let _ = self.commands.send(Command::Older { network: net.name.clone(), target });
     }
 
     /// Show a local error line in the current buffer.
@@ -688,7 +745,10 @@ impl HircApp {
                 let _ = self.commands.send(cmd);
             }
             Ok(Input::OpenQuery { nick, text }) => {
-                let q = self.store.buffer_ix(n, &Target::Query(nick.clone()));
+                let (q, open) = open_query(&mut self.store, n, &nick);
+                if let Some(cmd) = open {
+                    let _ = self.commands.send(cmd);
+                }
                 self.sync_layout();
                 self.select(n, q, cx);
                 if let Some(text) = text {
@@ -917,7 +977,23 @@ impl Render for HircApp {
         // While scrolled, the `-- more --` line takes the bottom row of its
         // own (it never covers a line), and a wrapped tail at the top shows
         // whose message it is.
-        let more = (!following).then(|| buffer::more(self, self.lines_below(), at_top, self.fresh_below));
+        // Heights read before the list is laid out again are stale: wait a
+        // frame (and ask for one) before acting on them.
+        let settled = !std::mem::take(&mut self.settling);
+        if !settled {
+            window.request_animation_frame();
+        }
+        // All of it fits: its top shows too, and older lines are wanted.
+        if settled {
+            self.fits = fits(following, f32::from(self.lines.max_offset_for_scrollbar().y), self.noted, m.line);
+        }
+        let fits = self.fits;
+        let service = self.current().is_some_and(|(_, buf)| matches!(&buf.target, Target::Query(nick) if services::is_service(nick)));
+        let dry = self.selected.is_some() && self.dry == self.selected;
+        self.want_older(ask_older(settled, at_top, fits, service, dry));
+        let state = self.current().map_or(HistoryState::Idle, |(_, buf)| buf.history);
+        let more = scroll_note(following, at_top, fits, state).map(|top| buffer::more(self, self.lines_below(), top, self.fresh_below));
+        self.noted = more.is_some();
         let sticky = (!following)
             .then(|| self.cut_head())
             .flatten()
@@ -1032,6 +1108,88 @@ fn confirm(lines: usize, messages: usize, batches: bool) -> Option<String> {
     ask.then(|| format!("{lines} lines will be sent as {messages} messages — Enter to send, Esc to cancel"))
 }
 
+/// Whether to ask for older lines of `buf` now: `up` (its top is on
+/// screen, or all of it fits), nothing asked for yet and something left to
+/// get, on a live connection, in a channel we are in or a query.
+pub fn older_ready(buf: &Buffer, up: bool, status: &ConnStatus) -> bool {
+    let place = match &buf.target {
+        Target::Channel(_) => buf.joined,
+        Target::Query(_) => true,
+        Target::Server => false,
+    };
+    up && place && buf.history == HistoryState::Idle && matches!(status, ConnStatus::Connected { .. })
+}
+
+/// Does all of the window fit in the view? Only while following (scrolled
+/// up, it overflows). `max` is the list's scroll range as last laid out.
+/// With the note's row taken last frame (`noted`) the list was a row
+/// shorter, so a row over still fits, else the note would come and go.
+fn fits(following: bool, max: f32, noted: bool, line: f32) -> bool {
+    following && max <= if noted { line } else { 0. }
+}
+
+/// Ask for older lines this frame? Not while the list's heights are stale
+/// (`settled` false: reset, or a page went in, since it was laid out),
+/// nor in a window the server gave up on (`dry`). At its top, the user
+/// scrolled there and asks; a window that all fits asks on its own,
+/// except a services query, which is never brought up to date unasked.
+fn ask_older(settled: bool, at_top: bool, fits: bool, service: bool, dry: bool) -> bool {
+    settled && !dry && (at_top || (fits && !service))
+}
+
+/// The scroll row, if it shows, and what it says of the top (`None` while
+/// the top isn't on screen). Scrolled away from the newest line it always
+/// shows. A window that all fits (so following) shows it only while an
+/// older page is loading: never "start of history", which under the
+/// newest line would read as if the talk ended there.
+fn scroll_note(following: bool, at_top: bool, fits: bool, state: HistoryState) -> Option<Option<HistoryState>> {
+    if fits {
+        return (state == HistoryState::Loading).then_some(Some(HistoryState::Loading));
+    }
+    (!following).then(|| at_top.then_some(state))
+}
+
+/// What a page of history for the window on screen says of asking again:
+/// `Some(true)`, an older page asked for (`loading` before it) came back
+/// with nothing and not at the start, so the server has given up on it
+/// for now; `Some(false)`, lines came, ask freely; `None`, no change.
+fn page_dry(loading: bool, now: HistoryState, added: usize) -> Option<bool> {
+    if added > 0 {
+        Some(false)
+    } else if loading && now == HistoryState::Idle {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// The `Open` for each query window from last time, for the network side
+/// to bring up to date once connected (channels catch up as they are
+/// joined). Services queries are left out: never brought up to date
+/// unasked.
+fn reopen(store: &Store) -> Vec<Command> {
+    store
+        .networks
+        .iter()
+        .flat_map(|net| {
+            net.buffers.iter().filter_map(|buf| match &buf.target {
+                Target::Query(nick) if !services::is_service(nick) => Some(Command::Open { network: net.name.clone(), target: nick.clone() }),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+/// `/query nick` on network `n`: its window, and the `Open` that brings it
+/// up to date when the window is new (the user opened it, so a services
+/// query too).
+fn open_query(store: &mut Store, n: usize, nick: &str) -> (usize, Option<Command>) {
+    let before = store.networks[n].buffers.len();
+    let q = store.buffer_ix(n, &Target::Query(nick.to_owned()));
+    let open = (store.networks[n].buffers.len() > before).then(|| Command::Open { network: store.networks[n].name.clone(), target: nick.to_owned() });
+    (q, open)
+}
+
 /// "No window 30 (there are 6)."
 fn no_window(number: usize, count: usize) -> String {
     format!("No window {number} (there are {count})")
@@ -1052,6 +1210,131 @@ fn measure(window: &Window, font: &gpui::Font, size: f32) -> Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_lines_are_asked_for_only_when_they_can_come() {
+        use hirc_core::store::HistoryState;
+        let up = ConnStatus::Connected { nick: "me".into() };
+        let mut chan = Buffer::new(Target::Channel("#a".into()));
+        assert!(!older_ready(&chan, true, &up), "not joined");
+        chan.joined = true;
+        assert!(older_ready(&chan, true, &up));
+        assert!(!older_ready(&chan, false, &up), "not at the top");
+        assert!(!older_ready(&chan, true, &ConnStatus::Connecting));
+        chan.history = HistoryState::Loading;
+        assert!(!older_ready(&chan, true, &up), "one at a time");
+        chan.history = HistoryState::Start;
+        assert!(!older_ready(&chan, true, &up), "nothing older");
+        assert!(older_ready(&Buffer::new(Target::Query("bob".into())), true, &up));
+        assert!(!older_ready(&Buffer::new(Target::Server), true, &up));
+    }
+
+    #[test]
+    fn the_scroll_row_shows_where_it_should() {
+        use HistoryState::*;
+        // Following, overflowing: no row, whatever the state.
+        for s in [Idle, Loading, Start] {
+            assert_eq!(scroll_note(true, false, false, s), None);
+        }
+        // Scrolled up, top not on screen: the count alone.
+        assert_eq!(scroll_note(false, false, false, Start), Some(None));
+        // Scrolled up to the top of an overflowing window: every note.
+        for s in [Idle, Loading, Start] {
+            assert_eq!(scroll_note(false, true, false, s), Some(Some(s)));
+        }
+        // A window that fits: only while loading, never the start note.
+        assert_eq!(scroll_note(true, false, true, Loading), Some(Some(Loading)));
+        assert_eq!(scroll_note(true, false, true, Start), None);
+        assert_eq!(scroll_note(true, false, true, Idle), None);
+    }
+
+    #[test]
+    fn a_window_fits_only_while_following_and_the_note_row_is_slack() {
+        let line = 21.;
+        assert!(fits(true, 0., false, line));
+        assert!(!fits(true, 1., false, line));
+        // The note took a row: a row over still fits, more doesn't.
+        assert!(fits(true, line, true, line));
+        assert!(!fits(true, line + 1., true, line));
+        // Scrolled up, it overflows.
+        assert!(!fits(false, 0., false, line));
+    }
+
+    #[test]
+    fn older_lines_wait_for_a_laid_out_frame_and_the_user_for_services() {
+        // Stale heights after a reset or a page: no ask, even "at the top".
+        assert!(!ask_older(false, true, false, false, false));
+        assert!(!ask_older(false, false, true, false, false));
+        assert!(ask_older(true, true, false, false, false));
+        assert!(ask_older(true, false, true, false, false));
+        assert!(!ask_older(true, false, false, false, false));
+        // A services query that fits never asks; scrolled to its top it does.
+        assert!(!ask_older(true, false, true, true, false));
+        assert!(ask_older(true, true, false, true, false));
+        // The server gave up: not asked again.
+        assert!(!ask_older(true, true, false, false, true));
+        assert!(!ask_older(true, false, true, false, true));
+    }
+
+    #[test]
+    fn only_an_answered_empty_page_stops_asking() {
+        use HistoryState::*;
+        // Asked, answered with nothing, not the start: dry.
+        assert_eq!(page_dry(true, Idle, 0), Some(true));
+        // Lines came: ask freely (also clears an earlier dry).
+        assert_eq!(page_dry(true, Idle, 3), Some(false));
+        assert_eq!(page_dry(false, Idle, 2), Some(false));
+        // The start: `Start` stops asking, not dry.
+        assert_eq!(page_dry(true, Start, 0), None);
+        // An empty page nobody asked older for (a backfill): no change.
+        assert_eq!(page_dry(false, Idle, 0), None);
+    }
+
+    #[test]
+    fn a_request_lost_with_the_connection_is_asked_again() {
+        // The store puts a lost request back to Idle on the drop (no page),
+        // and `dry` is only ever set by an answered empty page: nothing
+        // remembers the lost request, so the next connection asks.
+        let up = ConnStatus::Connected { nick: "me".into() };
+        let mut store = Store::new(["net".to_owned()]);
+        let b = store.buffer_ix(0, &Target::Query("bob".into()));
+        store.networks[0].status = up.clone();
+        store.networks[0].buffers[b].history = HistoryState::Loading;
+        store.apply(Event::Status { network: "net".into(), status: ConnStatus::Connecting });
+        assert_eq!(store.networks[0].buffers[b].history, HistoryState::Idle);
+        store.apply(Event::Status { network: "net".into(), status: up.clone() });
+        let buf = &store.networks[0].buffers[b];
+        assert!(ask_older(true, false, true, false, false) && older_ready(buf, true, &up));
+    }
+
+    #[test]
+    fn new_lines_do_not_rearm_a_window_the_server_gave_up_on() {
+        // `dry` is per window, not per line count: lines arriving after the
+        // empty answer leave it set (only a page with lines, a new
+        // connection or leaving the window clear it).
+        assert_eq!(page_dry(false, HistoryState::Idle, 0), None);
+        assert!(!ask_older(true, false, true, false, true));
+    }
+
+    #[test]
+    fn query_windows_from_last_time_reopen_but_services() {
+        let mut store = Store::new(["net".to_owned()]);
+        for t in [Target::Query("bob".into()), Target::Query("NickServ".into()), Target::Channel("#a".into()), Target::Query("chanserv".into())] {
+            store.buffer_ix(0, &t);
+        }
+        assert_eq!(reopen(&store), [Command::Open { network: "net".into(), target: "bob".into() }]);
+    }
+
+    #[test]
+    fn query_opens_a_new_window_once() {
+        let mut store = Store::new(["net".to_owned()]);
+        let (q, open) = open_query(&mut store, 0, "bob");
+        assert_eq!(open, Some(Command::Open { network: "net".into(), target: "bob".into() }));
+        // Already open: no second Open (case-insensitively the same window).
+        assert_eq!(open_query(&mut store, 0, "Bob"), (q, None));
+        // The user opened it: a services query gets one too.
+        assert_eq!(open_query(&mut store, 0, "NickServ").1, Some(Command::Open { network: "net".into(), target: "NickServ".into() }));
+    }
 
     #[test]
     fn big_sends_ask_first() {

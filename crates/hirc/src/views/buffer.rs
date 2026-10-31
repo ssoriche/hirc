@@ -36,7 +36,7 @@ use gpui::{
 };
 use hirc_core::display::{self, Part};
 use hirc_core::event::{ConnStatus, Target};
-use hirc_core::store::{Delivery, Line, LineKind, Peer, Presence};
+use hirc_core::store::{Delivery, HistoryState, Line, LineKind, Peer, Presence};
 use std::collections::HashMap;
 
 /// The title bar, one field rhythm for every window: the window's
@@ -741,30 +741,58 @@ impl Render for Tip {
     }
 }
 
+/// What the scroll note says of the oldest line, once it shows: plain
+/// top of buffer, an older page on its way, or nothing older to get.
+/// Empty while the top isn't on screen.
+pub fn top_note(top: Option<HistoryState>) -> &'static str {
+    match top {
+        None => "",
+        Some(HistoryState::Idle) => "top of buffer",
+        Some(HistoryState::Loading) => "loading older messages",
+        Some(HistoryState::Start) => "start of history",
+    }
+}
+
 /// The bottom row while the view is scrolled away from the newest line,
 /// irssi's `-- more --`: how many lines are below, in the unit `j` and
 /// `k` step (a line of the grid: a message that wraps to three is three),
-/// and, once the oldest line shows, that this is the top of the buffer,
-/// inside the note after the count, so the count never moves. In the
-/// quiet role the sticky head shares; the count takes the unread colour
-/// once new lines have arrived below. The viewport gives it a row of its
-/// own.
-pub fn more(app: &HircApp, below: usize, top: bool, fresh: bool) -> AnyElement {
+/// and, once the oldest line shows, where history stands (`top_note`),
+/// after the count, so the count never moves. A window that all fits
+/// shows the row only to say an older page is loading (see
+/// `app::scroll_note`): there is nothing below to count. In the quiet role the sticky
+/// head shares; the count takes the unread colour once new lines have
+/// arrived below. The viewport gives it a row of its own: the note never
+/// takes a row at the top, which would move the lines.
+pub fn more(app: &HircApp, below: usize, top: Option<HistoryState>, fresh: bool) -> AnyElement {
     let p = &app.palette;
     let m = &app.metrics;
     let mut runs = Runs::default();
-    runs.push("-- more: ", p.quiet, false).push(&below.to_string(), if fresh { p.unread } else { p.quiet }, fresh).push(
-        if below == 1 { " line below" } else { " lines below" },
-        p.quiet,
-        false,
-    );
-    runs.push(if top { " · top of buffer --" } else { " --" }, p.quiet, false);
+    let note = top_note(top);
+    if below > 0 || top.is_none() {
+        runs.push("-- more: ", p.quiet, false).push(&below.to_string(), if fresh { p.unread } else { p.quiet }, fresh).push(
+            if below == 1 { " line below" } else { " lines below" },
+            p.quiet,
+            false,
+        );
+        runs.push(&if note.is_empty() { " --".to_owned() } else { format!(" · {note} --") }, p.quiet, false);
+    } else {
+        runs.push(&format!("-- {note} --"), p.quiet, false);
+    }
     div().w_full().h(px(m.line)).px(px(m.gutter)).child(runs.element()).into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scroll_note_says_where_history_stands() {
+        use hirc_core::store::HistoryState;
+        assert_eq!(top_note(None), "");
+        assert_eq!(top_note(Some(HistoryState::Idle)), "top of buffer");
+        assert_eq!(top_note(Some(HistoryState::Loading)), "loading older messages");
+        assert_eq!(top_note(Some(HistoryState::Start)), "start of history");
+    }
 
     #[test]
     fn long_nicks_end_in_an_ellipsis() {
