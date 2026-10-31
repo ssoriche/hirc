@@ -4,9 +4,10 @@
 # #general has 90 older messages on the fake server, a minute apart from
 # 10:15, and its read marker is at 11:35 ("older message 81"), so the
 # divider sits above "older message 82". Pages are 20 lines (the config's
-# size; the server allows 50), so scrolling up loads 20, 20, 20 and 10 lines,
-# then says "start of history". #design's history has joins, parts and
-# nick changes among its lines.
+# size; the server allows 50), so the server serves 20, 20, 20 and 10 lines
+# before it says "start of history". In the UI the window fits at first, so
+# it loads the first two of those on its own before the first scroll.
+# #design's history has joins, parts and nick changes among its lines.
 base_time = "2026-01-01T12:00:00Z"
 
 [[server]]
