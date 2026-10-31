@@ -9,6 +9,7 @@ use crate::theme::{self, Palette, palette};
 use crate::views::selection::{self, Mark, Selection};
 use crate::views::{buffer, sidebar, viewport};
 use crate::vim::{self, Effect, Ex, Nav, Scroll};
+use chrono::{DateTime, Utc};
 use gpui::{
     App, ClipboardItem, Context, Entity, Focusable, KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, ScrollHandle,
     SharedString, Window, actions, div, list, prelude::*, px,
@@ -137,6 +138,9 @@ pub struct HircApp {
     /// window and the first unread line's seq (a "new" rule is drawn
     /// above it until the window is left).
     marker: Option<(usize, usize, u64)>,
+    /// The read marker hirc last sent for each window: when the server
+    /// sends it back, the divider stays where it is.
+    sent_read: HashMap<(usize, usize), DateTime<Utc>>,
     /// Where the primary button last went down in the message view
     /// (logical px): a link opens only on a click, not at the end of a
     /// drag.
@@ -244,6 +248,9 @@ impl HircApp {
             }
         })
         .detach();
+        // Coming back to hirc may mark the window on screen read (see
+        // `marks_read`): draw again so that is looked at.
+        cx.observe_window_activation(window, |_, _, cx| cx.notify()).detach();
         let mut events = init.events;
         cx.spawn(async move |this, cx| {
             while let Some(ev) = events.recv().await {
@@ -286,6 +293,7 @@ impl HircApp {
             dry: None,
             pending_join: None,
             marker: None,
+            sent_read: HashMap::new(),
             press: Rc::default(),
             clicks: Rc::default(),
             spots: Rc::default(),
@@ -548,12 +556,11 @@ impl HircApp {
             }
             _ => None,
         };
-        // A new connection (or none): what the server gave up on is asked again.
-        if matches!(ev, Event::Status { .. }) {
-            self.dry = None;
+        let got = absorb(&mut self.store, self.selected, &mut self.sent_read, &mut self.dry, ev);
+        if let Some(cmd) = got.resend {
+            let _ = self.commands.send(cmd);
         }
-        let loading = self.selected.is_some_and(|(n, b)| self.store.networks[n].buffers[b].history == HistoryState::Loading);
-        match self.store.apply(ev) {
+        match got.applied {
             Applied::Line { network, buffer, index } => self.arrived(network, buffer, index),
             Applied::Lines { network, at } => at.into_iter().for_each(|(buffer, index)| self.arrived(network, buffer, index)),
             Applied::Replaced { network, buffer, removed, index } => {
@@ -564,19 +571,12 @@ impl HircApp {
                     self.arrived(network, buffer, index);
                 }
             }
-            Applied::History { network, buffer, at } => {
-                if self.selected == Some((network, buffer)) {
-                    let now = self.store.networks[network].buffers[buffer].history;
-                    match page_dry(loading, now, at.len()) {
-                        Some(true) => self.dry = Some((network, buffer)),
-                        Some(false) => self.dry = None,
-                        None => {}
-                    }
+            Applied::History { network, buffer, at } => self.history_arrived(network, buffer, at),
+            Applied::Read { network, buffer } => {
+                if let Some(seq) = got.divider {
+                    self.set_marker(network, buffer, seq);
                 }
-                self.history_arrived(network, buffer, at)
             }
-            // The divider follows the server's marker in Task 10.
-            Applied::Read { .. } => {}
             Applied::Changed | Applied::Nothing => {}
         }
         self.sync_layout();
@@ -612,6 +612,15 @@ impl HircApp {
         for ix in at {
             self.lines.splice(ix..ix, 1);
         }
+        // Lines past the read marker came with it, and there is no divider
+        // yet: it goes above the first of them.
+        let buf = &self.store.networks[n].buffers[b];
+        if self.marker.is_none()
+            && let Some(ix) = buf.first_unread()
+        {
+            let seq = buf.lines[ix].seq;
+            self.set_marker(n, b, Some(seq));
+        }
         let buf = &mut self.store.networks[n].buffers[b];
         buf.unread = 0;
         buf.mentions = 0;
@@ -632,6 +641,22 @@ impl HircApp {
         let _ = self.commands.send(Command::Older { network: net.name.clone(), target });
     }
 
+    /// Put the "new" divider of the window on screen above the line with
+    /// `seq` (or take it away), redrawing the rows it leaves and joins.
+    fn set_marker(&mut self, n: usize, b: usize, seq: Option<u64>) {
+        let old = self.marker.take().filter(|m| (m.0, m.1) == (n, b)).map(|m| m.2);
+        self.marker = seq.map(|s| (n, b, s));
+        if self.selected != Some((n, b)) {
+            return;
+        }
+        let lines = &self.store.networks[n].buffers[b].lines;
+        for s in [old, seq].into_iter().flatten() {
+            if let Some(ix) = lines.iter().position(|l| l.seq == s) {
+                self.lines.splice(ix..ix + 1, 1);
+            }
+        }
+    }
+
     /// Show a local error line in the current buffer.
     fn local_error(&mut self, n: usize, b: usize, msg: String) {
         let index = self.store.push_local(n, b, LineKind::Error, msg);
@@ -641,14 +666,11 @@ impl HircApp {
     /// The selected window has been answered: whatever the user sends
     /// there says they have read it, so its "new" rule goes.
     fn caught_up(&mut self) {
-        let Some((n, b, seq)) = self.marker else { return };
+        let Some((n, b, _)) = self.marker else { return };
         if self.selected != Some((n, b)) {
             return;
         }
-        self.marker = None;
-        if let Some(ix) = self.store.networks[n].buffers[b].lines.iter().position(|l| l.seq == seq) {
-            self.lines.splice(ix..ix + 1, 1);
-        }
+        self.set_marker(n, b, None);
     }
 
     /// Show hirc's own answer to a command (`-!-`, the client's voice, not
@@ -964,6 +986,9 @@ impl Render for HircApp {
         if following {
             self.fresh_below = false;
         }
+        if let Some(cmd) = read_command(&mut self.store, self.selected, &mut self.sent_read, window.is_window_active(), following) {
+            let _ = self.commands.send(cmd);
+        }
         // The input types on the message text column, and names its target.
         let column = m.text_column(cols);
         let placeholder = self.placeholder();
@@ -1120,6 +1145,155 @@ pub fn older_ready(buf: &Buffer, up: bool, status: &ConnStatus) -> bool {
     up && place && buf.history == HistoryState::Idle && matches!(status, ConnStatus::Connected { .. })
 }
 
+/// How far to tell the server a window on screen at its end is read: its
+/// newest line from the server. Only once the server has said where its
+/// marker is on this connection (so hirc never marks lines read before
+/// their divider has shown), and only when that moves the marker on.
+/// Never in a services query, which hirc leaves alone unasked.
+pub fn read_up_to(buf: &Buffer) -> Option<DateTime<Utc>> {
+    if !buf.read_synced || !markable(&buf.target) {
+        return None;
+    }
+    let newest = buf.lines.iter().rev().find(|l| l.msgid.is_some())?.time;
+    buf.read.is_none_or(|r| newest > r).then_some(newest)
+}
+
+/// Whether hirc ever tells the server how far `target` is read: a
+/// channel or a query, but never a services query, which hirc leaves
+/// alone unasked.
+fn markable(target: &Target) -> bool {
+    match target {
+        Target::Channel(_) => true,
+        Target::Query(nick) => !services::is_service(nick),
+        Target::Server => false,
+    }
+}
+
+/// The marker to send again when the server, on a new connection, says
+/// `server` for `buf` but hirc had read further (`buf.read`): a MARKREAD
+/// lost with the last socket. Never one behind the server's.
+fn read_behind(buf: &Buffer, server: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    if !buf.read_synced || !markable(&buf.target) {
+        return None;
+    }
+    buf.read.filter(|r| server.is_none_or(|s| *r > s))
+}
+
+/// The MARKREAD for the window on screen, if it may go now (`marks_read`)
+/// and moves the server's marker on (`read_up_to`). The store takes it at
+/// once and `sent` remembers it, so its echo leaves the divider alone.
+fn read_command(
+    store: &mut Store,
+    selected: Option<(usize, usize)>,
+    sent: &mut HashMap<(usize, usize), DateTime<Utc>>,
+    active: bool,
+    following: bool,
+) -> Option<Command> {
+    if !marks_read(active, following) {
+        return None;
+    }
+    let (n, b) = selected?;
+    let net = &store.networks[n];
+    let buf = &net.buffers[b];
+    let time = read_up_to(buf)?;
+    let target = buf.target.name()?.to_owned();
+    let network = net.name.clone();
+    store.mark_read(n, b, time);
+    sent.insert((n, b), time);
+    Some(Command::MarkRead { network, target, time })
+}
+
+/// What an event did, for the view to follow.
+struct Absorbed {
+    applied: Applied,
+    /// For `Applied::Read` on the window on screen: where its "new"
+    /// divider goes (see `divider_after_read`).
+    divider: Option<Option<u64>>,
+    /// A MARKREAD to send again (see `read_behind`).
+    resend: Option<Command>,
+}
+
+/// `on_event` up to the view: apply `ev` to the store and keep what hangs
+/// on it up to date. That covers whether the server gave up on older
+/// lines of the window on screen (`dry`), the window on screen having
+/// nothing unread once the server moves its marker, and a marker lost
+/// with the last connection going out again.
+fn absorb(
+    store: &mut Store,
+    selected: Option<(usize, usize)>,
+    sent: &mut HashMap<(usize, usize), DateTime<Utc>>,
+    dry: &mut Option<(usize, usize)>,
+    ev: Event,
+) -> Absorbed {
+    // A new connection (or none): what the server gave up on is asked again.
+    if matches!(ev, Event::Status { .. }) {
+        *dry = None;
+    }
+    let incoming = page_lines(&ev);
+    let server = match &ev {
+        Event::ReadMarker { time, .. } => Some(*time),
+        _ => None,
+    };
+    let loading = selected.is_some_and(|(n, b)| store.networks[n].buffers[b].history == HistoryState::Loading);
+    let applied = store.apply(ev);
+    let mut got = Absorbed { applied, divider: None, resend: None };
+    match got.applied {
+        Applied::History { network, buffer, .. } if selected == Some((network, buffer)) => {
+            match page_dry(loading, store.networks[network].buffers[buffer].history, incoming) {
+                Some(true) => *dry = Some((network, buffer)),
+                Some(false) => *dry = None,
+                None => {}
+            }
+        }
+        Applied::Read { network, buffer } => {
+            let net = &mut store.networks[network];
+            let buf = &mut net.buffers[buffer];
+            if let Some(server) = server
+                && let Some(time) = read_behind(buf, server)
+                && let Some(target) = buf.target.name()
+            {
+                sent.insert((network, buffer), time);
+                got.resend = Some(Command::MarkRead { network: net.name.clone(), target: target.to_owned(), time });
+            }
+            if selected == Some((network, buffer)) {
+                got.divider = divider_after_read(buf, sent.get(&(network, buffer)));
+                buf.unread = 0;
+                buf.mentions = 0;
+            }
+        }
+        _ => {}
+    }
+    got
+}
+
+/// May the window on screen be marked read now? Only while hirc is the
+/// active window (`active`) and the view is at its newest line
+/// (`following`): a marker sent otherwise would tell the user's other
+/// clients they read lines they never saw.
+fn marks_read(active: bool, following: bool) -> bool {
+    active && following
+}
+
+/// Where the "new" divider goes once the server has moved `buf`'s read
+/// marker: `Some(seq)` of the first line past it (`Some(None)`, none),
+/// or `None` to leave it, when the marker is the one hirc last sent
+/// (`sent`) coming back.
+fn divider_after_read(buf: &Buffer, sent: Option<&DateTime<Utc>>) -> Option<Option<u64>> {
+    if buf.read.is_some() && sent == buf.read.as_ref() {
+        return None;
+    }
+    Some(buf.first_unread().map(|ix| buf.lines[ix].seq))
+}
+
+/// How many lines a history page brought, before any already here were
+/// left out: what says whether the server still has some to give.
+fn page_lines(ev: &Event) -> usize {
+    match ev {
+        Event::History { lines, .. } => lines.len(),
+        _ => 0,
+    }
+}
+
 /// Does all of the window fit in the view? Only while following (scrolled
 /// up, it overflows). `max` is the list's scroll range as last laid out.
 /// With the note's row taken last frame (`noted`) the list was a row
@@ -1153,8 +1327,10 @@ fn scroll_note(following: bool, at_top: bool, fits: bool, state: HistoryState) -
 /// `Some(true)`, an older page asked for (`loading` before it) came back
 /// with nothing and not at the start, so the server has given up on it
 /// for now; `Some(false)`, lines came, ask freely; `None`, no change.
-fn page_dry(loading: bool, now: HistoryState, added: usize) -> Option<bool> {
-    if added > 0 {
+/// `sent` counts the page's lines as the server sent them: lines already
+/// here (a latest page repeating what came live) still say it has more.
+fn page_dry(loading: bool, now: HistoryState, sent: usize) -> Option<bool> {
+    if sent > 0 {
         Some(false)
     } else if loading && now == HistoryState::Idle {
         Some(true)
@@ -1334,6 +1510,195 @@ mod tests {
         assert_eq!(open_query(&mut store, 0, "Bob"), (q, None));
         // The user opened it: a services query gets one too.
         assert_eq!(open_query(&mut store, 0, "NickServ").1, Some(Command::Open { network: "net".into(), target: "NickServ".into() }));
+    }
+
+    fn at(s: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_800_000_000 + s, 0).unwrap()
+    }
+
+    fn said(s: i64, id: Option<&str>) -> hirc_core::store::Line {
+        use hirc_core::store::{Delivery, Line};
+        Line {
+            seq: 0,
+            time: at(s),
+            msgid: id.map(Into::into),
+            kind: LineKind::Privmsg,
+            nick: Some("bob".into()),
+            text: "x".into(),
+            own: false,
+            delivery: Delivery::Sent,
+            boundary: false,
+            replayed: false,
+        }
+    }
+
+    #[test]
+    fn the_server_hears_how_far_a_window_is_read_once_it_has_said() {
+        let mut s = Store::new(["n".to_string()]);
+        let chan = || Target::Channel("#a".into());
+        s.apply(Event::Line { network: "n".into(), target: chan(), line: said(1, Some("m1")) });
+        // Ours, still waiting for its echo: not the server's yet.
+        s.apply(Event::Line { network: "n".into(), target: chan(), line: said(2, None) });
+        let b = s.buffer_ix(0, &chan());
+        assert_eq!(read_up_to(&s.networks[0].buffers[b]), None, "the server hasn't said where its marker is");
+        s.apply(Event::ReadMarker { network: "n".into(), target: chan(), time: None });
+        assert_eq!(read_up_to(&s.networks[0].buffers[b]), Some(at(1)));
+        s.mark_read(0, b, at(1));
+        assert_eq!(read_up_to(&s.networks[0].buffers[b]), None, "already there");
+        assert_eq!(read_up_to(&s.networks[0].buffers[0]), None, "the server buffer has no marker");
+    }
+
+    #[test]
+    fn services_queries_are_never_marked_read() {
+        let mut s = Store::new(["n".to_string()]);
+        let q = || Target::Query("NickServ".into());
+        s.apply(Event::Line { network: "n".into(), target: q(), line: said(1, Some("m1")) });
+        s.apply(Event::ReadMarker { network: "n".into(), target: q(), time: None });
+        let b = s.buffer_ix(0, &q());
+        assert!(s.networks[0].buffers[b].read_synced);
+        assert_eq!(read_up_to(&s.networks[0].buffers[b]), None);
+    }
+
+    #[test]
+    fn a_window_is_marked_read_only_while_hirc_is_in_front_and_at_the_bottom() {
+        assert!(marks_read(true, true));
+        assert!(!marks_read(false, true), "hirc isn't focused: the user may not have seen it");
+        assert!(!marks_read(true, false), "scrolled up: the newest lines aren't on screen");
+        assert!(!marks_read(false, false));
+    }
+
+    #[test]
+    fn the_divider_follows_the_servers_marker_but_not_our_own() {
+        let mut s = Store::new(["n".to_string()]);
+        let chan = || Target::Channel("#a".into());
+        for (t, id) in [(1, "m1"), (2, "m2"), (3, "m3")] {
+            s.apply(Event::Line { network: "n".into(), target: chan(), line: said(t, Some(id)) });
+        }
+        let b = s.buffer_ix(0, &chan());
+        // Another client read up to m1: the divider goes above m2.
+        s.apply(Event::ReadMarker { network: "n".into(), target: chan(), time: Some(at(1)) });
+        let buf = &s.networks[0].buffers[b];
+        assert_eq!(divider_after_read(buf, None), Some(Some(buf.lines[1].seq)));
+        // Our own marker coming back leaves it where it is.
+        s.mark_read(0, b, at(3));
+        s.apply(Event::ReadMarker { network: "n".into(), target: chan(), time: Some(at(3)) });
+        let buf = &s.networks[0].buffers[b];
+        assert_eq!(divider_after_read(buf, Some(&at(3))), None);
+        // Read to the end elsewhere: no divider.
+        assert_eq!(divider_after_read(buf, Some(&at(2))), Some(None));
+    }
+
+    /// A store with `lines` said in `target` on network "n", and the
+    /// server's word on where its marker is.
+    fn with_lines(target: &Target, lines: &[(i64, &str)], marker: Option<i64>) -> (Store, usize) {
+        let mut s = Store::new(["n".to_string()]);
+        for &(t, id) in lines {
+            s.apply(Event::Line { network: "n".into(), target: target.clone(), line: said(t, Some(id)) });
+        }
+        s.apply(Event::ReadMarker { network: "n".into(), target: target.clone(), time: marker.map(at) });
+        let b = s.buffer_ix(0, target);
+        (s, b)
+    }
+
+    fn marker(target: &Target, time: Option<i64>) -> Event {
+        Event::ReadMarker { network: "n".into(), target: target.clone(), time: time.map(at) }
+    }
+
+    fn mark(target: &str, time: i64) -> Command {
+        Command::MarkRead { network: "n".into(), target: target.into(), time: at(time) }
+    }
+
+    #[test]
+    fn the_window_on_screen_is_marked_read_only_while_in_front_and_at_the_bottom() {
+        let chan = Target::Channel("#a".into());
+        let (mut s, b) = with_lines(&chan, &[(1, "m1"), (2, "m2")], None);
+        let mut sent = HashMap::new();
+        let on = Some((0, b));
+        assert_eq!(read_command(&mut s, on, &mut sent, false, true), None, "hirc isn't focused");
+        assert_eq!(read_command(&mut s, on, &mut sent, true, false), None, "scrolled up");
+        assert_eq!((s.networks[0].buffers[b].read, sent.len()), (None, 0), "nothing marked while held back");
+        // Back in front at the bottom: it goes now, once.
+        assert_eq!(read_command(&mut s, on, &mut sent, true, true), Some(mark("#a", 2)));
+        assert_eq!((s.networks[0].buffers[b].read, sent.get(&(0, b))), (Some(at(2)), Some(&at(2))));
+        assert_eq!(read_command(&mut s, on, &mut sent, true, true), None, "already there");
+        // Its echo is ours: the divider stays, nothing is sent again.
+        let got = absorb(&mut s, on, &mut sent, &mut None, marker(&chan, Some(2)));
+        assert_eq!((got.divider, got.resend), (None, None));
+    }
+
+    #[test]
+    fn a_marker_on_the_window_on_screen_leaves_nothing_unread() {
+        let q = Target::Query("bob".into());
+        let (mut s, b) = with_lines(&q, &[(1, "m1"), (2, "m2"), (3, "m3")], None);
+        let first_new = s.networks[0].buffers[b].lines[1].seq;
+        // Elsewhere: the counts follow the marker.
+        absorb(&mut s, None, &mut HashMap::new(), &mut None, marker(&q, Some(1)));
+        assert_eq!((s.networks[0].buffers[b].unread, s.networks[0].buffers[b].mentions), (2, 2));
+        // On screen: the divider moves above m2, and nothing is unread.
+        let got = absorb(&mut s, Some((0, b)), &mut HashMap::new(), &mut None, marker(&q, Some(1)));
+        assert_eq!(got.divider, Some(Some(first_new)));
+        assert_eq!((s.networks[0].buffers[b].unread, s.networks[0].buffers[b].mentions), (0, 0));
+    }
+
+    #[test]
+    fn whether_the_server_gave_up_follows_the_lines_it_sent() {
+        let chan = Target::Channel("#a".into());
+        let (mut s, b) = with_lines(&chan, &[(1, "m1")], None);
+        let on = Some((0, b));
+        let page = |lines| Event::History { network: "n".into(), target: chan.clone(), lines, start: false };
+        // Only lines already here: the server still has some.
+        s.networks[0].buffers[b].history = HistoryState::Loading;
+        let mut dry = None;
+        absorb(&mut s, on, &mut HashMap::new(), &mut dry, page(vec![said(1, Some("m1"))]));
+        assert_eq!(dry, None);
+        // Nothing at all: it gave up.
+        s.networks[0].buffers[b].history = HistoryState::Loading;
+        absorb(&mut s, on, &mut HashMap::new(), &mut dry, page(vec![]));
+        assert_eq!(dry, on);
+        // A new connection asks again.
+        absorb(&mut s, on, &mut HashMap::new(), &mut dry, Event::Status { network: "n".into(), status: ConnStatus::Connecting });
+        assert_eq!(dry, None);
+    }
+
+    #[test]
+    fn a_marker_lost_with_the_connection_is_sent_again() {
+        let chan = Target::Channel("#a".into());
+        let (mut s, b) = with_lines(&chan, &[(1, "m1"), (2, "m2")], Some(1));
+        let mut sent = HashMap::new();
+        assert_eq!(read_command(&mut s, Some((0, b)), &mut sent, true, true), Some(mark("#a", 2)));
+        // The socket went before the server had it: the next one says m1.
+        absorb(&mut s, None, &mut sent, &mut None, Event::Status { network: "n".into(), status: ConnStatus::Connecting });
+        let got = absorb(&mut s, None, &mut sent, &mut None, marker(&chan, Some(1)));
+        assert_eq!(got.resend, Some(mark("#a", 2)));
+        assert_eq!(sent.get(&(0, b)), Some(&at(2)));
+        // A server with none at all hears it too.
+        assert_eq!(absorb(&mut s, None, &mut sent, &mut None, marker(&chan, None)).resend, Some(mark("#a", 2)));
+        // Never backwards, and not when the server has ours.
+        assert_eq!(absorb(&mut s, None, &mut sent, &mut None, marker(&chan, Some(2))).resend, None);
+        assert_eq!(absorb(&mut s, None, &mut sent, &mut None, marker(&chan, Some(3))).resend, None);
+        assert_eq!(s.networks[0].buffers[b].read, Some(at(3)));
+        // Never for services.
+        let ns = Target::Query("NickServ".into());
+        let (mut s, b) = with_lines(&ns, &[(1, "m1"), (2, "m2")], Some(1));
+        s.mark_read(0, b, at(2));
+        assert_eq!(absorb(&mut s, None, &mut HashMap::new(), &mut None, marker(&ns, Some(1))).resend, None);
+    }
+
+    #[test]
+    fn a_page_that_only_repeats_lines_already_here_is_not_dry() {
+        let mut s = Store::new(["n".to_string()]);
+        let chan = || Target::Channel("#a".into());
+        s.apply(Event::Line { network: "n".into(), target: chan(), line: said(1, Some("m1")) });
+        let b = s.buffer_ix(0, &chan());
+        s.networks[0].buffers[b].history = HistoryState::Loading;
+        let page = Event::History { network: "n".into(), target: chan(), lines: vec![said(1, Some("m1"))], start: false };
+        let incoming = page_lines(&page);
+        let Applied::History { at, .. } = s.apply(page) else { panic!("not a page") };
+        assert!(at.is_empty(), "the line was already here");
+        assert_eq!(page_dry(true, s.networks[0].buffers[b].history, incoming), Some(false), "the server sent lines: it hasn't given up");
+        let empty = Event::History { network: "n".into(), target: chan(), lines: vec![], start: false };
+        assert_eq!(page_lines(&empty), 0);
+        assert_eq!(page_lines(&Event::OwnNick { network: "n".into(), nick: "me".into() }), 0);
     }
 
     #[test]
