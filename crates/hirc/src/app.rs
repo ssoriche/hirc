@@ -18,7 +18,7 @@ use hirc_core::command::{self, Input, WindowAction};
 use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::layout::{self, Layout};
 use hirc_core::services;
-use hirc_core::store::{Applied, Buffer, HistoryState, LineKind, Network, Store};
+use hirc_core::store::{Applied, Buffer, HistoryState, LineKind, Network, Store, counts};
 use hirc_core::theme::Theme;
 use hirc_core::{display, multiline, split};
 use std::cell::{Cell, RefCell};
@@ -557,7 +557,7 @@ impl HircApp {
             _ => None,
         };
         let got = absorb(&mut self.store, self.selected, &mut self.sent_read, &mut self.dry, ev);
-        if let Some(cmd) = got.resend {
+        for cmd in [got.resend, got.open].into_iter().flatten() {
             let _ = self.commands.send(cmd);
         }
         match got.applied {
@@ -1146,15 +1146,17 @@ pub fn older_ready(buf: &Buffer, up: bool, status: &ConnStatus) -> bool {
 }
 
 /// How far to tell the server a window on screen at its end is read: its
-/// newest line from the server. Only once the server has said where its
-/// marker is on this connection (so hirc never marks lines read before
-/// their divider has shown), and only when that moves the marker on.
-/// Never in a services query, which hirc leaves alone unasked.
+/// newest line from the server that someone else said (`counts`), never
+/// our own JOIN or other lines of ours. Only once the server has said
+/// where its marker is on this connection and the window's history for
+/// it is in (`filled`), so hirc never marks lines read before their
+/// divider has shown, and only when that moves the marker on. Never in a
+/// services query, which hirc leaves alone unasked.
 pub fn read_up_to(buf: &Buffer) -> Option<DateTime<Utc>> {
-    if !buf.read_synced || !markable(&buf.target) {
+    if !buf.read_synced || !buf.filled || !markable(&buf.target) {
         return None;
     }
-    let newest = buf.lines.iter().rev().find(|l| l.msgid.is_some())?.time;
+    let newest = buf.lines.iter().rev().find(|l| l.msgid.is_some() && counts(l))?.time;
     buf.read.is_none_or(|r| newest > r).then_some(newest)
 }
 
@@ -1211,6 +1213,8 @@ struct Absorbed {
     divider: Option<Option<u64>>,
     /// A MARKREAD to send again (see `read_behind`).
     resend: Option<Command>,
+    /// The `Open` for a query window a line just opened (see `opened`).
+    open: Option<Command>,
 }
 
 /// `on_event` up to the view: apply `ev` to the store and keep what hangs
@@ -1235,8 +1239,10 @@ fn absorb(
         _ => None,
     };
     let loading = selected.is_some_and(|(n, b)| store.networks[n].buffers[b].history == HistoryState::Loading);
+    let opened = opened(store, &ev);
     let applied = store.apply(ev);
-    let mut got = Absorbed { applied, divider: None, resend: None };
+    let open = opened.map(|(network, target)| Command::Open { network, target });
+    let mut got = Absorbed { applied, divider: None, resend: None, open };
     match got.applied {
         Applied::History { network, buffer, .. } if selected == Some((network, buffer)) => {
             match page_dry(loading, store.networks[network].buffers[buffer].history, incoming) {
@@ -1264,6 +1270,19 @@ fn absorb(
         _ => {}
     }
     got
+}
+
+/// The query `ev` would open: a line in a query window not there yet (a
+/// PM to us, or our own `/msg`). Its window needs an `Open`, as one
+/// `/query` opens does, so its history and read marker sync on this
+/// connection. Never a services query, which hirc leaves alone unasked.
+fn opened(store: &Store, ev: &Event) -> Option<(String, String)> {
+    let Event::Line { network, target: Target::Query(nick), .. } = ev else { return None };
+    if services::is_service(nick) {
+        return None;
+    }
+    let held = store.networks.iter().find(|n| n.name == *network).is_some_and(|n| n.buffers.iter().any(|b| b.target.same(&Target::Query(nick.clone()))));
+    (!held).then(|| (network.clone(), nick.clone()))
 }
 
 /// May the window on screen be marked read now? Only while hirc is the
@@ -1542,6 +1561,8 @@ mod tests {
         let b = s.buffer_ix(0, &chan());
         assert_eq!(read_up_to(&s.networks[0].buffers[b]), None, "the server hasn't said where its marker is");
         s.apply(Event::ReadMarker { network: "n".into(), target: chan(), time: None });
+        assert_eq!(read_up_to(&s.networks[0].buffers[b]), None, "its history isn't in yet");
+        s.apply(Event::Filled { network: "n".into(), target: chan() });
         assert_eq!(read_up_to(&s.networks[0].buffers[b]), Some(at(1)));
         s.mark_read(0, b, at(1));
         assert_eq!(read_up_to(&s.networks[0].buffers[b]), None, "already there");
@@ -1596,6 +1617,7 @@ mod tests {
             s.apply(Event::Line { network: "n".into(), target: target.clone(), line: said(t, Some(id)) });
         }
         s.apply(Event::ReadMarker { network: "n".into(), target: target.clone(), time: marker.map(at) });
+        s.apply(Event::Filled { network: "n".into(), target: target.clone() });
         let b = s.buffer_ix(0, target);
         (s, b)
     }
@@ -1682,6 +1704,54 @@ mod tests {
         let (mut s, b) = with_lines(&ns, &[(1, "m1"), (2, "m2")], Some(1));
         s.mark_read(0, b, at(2));
         assert_eq!(absorb(&mut s, None, &mut HashMap::new(), &mut None, marker(&ns, Some(1))).resend, None);
+    }
+
+    /// Back after a drop with #a on screen: the server says our JOIN (with
+    /// a msgid, stamped now) and its marker before the gap fill comes. No
+    /// marker goes out until the fill is in, and then only up to the
+    /// newest line someone said: the divider sits above what was missed.
+    #[test]
+    fn a_reconnect_marks_nothing_read_until_the_fill_is_in() {
+        use hirc_core::store::Line;
+        let chan = Target::Channel("#a".into());
+        let (mut s, b) = with_lines(&chan, &[(1, "m1")], Some(1));
+        let on = Some((0, b));
+        let mut sent = HashMap::new();
+        let status = |status| Event::Status { network: "n".into(), status };
+        absorb(&mut s, on, &mut sent, &mut None, status(ConnStatus::Connecting));
+        absorb(&mut s, on, &mut sent, &mut None, status(ConnStatus::Connected { nick: "me".into() }));
+        absorb(&mut s, on, &mut sent, &mut None, Event::Joined { network: "n".into(), channel: "#a".into() });
+        // Another device read up to m2.
+        absorb(&mut s, on, &mut sent, &mut None, marker(&chan, Some(2)));
+        let join = Line { kind: LineKind::Join, own: true, nick: Some("me".into()), ..said(10, Some("j1")) };
+        absorb(&mut s, on, &mut sent, &mut None, Event::Line { network: "n".into(), target: chan.clone(), line: join });
+        assert_eq!(read_command(&mut s, on, &mut sent, true, true), None, "the fill isn't in");
+        let missed = |t, id| Line { replayed: true, ..said(t, Some(id)) };
+        let page = Event::History { network: "n".into(), target: chan.clone(), lines: vec![missed(2, "m2"), missed(3, "m3")], start: false };
+        absorb(&mut s, on, &mut sent, &mut None, page);
+        let buf = &s.networks[0].buffers[b];
+        let ix = buf.first_unread().expect("m3 is new");
+        assert_eq!(buf.lines[ix].msgid.as_deref(), Some("m3"));
+        absorb(&mut s, on, &mut sent, &mut None, Event::Filled { network: "n".into(), target: chan.clone() });
+        assert_eq!(read_command(&mut s, on, &mut sent, true, true), Some(mark("#a", 3)), "up to m3, not our JOIN");
+    }
+
+    /// A query a line opens (bob's PM, or our `/msg carol`) is brought up
+    /// to date like one `/query` opens, so its marker syncs; never a
+    /// services query.
+    #[test]
+    fn a_query_a_line_opens_is_brought_up_to_date() {
+        use hirc_core::store::{Delivery, Line};
+        let mut s = Store::new(["n".to_string()]);
+        let mut line = |target: &str, line| {
+            absorb(&mut s, None, &mut HashMap::new(), &mut None, Event::Line { network: "n".into(), target: Target::Query(target.into()), line }).open
+        };
+        let open = |t: &str| Some(Command::Open { network: "n".into(), target: t.into() });
+        assert_eq!(line("bob", said(1, Some("p1"))), open("bob"));
+        assert_eq!(line("bob", said(2, Some("p2"))), None, "open already");
+        let ours = Line { own: true, delivery: Delivery::Pending, ..said(3, None) };
+        assert_eq!(line("carol", ours), open("carol"));
+        assert_eq!(line("NickServ", said(4, Some("n1"))), None);
     }
 
     #[test]
