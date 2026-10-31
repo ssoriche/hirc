@@ -187,6 +187,8 @@ async fn a_reconnect_fills_the_gap_without_duplicates_or_news() {
     bob.expect("JOIN").await;
     let (tx, mut rx) = net(alice(&ergo, "printf hunter22"));
     next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
+    // Take the join's own LATEST page first, so it can't be counted as gap fill.
+    page(&mut rx, "#test").await;
     bob.send("PRIVMSG #test :before the drop").await;
     next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "before the drop")).await;
 
