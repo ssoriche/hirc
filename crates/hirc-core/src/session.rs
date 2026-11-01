@@ -486,9 +486,15 @@ impl Session {
 
     pub fn handle(&mut self, msg: Message, now: DateTime<Utc>) -> Vec<Output> {
         let mut out = Vec::new();
-        let end_of_motd = matches!(msg.command.as_str(), "376" | "422");
+        // The burst ends at the MOTD's end, or, from a server that sends
+        // none (some bouncers), at its first PING or our first JOIN.
+        let burst_over = match msg.command.as_str() {
+            "376" | "422" | "PING" => true,
+            "JOIN" => msg.nick().is_some_and(|n| self.is_me(n)),
+            _ => false,
+        };
         self.dispatch(msg, now, &mut out);
-        if end_of_motd && self.reg == Reg::Done && !self.synced {
+        if burst_over && self.reg == Reg::Done && !self.synced {
             self.synced = true;
             self.sync(now, &mut out);
         }
@@ -2623,6 +2629,10 @@ pub(crate) mod tests {
         feed(&mut s, ":srv CAP * LS :server-time batch draft/chathistory");
         feed(&mut s, ":srv CAP alice ACK :server-time batch draft/chathistory");
         feed(&mut s, ":srv 001 alice :hi");
+        // The end of the MOTD asks TARGETS; answered, it is out of the way.
+        feed(&mut s, ":srv 376 alice :End of MOTD");
+        feed(&mut s, ":srv BATCH +t draft/chathistory-targets");
+        feed(&mut s, ":srv BATCH -t");
         let out = feed(&mut s, ":alice!a@h JOIN #test");
         assert_eq!(sent(&out), ["CHATHISTORY LATEST #test * 20"]);
         feed(&mut s, ":srv BATCH +e chathistory #test");
@@ -2934,6 +2944,21 @@ pub(crate) mod tests {
         feed(&mut s, ":srv 001 alice :hi");
         let out = feed(&mut s, ":srv 422 alice :MOTD File is missing");
         assert_eq!(sent(&out), ["CHATHISTORY TARGETS timestamp=2026-10-15T12:00:00.000Z timestamp=2026-10-22T13:00:00.000Z 100"]);
+    }
+
+    #[test]
+    fn a_server_that_sends_no_motd_end_syncs_at_its_first_other_line() {
+        // Some bouncers send neither 376 nor 422; registration still ends.
+        let mut s = Session::new("net", cfg());
+        s.start();
+        feed(&mut s, ":srv CAP * LS :batch server-time draft/chathistory");
+        feed(&mut s, ":srv CAP alice ACK :batch server-time draft/chathistory");
+        feed(&mut s, ":srv 001 alice :hi");
+        assert!(sent(&feed(&mut s, ":srv 005 alice CHANTYPES=# :are supported")).is_empty());
+        let out = feed(&mut s, ":alice!a@h JOIN #test");
+        assert!(sent(&out).contains(&"CHATHISTORY TARGETS timestamp=2026-10-15T12:00:00.000Z timestamp=2026-10-22T13:00:00.000Z 100".to_owned()), "{out:?}");
+        // Once synced, a late MOTD end changes nothing.
+        assert!(sent(&feed(&mut s, ":srv 376 alice :End of MOTD")).is_empty());
     }
 
     #[test]
