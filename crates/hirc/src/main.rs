@@ -48,8 +48,22 @@ fn quit(flush: Option<hirc_core::conn::Flush>, cx: &mut App) {
     .detach();
 }
 
+/// Logs go to stderr (fmt's own default is stdout), filtered by `RUST_LOG`
+/// as `fmt::init` filters them: `warn,hirc::wire=trace`, say.
+fn logging() {
+    use tracing_subscriber::{filter::Targets, prelude::*};
+    let targets = match std::env::var("RUST_LOG") {
+        Ok(var) => var.parse::<Targets>().unwrap_or_else(|e| {
+            eprintln!("Ignoring `RUST_LOG={var:?}`: {e}");
+            Targets::new()
+        }),
+        Err(_) => Targets::new().with_default(tracing::Level::INFO),
+    };
+    tracing_subscriber::fmt().with_writer(std::io::stderr).with_max_level(tracing::Level::TRACE).finish().with(targets).init();
+}
+
 fn main() {
-    tracing_subscriber::fmt::init();
+    logging();
     let dir = config::dir();
     let mut banner = None;
     let mut hint = None;

@@ -505,7 +505,7 @@ async fn connect_once(
                     pinged = false;
                     // What the server sent, never what we send: ours can
                     // hold PASS or AUTHENTICATE. Off unless RUST_LOG asks.
-                    tracing::trace!(target: "hirc::wire", "{name} <- {line}");
+                    tracing::trace!(target: "hirc::wire", "{name} <- {}", line.trim_end_matches(['\r', '\n']));
                     match Message::parse(&line) {
                         Ok(m) => outs = session.handle(m, Utc::now()),
                         Err(e) => tracing::debug!("{name}: dropped line ({e}): {line:?}"),
