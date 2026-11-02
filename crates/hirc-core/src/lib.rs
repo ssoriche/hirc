@@ -14,6 +14,7 @@ pub mod event;
 pub mod history;
 pub mod isupport;
 pub mod layout;
+pub mod msgid;
 pub mod multiline;
 pub mod playback;
 pub mod proto;

@@ -71,11 +71,13 @@ impl Anchor {
         Anchor { msgid: None, time: self.time }
     }
 
-    /// `msgid=...` when there is one, else `timestamp=...`.
+    /// `msgid=...` when there is a msgid the server gave, else
+    /// `timestamp=...`. A made-up id (`msgid::made_up`) is ours alone: the
+    /// server is asked by time.
     pub fn param(&self) -> String {
         match &self.msgid {
-            Some(id) => format!("msgid={id}"),
-            None => timestamp(self.time),
+            Some(id) if !crate::msgid::is_made_up(id) => format!("msgid={id}"),
+            _ => timestamp(self.time),
         }
     }
 }
@@ -260,6 +262,12 @@ mod tests {
         assert_eq!(wire(Kind::After(a.by_time())), "CHATHISTORY AFTER #test timestamp=2026-10-22T10:00:00.000Z 50");
         let targets = Kind::Targets { from: "2026-10-15T12:00:00Z".parse().unwrap(), to: "2026-10-22T13:00:00Z".parse().unwrap() };
         assert_eq!(wire(targets), "CHATHISTORY TARGETS timestamp=2026-10-15T12:00:00.000Z timestamp=2026-10-22T13:00:00.000Z 50");
+    }
+
+    #[test]
+    fn a_made_up_msgid_is_never_an_anchor_on_the_wire() {
+        let a = Anchor { msgid: Some("hirc:0123456789abcdef".into()), time: at(5) };
+        assert_eq!(a.param(), timestamp(at(5)));
     }
 
     #[test]

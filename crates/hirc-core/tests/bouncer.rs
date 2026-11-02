@@ -179,6 +179,34 @@ async fn znc_the_first_connect_replays_the_whole_buffer_as_history() {
     assert!(modules.is_empty(), "{modules:?}");
 }
 
+/// Spec, ZNC test 7, which decides decision 12. A live line and its
+/// replayed copy carry one time, to the millisecond, so they get one
+/// made-up id. ZNC passes Ergo's msgid on the live copy only (Facts row
+/// 6), so the made-up id replaces it (ruling Q1).
+#[tokio::test(flavor = "multi_thread")]
+async fn znc_a_live_line_and_its_replay_have_one_time() {
+    let ergo = Ergo::start();
+    let znc = Znc::start(&ergo);
+    wait_in_channel(&ergo, znc::USER, "#test").await;
+    let mut bob = join_bob(&ergo).await;
+    let (tx, mut rx) = net(via_znc(&znc));
+    joined(&mut rx, "#test").await;
+    bob.send("PRIVMSG #test :same line").await;
+    let live = next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "same line")).await;
+    tx.send(Command::Disconnect { network: "znc".into(), reason: None }).unwrap();
+    offline(&mut rx).await;
+    // A hirc that holds nothing asks ZNC for its whole buffer.
+    let (_tx, mut rx) = net(via_znc(&znc));
+    let replayed = next_matching(&mut rx, |e| match e {
+        Event::History { lines, .. } => lines.iter().find(|l| l.text == "same line").cloned(),
+        _ => None,
+    })
+    .await;
+    assert_eq!(replayed.time, live.time, "ZNC re-timed the line: decision 12's fallback applies");
+    assert!(live.msgid.as_deref().is_some_and(hirc_core::msgid::is_made_up), "{live:?}");
+    assert_eq!(replayed.msgid, live.msgid);
+}
+
 /// Records what ZNC 1.10.3 with playback really sends, for the unit
 /// tests to read. Facts the spec says to check:
 /// - the replay's batch type, and its brackets without batches

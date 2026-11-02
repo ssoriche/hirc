@@ -240,6 +240,21 @@ fn server_time(msg: &Message) -> Option<DateTime<Utc>> {
     msg.tag("time").and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map(|t| t.with_timezone(&Utc))
 }
 
+/// Nothing in `out` carries a made-up msgid to the server: not a
+/// CHATHISTORY or MARKREAD anchor, not a tag. Only those two commands'
+/// params are checked, because a PRIVMSG's text is the user's to say
+/// anything in.
+fn safe_to_send(out: &[Output]) -> bool {
+    out.iter().all(|o| match o {
+        Output::Send(m) => {
+            let anchors = matches!(m.command.as_str(), "CHATHISTORY" | "MARKREAD");
+            let anchor = anchors && m.params.iter().any(|p| p.strip_prefix("msgid=").is_some_and(crate::msgid::is_made_up));
+            !anchor && !m.tags.iter().any(|(_, v)| v.as_deref().is_some_and(crate::msgid::is_made_up))
+        }
+        _ => true,
+    })
+}
+
 // The event lines' words, shared by the live handlers and by replay, so a
 // replayed event reads as its live copy did.
 
@@ -515,6 +530,8 @@ impl Session {
             self.sync(now, &mut out);
         }
         self.note(&out);
+        // Never with `out` in the message: it can hold AUTHENTICATE.
+        debug_assert!(safe_to_send(&out), "a made-up msgid was about to go to the server");
         out
     }
 
@@ -1107,7 +1124,7 @@ impl Session {
             _ => return,
         };
         let line = self.line(msg, now, kind, Some(&who), text, own);
-        out.push(self.event_line(self.dest(target), line));
+        out.push(self.stamped(msg, self.dest(target), line));
     }
 
     /// A page is in (or `cut` off by the drop). It answers the request
@@ -1406,6 +1423,24 @@ impl Session {
         Output::Event(Event::Line { network: self.network.clone(), target, line })
     }
 
+    /// `line`, said by `msg` in `target`, as an event, with a msgid made up
+    /// from what it says (`msgid::made_up`) when that is the only way its
+    /// live and replayed copies get one key, so they are one line and it
+    /// can be cached:
+    /// - on a playback network (ZNC), always, the server's msgid replaced:
+    ///   ZNC passes it on live lines but replays without it (ruling Q1);
+    /// - else without chathistory, on a line the server gave none.
+    ///
+    /// Never in the server buffer, and never without server-time: our
+    /// clock differs between copies.
+    fn stamped(&self, msg: &Message, target: Target, mut line: Line) -> Output {
+        let wanted = self.playback_on() || (line.msgid.is_none() && !self.history_on());
+        if wanted && !matches!(target, Target::Server) && server_time(msg).is_some() {
+            line.msgid = Some(crate::msgid::made_up(&target, &line));
+        }
+        self.event_line(target, line)
+    }
+
     fn is_me(&self, nick: &str) -> bool {
         nick.eq_ignore_ascii_case(&self.nick)
     }
@@ -1501,7 +1536,7 @@ impl Session {
             (kind, nick, text) = (relayed, Some(name), rest);
         }
         let line = self.line(msg, now, kind, nick.as_deref(), text, own);
-        out.push(self.event_line(target, line));
+        out.push(self.stamped(msg, target, line));
     }
 
     fn members_of(&mut self, chan: &str) -> &mut HashSet<String> {
@@ -1519,7 +1554,7 @@ impl Session {
         self.members_of(&chan).insert(nick.to_ascii_lowercase());
         let me = self.is_me(&nick);
         let line = self.line(msg, now, LineKind::Join, Some(&nick), join_text(&nick), me);
-        out.push(self.event_line(Target::Channel(chan.clone()), line));
+        out.push(self.stamped(msg, Target::Channel(chan.clone()), line));
         if me {
             self.book.open(&chan, false);
             self.backfill(&chan, out);
@@ -1539,7 +1574,7 @@ impl Session {
         let (Some(nick), Some(chan)) = (msg.nick().map(str::to_owned), msg.params.first().cloned()) else { return };
         let text = part_text(&nick, msg.params.get(1).map(String::as_str));
         let line = self.line(msg, now, LineKind::Part, Some(&nick), text, self.is_me(&nick));
-        out.push(self.event_line(Target::Channel(chan.clone()), line));
+        out.push(self.stamped(msg, Target::Channel(chan.clone()), line));
         self.left(&chan, &nick, out);
     }
 
@@ -1551,7 +1586,7 @@ impl Session {
         // Worded from the one who leaves, as a part or a quit is, so the
         // `<--` always points at the first nick.
         let line = self.line(msg, now, LineKind::Kick, Some(&victim), text, self.is_me(&victim));
-        out.push(self.event_line(Target::Channel(chan.clone()), line));
+        out.push(self.stamped(msg, Target::Channel(chan.clone()), line));
         self.left(&chan, &victim, out);
     }
 
@@ -1573,7 +1608,7 @@ impl Session {
         for chan in self.channels_with(&nick) {
             self.members_of(&chan).remove(&nick.to_ascii_lowercase());
             let line = self.line(msg, now, LineKind::Quit, Some(&nick), text.clone(), false);
-            out.push(self.event_line(Target::Channel(chan), line));
+            out.push(self.stamped(msg, Target::Channel(chan), line));
         }
     }
 
@@ -1591,7 +1626,7 @@ impl Session {
             m.remove(&old.to_ascii_lowercase());
             m.insert(new.to_ascii_lowercase());
             let line = self.line(msg, now, LineKind::Nick, Some(&old), nick_text(&old, &new), own);
-            out.push(self.event_line(Target::Channel(chan), line));
+            out.push(self.stamped(msg, Target::Channel(chan), line));
         }
     }
 
@@ -1601,7 +1636,7 @@ impl Session {
         let by = msg.nick().unwrap_or("").to_owned();
         out.push(Output::Event(Event::Topic { network: self.network.clone(), channel: chan.clone(), topic: Some(topic.clone()).filter(|t| !t.is_empty()) }));
         let line = self.line(msg, now, LineKind::Topic, Some(&by), topic_text(&by, &topic), self.is_me(&by));
-        out.push(self.event_line(Target::Channel(chan), line));
+        out.push(self.stamped(msg, Target::Channel(chan), line));
     }
 
     fn on_names(&mut self, msg: &Message, out: &mut Vec<Output>) {
@@ -1620,13 +1655,17 @@ impl Session {
         let modes = msg.params[1..].join(" ");
         let (dest, own) = if self.isupport.is_channel(&target) { (Target::Channel(target), self.is_me(&by)) } else { (Target::Server, true) };
         let line = self.line(msg, now, LineKind::Mode, Some(&by), mode_text(&by, &modes), own);
-        out.push(self.event_line(dest, line));
+        out.push(self.stamped(msg, dest, line));
     }
 
     pub fn command(&mut self, cmd: Command, now: DateTime<Utc>) -> Vec<Output> {
+        // A raw line is the user's own: whatever it says goes.
+        let raw = matches!(cmd, Command::Raw { .. });
         let out = self.run(cmd, now);
         // Our own lines, too: one without a msgid is a hole in the cache.
         self.note(&out);
+        // Never with `out` in the message: it can hold AUTHENTICATE.
+        debug_assert!(raw || safe_to_send(&out), "a made-up msgid was about to go to the server");
         out
     }
 
@@ -3622,5 +3661,101 @@ pub(crate) mod tests {
         let out = answer_targets(&mut s, &out, &["bob 2026-10-15T12:00:00.000Z"]);
         assert_eq!(bare(&out), ["CHATHISTORY LATEST bob * 1"]);
         assert_eq!(s.book().discovered(), Some(week_back()));
+    }
+
+    #[test]
+    fn without_chathistory_a_timed_line_gets_a_made_up_msgid() {
+        let mut s = registered(ECHO);
+        let (t, l) = lines(&feed(&mut s, "@time=2026-10-22T10:00:00.250Z :bob!b@h PRIVMSG #test :hi")).remove(0);
+        let id = l.msgid.clone().expect("made up");
+        assert!(crate::msgid::is_made_up(&id), "{id}");
+        assert_eq!(id, crate::msgid::made_up(&t, &l));
+        // Untimed: our clock, which differs between copies, so no id.
+        assert_eq!(lines(&feed(&mut s, ":bob!b@h PRIVMSG #test :hi"))[0].1.msgid, None);
+        // The server's own msgid stays.
+        let srv = lines(&feed(&mut s, "@time=2026-10-22T10:00:00.250Z;msgid=srv1 :bob!b@h PRIVMSG #test :hi")).remove(0).1;
+        assert_eq!(srv.msgid.as_deref(), Some("srv1"));
+        // Never in the server buffer.
+        assert_eq!(lines(&feed(&mut s, "@time=2026-10-22T10:00:00.250Z :srv NOTICE alice :hello"))[0].1.msgid, None);
+        // Event lines too: a timed JOIN.
+        let join = lines(&feed(&mut s, "@time=2026-10-22T10:00:01.000Z :carol!c@h JOIN #test")).remove(0).1;
+        assert!(join.msgid.as_deref().is_some_and(crate::msgid::is_made_up));
+    }
+
+    #[test]
+    fn with_chathistory_nothing_is_made_up() {
+        let mut s = historied("", 50, Book::default());
+        let l = lines(&feed(&mut s, "@time=2026-10-22T10:00:00.250Z :bob!b@h PRIVMSG #test :hi")).remove(0).1;
+        assert_eq!(l.msgid, None);
+    }
+
+    #[test]
+    fn a_live_line_and_its_replay_are_one_line() {
+        let (mut s, _) = zncd(Book::default());
+        let live = feed(&mut s, "@time=2026-10-22T10:01:00.123Z :bob!b@h PRIVMSG #test :same");
+        feed(&mut s, ":irc.znc.in BATCH +p znc.in/playback #test");
+        feed(&mut s, "@batch=p;time=2026-10-22T10:01:00.123Z :bob!b@h PRIVMSG #test :same");
+        let replay = feed(&mut s, ":irc.znc.in BATCH -p");
+        assert_eq!(lines(&live)[0].1.msgid, histories(&replay)[0].1[0].msgid);
+        let mut store = crate::store::Store::new(["net".to_owned()]);
+        for o in live.into_iter().chain(replay) {
+            if let Output::Event(e) = o {
+                store.apply(e);
+            }
+        }
+        let b = store.buffer_ix(0, &Target::Channel("#test".into()));
+        assert_eq!(store.networks[0].buffers[b].lines.iter().filter(|l| l.text == "same").count(), 1);
+    }
+
+    /// Ruling Q1: ZNC passes the server's msgid on a live line, but its
+    /// replay carries none (Facts row 6). On a playback network the
+    /// made-up id always wins, so both copies get one key.
+    #[test]
+    fn on_znc_the_recorded_live_line_and_its_replay_are_one_line() {
+        let at = recorded_at();
+        let (mut s, _) = zncd_at(&format!("{ZNC} echo-message"), Book::default(), at);
+        let live: Vec<Output> = recorded(include_str!("../tests/data/znc-1.10.3-live.txt")).flat_map(|l| s.handle(Message::parse(l).unwrap(), at)).collect();
+        let id = lines(&live)[0].1.msgid.clone().expect("an id");
+        assert!(crate::msgid::is_made_up(&id), "the server's msgid was kept: {id}");
+        let replay: Vec<Output> =
+            recorded(include_str!("../tests/data/znc-1.10.3-play-after-live.txt")).flat_map(|l| s.handle(Message::parse(l).unwrap(), at)).collect();
+        let replayed: Vec<Line> = histories(&replay).into_iter().flat_map(|(_, l, _)| l).collect();
+        assert!(replayed.iter().all(|l| l.msgid.as_deref().is_some_and(crate::msgid::is_made_up)), "{replayed:?}");
+        assert_eq!(replayed.iter().find(|l| l.text == "fact live").and_then(|l| l.msgid.clone()), Some(id));
+        let mut store = crate::store::Store::new(["net".to_owned()]);
+        for o in live.into_iter().chain(replay) {
+            if let Output::Event(e) = o {
+                store.apply(e);
+            }
+        }
+        let b = store.buffer_ix(0, &Target::Channel("#test".into()));
+        assert_eq!(store.networks[0].buffers[b].lines.iter().filter(|l| l.text == "fact live").count(), 1);
+    }
+
+    #[test]
+    fn the_next_play_starts_at_the_newest_line_shown() {
+        let (mut s, _) = zncd(Book::default());
+        feed(&mut s, "@time=2026-10-22T10:05:30.500Z :bob!b@h PRIVMSG #test :last");
+        let (_, out) = zncd(s.take_book());
+        assert_eq!(plays(&out), ["PRIVMSG *playback :PLAY * 1792663530"]);
+    }
+
+    #[test]
+    fn made_up_ids_are_never_sent() {
+        let ask = Output::Send(Message::new("CHATHISTORY", ["AFTER", "#test", "msgid=hirc:0123456789abcdef", "5"]));
+        assert!(!safe_to_send(&[ask]));
+        let mark = Output::Send(Message::new("MARKREAD", ["#test", "msgid=hirc:0123456789abcdef"]));
+        assert!(!safe_to_send(&[mark]));
+        let tagged = Output::Send(Message { tags: vec![("+draft/reply".into(), Some("hirc:0123456789abcdef".into()))], ..Message::new("TAGMSG", ["#test"]) });
+        assert!(!safe_to_send(&[tagged]));
+        // Someone saying the words is not an id.
+        assert!(safe_to_send(&[Output::Send(Message::new("PRIVMSG", ["#test", "msgid=hirc:0123456789abcdef"]))]));
+        // A server's own id is fine.
+        assert!(safe_to_send(&[Output::Send(Message::new("CHATHISTORY", ["AFTER", "#test", "msgid=m1", "5"]))]));
+        // A book holding a made-up id asks by time instead.
+        let mut book = Book::default();
+        book.note("#test", false, &[Line { msgid: Some("hirc:0123456789abcdef".into()), time: "2026-10-22T10:00:00Z".parse().unwrap(), ..local_line() }]);
+        let mut s = historied("", 50, book);
+        assert_eq!(asked(&feed(&mut s, OUR_JOIN)).0, "CHATHISTORY AFTER #test timestamp=2026-10-22T10:00:00.000Z 20");
     }
 }

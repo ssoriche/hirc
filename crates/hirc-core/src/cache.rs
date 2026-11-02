@@ -471,7 +471,7 @@ fn tighten(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn kind_name(kind: LineKind) -> &'static str {
+pub(crate) fn kind_name(kind: LineKind) -> &'static str {
     KINDS.iter().find(|(k, _)| *k == kind).map_or("privmsg", |(_, n)| n)
 }
 
