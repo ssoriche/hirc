@@ -1596,15 +1596,21 @@ impl Session {
         let relay = from_user && !own && kind == LineKind::Privmsg && bridge::is_bridge(&self.cfg.bridges, from);
         // A bridge's multiline message whose lines aren't all one person's:
         // each line stands alone, unwrapped (or not) by itself. Their msgids
-        // stay distinct so the store keeps every line.
+        // stay distinct, and line `i` is timed `i` ms after the message,
+        // so two that say the same (a pasted `}`) aren't one line by what
+        // they say (`Buffer::insert`) or by a made-up id.
         if relay && text.contains('\n') && bridge::unwrap_lines(text).is_none() {
             let msgid = msg.tag("msgid").filter(|m| !m.is_empty()).map(str::to_owned);
+            let at = server_time(msg).unwrap_or(now);
             for (i, line) in text.split('\n').filter(|l| !l.is_empty()).enumerate() {
                 let mut one = Message { params: vec![to.clone(), line.to_owned()], ..msg.clone() };
                 if let Some(id) = msgid.as_deref().filter(|_| i > 0) {
                     one.tags.retain(|(k, _)| k != "msgid");
                     one.tags.push(("msgid".into(), Some(format!("{id}:{i}"))));
                 }
+                let time = at + chrono::Duration::milliseconds(i as i64);
+                one.tags.retain(|(k, _)| k != "time");
+                one.tags.push(("time".into(), Some(time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))));
                 self.on_message(&one, now, out);
             }
             return;
@@ -3356,6 +3362,27 @@ pub(crate) mod tests {
             ("IrcBot".into(), "bot words".into(), "b:2".into()),
         ];
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_split_bridged_message_keeps_its_repeated_lines() {
+        // A pasted block through a bridge: two lines say the same at the
+        // same time, and the store must keep both.
+        let mut s = multiline("max-bytes=4096");
+        s.cfg.bridges = vec!["IrcBot".into()];
+        let mut out = feed(&mut s, "@msgid=c;time=2026-10-22T10:00:00.000Z :IrcBot!b@h BATCH +c draft/multiline #test");
+        for t in ["<hacker> fn x() {", "<other> }", "<other> }"] {
+            out.extend(feed(&mut s, &format!("@batch=c :IrcBot!b@h PRIVMSG #test :{t}")));
+        }
+        out.extend(feed(&mut s, ":IrcBot!b@h BATCH -c"));
+        let mut store = crate::store::Store::new(["net".to_owned()]);
+        for o in out {
+            if let Output::Event(e) = o {
+                store.apply(e);
+            }
+        }
+        let b = store.buffer_ix(0, &Target::Channel("#test".into()));
+        assert_eq!(store.networks[0].buffers[b].lines.iter().filter(|l| l.text == "}").count(), 2);
     }
 
     #[test]
