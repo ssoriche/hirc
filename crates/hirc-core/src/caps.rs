@@ -29,7 +29,8 @@ pub const WANTED: CapGroups = &[
 /// `WANTED` for a server whose history is turned off (the config's
 /// `chathistory`): ZNC's playback cap stops ZNC's own replay on attach,
 /// and nothing would ask for it instead, so it isn't requested. ZNC then
-/// replays as it does for any client, shown live and never cached.
+/// replays as it does for any client, in its playback batches: shown as
+/// history (never as news), and never cached.
 pub const WITHOUT_PLAYBACK: CapGroups = WANTED.split_at(WANTED.len() - 1).0;
 
 #[derive(Debug)]

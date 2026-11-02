@@ -752,4 +752,8 @@ async fn soju_scrolling_up_reads_a_burst_in_one_millisecond_whole() {
     assert_eq!(said_in(&mut store, &chan), ["burst 2", "burst 3", "after 1", "after 2"]);
     scroll_to_the_top(&tx, &mut rx, &mut store, "soju", &chan).await;
     assert_eq!(said_in(&mut store, &chan), all);
+    // Else the test proves nothing: the burst must share one millisecond.
+    let b = store.buffer_ix(0, &chan);
+    let burst: Vec<_> = store.networks[0].buffers[b].lines.iter().filter(|l| l.text.starts_with("burst ")).map(|l| l.time).collect();
+    assert!(burst.len() == 3 && burst.iter().all(|t| *t == burst[0]), "the burst is not one millisecond: {burst:?}");
 }

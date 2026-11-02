@@ -1,6 +1,9 @@
 //! The lines the UI shows, per network and buffer. Lines stay sorted by
 //! server time (arrival order breaks ties), and a msgid seen twice is kept
-//! once, so a live copy and a replayed copy of a message collapse.
+//! once, so a live copy and a replayed copy of a message collapse. So is a
+//! line that says what one held says, at the same millisecond, under
+//! another msgid: a network whose history source changed (ZNC's made-up
+//! ids, then soju's or Ergo's own) gives one line two.
 
 use crate::event::{ConnStatus, Event, PeerChange, Target};
 use crate::multiline::Limits;
@@ -118,6 +121,9 @@ pub struct Buffer {
     pub filled: bool,
     pub history: HistoryState,
     msgids: HashSet<String>,
+    /// What each line with a msgid says (`msgid::made_up` of it: its time,
+    /// kind, nick and text), whatever its msgid.
+    said: HashSet<String>,
 }
 
 impl Buffer {
@@ -134,15 +140,23 @@ impl Buffer {
             filled: false,
             history: HistoryState::Idle,
             msgids: HashSet::new(),
+            said: HashSet::new(),
         }
     }
 
-    /// Where the line went, or `None` if we already have its msgid.
+    /// Where the line went, or `None` if we already have it: its msgid,
+    /// or (both with a msgid) a line that says the same at the same
+    /// millisecond. Two such lines from one nick become one (accepted, as
+    /// for made-up ids). A line without a msgid (ours, pending) is never
+    /// matched by what it says.
     pub fn insert(&mut self, line: Line) -> Option<usize> {
-        if let Some(id) = &line.msgid
-            && !self.msgids.insert(id.clone())
-        {
-            return None;
+        if let Some(id) = &line.msgid {
+            let said = crate::msgid::made_up(&self.target, &line);
+            if self.msgids.contains(id) || self.said.contains(&said) {
+                return None;
+            }
+            self.msgids.insert(id.clone());
+            self.said.insert(said);
         }
         let ix = self.lines.partition_point(|l| (l.time, l.seq) <= (line.time, line.seq));
         self.lines.insert(ix, line);
@@ -625,6 +639,28 @@ mod tests {
         assert_eq!(b.insert(line(1, 1, Some("x"), "one")), Some(0));
         assert_eq!(b.insert(line(2, 1, Some("x"), "again")), None);
         assert_eq!(b.lines.len(), 1);
+    }
+
+    #[test]
+    fn a_line_held_under_another_msgid_is_the_same_line() {
+        // A network whose history source changes: ZNC's replay (made-up
+        // ids), then soju's or Ergo's pages (their own), then ZNC again.
+        let chan = Target::Channel("#a".into());
+        let made_up = |l: Line| Line { msgid: Some(crate::msgid::made_up(&chan, &l)), ..l };
+        let mut s = Store::new(["net".to_string()]);
+        let page = |lines: Vec<Line>| Event::History { network: "net".into(), target: chan.clone(), lines, start: false, older: false };
+        s.apply(page(vec![made_up(line(0, 1, None, "one")), made_up(line(0, 2, None, "two"))]));
+        s.apply(page(vec![line(0, 1, Some("real1"), "one"), line(0, 2, Some("real2"), "two"), line(0, 3, Some("real3"), "three")]));
+        s.apply(page(vec![made_up(line(0, 2, None, "two")), made_up(line(0, 3, None, "three")), made_up(line(0, 4, None, "four"))]));
+        // And live, under the server's id again.
+        s.apply(Event::Line { network: "net".into(), target: chan.clone(), line: line(0, 4, Some("real4"), "four") });
+        let texts: Vec<_> = s.networks[0].buffers[1].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["one", "two", "three", "four"]);
+        // Said again later, or by another nick, or another kind: new lines.
+        let b = &mut s.networks[0].buffers[1];
+        assert!(b.insert(line(0, 5, Some("real5"), "four")).is_some());
+        assert!(b.insert(Line { nick: Some("carol".into()), ..line(0, 4, Some("real6"), "four") }).is_some());
+        assert!(b.insert(Line { kind: LineKind::Notice, ..line(0, 4, Some("real7"), "four") }).is_some());
     }
 
     #[test]

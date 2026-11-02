@@ -71,13 +71,18 @@ impl Anchor {
         Anchor { msgid: None, time: self.time }
     }
 
+    /// The msgid, when the server gave it. A made-up id (`msgid::made_up`)
+    /// is ours alone: no server knows it, and a page never holds it.
+    pub fn server_msgid(&self) -> Option<&str> {
+        self.msgid.as_deref().filter(|id| !crate::msgid::is_made_up(id))
+    }
+
     /// `msgid=...` when there is a msgid the server gave, else
-    /// `timestamp=...`. A made-up id (`msgid::made_up`) is ours alone: the
-    /// server is asked by time.
+    /// `timestamp=...`: for a made-up id the server is asked by time.
     pub fn param(&self) -> String {
-        match &self.msgid {
-            Some(id) if !crate::msgid::is_made_up(id) => format!("msgid={id}"),
-            _ => timestamp(self.time),
+        match self.server_msgid() {
+            Some(id) => format!("msgid={id}"),
+            None => timestamp(self.time),
         }
     }
 }

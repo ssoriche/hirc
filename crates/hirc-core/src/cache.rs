@@ -95,12 +95,14 @@ pub fn is_service(nick: &str) -> bool {
 
 /// Whether `line` in `target` goes in the cache: a message the server
 /// gave a msgid (so it can be matched with the server's copy), in a
-/// channel or a query that isn't with services.
+/// channel or a query that isn't with services. Every write is a run
+/// through `put`, which keeps only these, so this is the one gate. A
+/// services name never counts as a place, whatever it was taken for (a
+/// `*status` from a server with `*` in CHANTYPES).
 pub fn cacheable(target: &Target, line: &Line) -> bool {
     let place = match target {
         Target::Server => false,
-        Target::Channel(_) => true,
-        Target::Query(nick) => !is_service(nick),
+        Target::Channel(name) | Target::Query(name) => !is_service(name),
     };
     place && line.msgid.is_some() && line.delivery == Delivery::Sent && !line.boundary
 }
@@ -232,6 +234,8 @@ impl Cache {
     /// there (same msgid) is kept, but a run proves that each of its lines
     /// after the first follows on, so their breaks are healed. A run's
     /// oldest new line is a break unless it `Joins` (see `Below`, `Above`).
+    /// A line held under another msgid (the same time, kind, nick and
+    /// text) is skipped, and the next line after it is a break.
     /// Returns how many went in.
     pub fn put(&mut self, entries: &[Entry]) -> Result<usize, CacheError> {
         let tx = self.db.transaction()?;
@@ -367,16 +371,30 @@ fn put_run(db: &Connection, e: &Entry) -> Result<usize, CacheError> {
         None
     };
     let mut heal = db.prepare_cached("UPDATE lines SET brk = 0 WHERE network = ?1 AND target = ?2 AND msgid = ?3")?;
-    let (mut n, mut newest_is_new) = (0, false);
+    let mut held = db.prepare_cached("SELECT 1 FROM lines WHERE network = ?1 AND target = ?2 AND msgid = ?3")?;
+    // On the time index: the same line held under another msgid (made up
+    // on a network without chathistory, the server's own on one with).
+    let mut said = db.prepare_cached("SELECT 1 FROM lines WHERE network = ?1 AND target = ?2 AND time = ?3 AND kind = ?4 AND nick IS ?5 AND text = ?6")?;
+    let (mut n, mut newest_is_new, mut skipped) = (0, false, false);
     for (i, l) in lines.iter().enumerate() {
+        let ms = l.time.timestamp_millis();
+        // Skipped: the held copy is where it is, and what is around it is
+        // not known to be what is around this line (two lines can read the
+        // same), so no join is claimed across it: not at the held copy, and
+        // not at the next line that goes in.
+        if !held.exists(params![e.network, target, l.msgid])? && said.exists(params![e.network, target, ms, kind_name(l.kind), l.nick, l.text])? {
+            (skipped, newest_is_new) = (true, false);
+            continue;
+        }
         let rowid = below.map(|b| b + i64::try_from(i).unwrap_or(0));
-        let row = params![e.network, target, name, query, l.msgid, l.time.timestamp_millis(), kind_name(l.kind), l.nick, l.text, l.own, i == 0, rowid];
+        let row = params![e.network, target, name, query, l.msgid, ms, kind_name(l.kind), l.nick, l.text, l.own, i == 0 || skipped, rowid];
         let new = insert.execute(row)? == 1;
-        if !new && i > 0 {
+        if !new && i > 0 && !skipped {
             heal.execute(params![e.network, target, l.msgid])?;
         }
         n += usize::from(new);
         newest_is_new = new;
+        skipped = false;
     }
     if let Below::Joins(prev) = &e.below
         && neighbour(db, &e.network, &target, &oldest, false)?.as_ref() == Some(prev)
@@ -981,6 +999,95 @@ mod tests {
         c.put(&[entry(chan("#zed"), vec![line(Some("1"), 1, "x")]), entry(chan("#Zed"), vec![line(Some("2"), 2, "x")])]).unwrap();
         c.put(&[entry(chan("#ZED"), vec![line(Some("0"), 0, "x")])]).unwrap();
         assert_eq!(c.targets("net").unwrap(), [("#Zed".to_owned(), false)]);
+    }
+
+    #[test]
+    fn no_services_line_is_ever_kept_from_any_run() {
+        // Every write to the cache is a run through `put`: none of these
+        // targets' lines go in, however the run says it meets what is held.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Cache::open(&dir.path().join(FILE)).unwrap();
+        let names = ["NickServ", "BouncerServ", "bouncerserv@soju", "*status", "*controlpanel"];
+        let runs: Vec<Entry> = names
+            .iter()
+            .enumerate()
+            .flat_map(|(i, n)| {
+                let id = format!("s{i}");
+                let lines = vec![line(Some(&id), 1, "sasl set-plain alice soju-test-only")];
+                [
+                    entry(Target::Query((*n).into()), lines.clone()),
+                    Entry { below: Below::Joins("x".into()), above: Above::Joins("y".into()), older: true, ..entry(Target::Query((*n).into()), lines) },
+                ]
+            })
+            .collect();
+        assert_eq!(c.put(&runs).unwrap(), 0);
+        // Nor one taken for a channel.
+        assert_eq!(c.put(&[entry(chan("*status"), vec![line(Some("c"), 1, "x")])]).unwrap(), 0);
+        assert!(c.targets("net").unwrap().is_empty());
+    }
+
+    /// `l` under its made-up id in `target`, as a ZNC era of the network
+    /// cached it.
+    fn made_up(target: &Target, l: Line) -> Line {
+        Line { msgid: Some(crate::msgid::made_up(target, &l)), ..l }
+    }
+
+    fn rows(path: &Path) -> i64 {
+        Connection::open(path).unwrap().query_row("SELECT count(*) FROM lines", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_line_held_under_another_msgid_is_not_kept_twice() {
+        // The network's history source changes: ZNC (made-up ids), then
+        // soju or Ergo (theirs), then ZNC again.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let mut c = Cache::open(&path).unwrap();
+        let a = chan("#a");
+        assert_eq!(c.put(&[entry(a.clone(), vec![made_up(&a, line(None, 1, "one")), made_up(&a, line(None, 2, "two"))])]).unwrap(), 2);
+        let real = vec![line(Some("r1"), 1, "one"), line(Some("r2"), 2, "two"), line(Some("r3"), 3, "three")];
+        assert_eq!(c.put(&[Entry { older: true, ..entry(a.clone(), real) }]).unwrap(), 1);
+        let back = vec![made_up(&a, line(None, 2, "two")), made_up(&a, line(None, 3, "three")), made_up(&a, line(None, 4, "four"))];
+        assert_eq!(c.put(&[entry(a.clone(), back)]).unwrap(), 1);
+        assert_eq!(rows(&path), 4);
+        assert_eq!(texts(&c.latest_in("net", "#a", 10, Reach::All).unwrap()), ["one", "two", "three", "four"]);
+        // Another time, nick or kind is another line; so is another target.
+        let mut notice = line(Some("n"), 4, "four");
+        notice.kind = LineKind::Notice;
+        let carol = Line { nick: Some("carol".into()), ..line(Some("c"), 4, "four") };
+        assert_eq!(
+            c.put(&[entry(a.clone(), vec![line(Some("l"), 5, "four"), notice, carol]), entry(chan("#b"), vec![line(Some("b"), 4, "four")])]).unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn no_join_is_claimed_across_a_line_held_under_another_msgid() {
+        // `two` is held under its made-up id, an island. A run through it
+        // can't vouch for what lies around the held copy: it could be
+        // another line that only reads the same.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let mut c = Cache::open(&path).unwrap();
+        let a = chan("#a");
+        let two = made_up(&a, line(None, 2, "two"));
+        let held = two.msgid.clone().unwrap();
+        c.put(&[entry(a.clone(), vec![line(Some("r0"), 0, "zero")]), entry(a.clone(), vec![two])]).unwrap();
+        assert!(brk(&path, &held));
+        let run = vec![line(Some("r1"), 1, "one"), line(Some("r2"), 2, "two"), line(Some("r3"), 3, "three")];
+        assert_eq!(c.put(&[Entry { below: Below::Joins("r0".into()), ..entry(a.clone(), run) }]).unwrap(), 2);
+        assert!(!brk(&path, "r1"), "r1 joins r0, as said");
+        assert!(brk(&path, &held), "the held copy is not healed");
+        assert!(brk(&path, "r3"), "the line after the skip follows on from nothing known");
+        // A run whose oldest line is held under another id: no join there.
+        let run = vec![line(Some("q1"), 1, "one"), line(Some("q4"), 4, "four")];
+        c.put(&[Entry { below: Below::Joins("r0".into()), ..entry(a.clone(), run) }]).unwrap();
+        assert!(!brk(&path, "r1") && brk(&path, "q4"));
+        // Above: a page before r3 whose newest line is held under another
+        // id doesn't heal r3.
+        let run = vec![line(Some("p2"), 2, "two")];
+        c.put(&[Entry { above: Above::Joins("r3".into()), older: true, ..entry(a.clone(), run) }]).unwrap();
+        assert!(brk(&path, "r3"));
     }
 
     #[test]

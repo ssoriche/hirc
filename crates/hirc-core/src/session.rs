@@ -251,13 +251,16 @@ fn server_time(msg: &Message) -> Option<DateTime<Utc>> {
 /// page from a line we hold starts a millisecond past it: BEFORE and
 /// AFTER by time are strict, and a burst can share one millisecond, so
 /// from that line's own time the rest of its burst would be skipped.
-/// `finish_page` cuts the lines this repeats, at the anchor's msgid.
+/// `finish_page` cuts the lines this repeats, at the anchor's msgid. A
+/// made-up msgid is never in the page, so nothing could be cut: from one
+/// (a cache from a time without chathistory) the page is strict, and
+/// `finish_page` claims no join across what it may skip.
 fn by_time(kind: &Kind) -> Kind {
     let past = TimeDelta::milliseconds(1);
     match kind {
-        Kind::Before(a) if a.msgid.is_some() => Kind::Before(Anchor { msgid: None, time: a.time + past }),
+        Kind::Before(a) if a.server_msgid().is_some() => Kind::Before(Anchor { msgid: None, time: a.time + past }),
         Kind::Before(a) => Kind::Before(a.by_time()),
-        Kind::After(a) if a.msgid.is_some() => Kind::After(Anchor { msgid: None, time: a.time - past }),
+        Kind::After(a) if a.server_msgid().is_some() => Kind::After(Anchor { msgid: None, time: a.time - past }),
         Kind::After(a) => Kind::After(a.by_time()),
         k => k.clone(),
     }
@@ -856,15 +859,15 @@ impl Session {
         let request = Request { target: target.to_owned(), kind, limit: self.page() };
         // The request keeps its msgid (the gap's bookkeeping needs it); a
         // server that names messages only by time is asked by time.
-        let by_time = !self.isupport.takes_msgid();
-        let mut msg = if by_time { Request { kind: self::by_time(&request.kind), ..request.clone() }.message() } else { request.message() };
+        let timed = !self.isupport.takes_msgid();
+        let mut msg = if timed { Request { kind: by_time(&request.kind), ..request.clone() }.message() } else { request.message() };
         if self.caps.is_enabled("labeled-response") {
             self.label_seq += 1;
             let label = format!("hl{}", self.label_seq);
             msg.tags.push(("label".into(), Some(label.clone())));
             self.labels.insert(label, key.clone());
         }
-        self.inflight.insert(key, Inflight { request, retried: false, by_time });
+        self.inflight.insert(key, Inflight { request, retried: false, by_time: timed });
         out.push(Output::Send(msg));
     }
 
@@ -1083,12 +1086,17 @@ impl Session {
     /// it shows nothing. A services query's replay opens no window: only
     /// one the user has open shows it, and it is never cached.
     ///
-    /// The run is kept following the last line kept for its target on
-    /// this connection, else as a break. The cache already holds the line
-    /// a replay starts on when ZNC kept everything since we left (PLAY
-    /// asks from that line's second). So only a replay that starts past
-    /// what we hold leaves a break: ZNC's buffer ran out. Live lines then
-    /// follow on from the replay.
+    /// A replay we asked for (`playback_on`) is kept following the last
+    /// line kept for its target on this connection, else as a break. The
+    /// cache already holds the line a replay starts on when ZNC kept
+    /// everything since we left (PLAY asks from that line's second). So
+    /// only a replay that starts past what we hold leaves a break: ZNC's
+    /// buffer ran out. Live lines then follow on from the replay.
+    ///
+    /// ZNC's plain replay (no playback module, or history off) is shown
+    /// but never kept, and the tail is left alone: its lines' live copies
+    /// were kept under the server's msgids, so under made-up ids they
+    /// would be kept twice.
     fn finish_playback(&mut self, target: &str, lines: Vec<Line>, out: &mut Vec<Output>) {
         let query = !self.isupport.is_channel(target);
         let unasked_service = query && services::is_service(target) && !self.book.get(target).is_some_and(|k| k.query);
@@ -1096,18 +1104,20 @@ impl Session {
             return;
         }
         self.book.note(target, query, &lines);
-        let key = target.to_ascii_lowercase();
-        let below = match self.tail.get(&key) {
-            Some(Tail::At(prev) | Tail::Behind(prev)) => Below::Joins(prev.clone()),
-            Some(Tail::Hole) | None => Below::Breaks,
-        };
-        self.keep_run(target, &lines, below, Above::Leave, false);
-        // After a hole, the replay is from before it: the next live line
-        // still doesn't follow on, but more of the replay does.
-        let dest = self.dest(target);
-        if let Some(id) = lines.iter().rev().find(|l| cache::cacheable(&dest, l)).and_then(|l| l.msgid.clone()) {
-            let behind = matches!(self.tail.get(&key), Some(Tail::Hole | Tail::Behind(_)));
-            self.tail.insert(key, if behind { Tail::Behind(id) } else { Tail::At(id) });
+        if self.playback_on() {
+            let key = target.to_ascii_lowercase();
+            let below = match self.tail.get(&key) {
+                Some(Tail::At(prev) | Tail::Behind(prev)) => Below::Joins(prev.clone()),
+                Some(Tail::Hole) | None => Below::Breaks,
+            };
+            self.keep_run(target, &lines, below, Above::Leave, false);
+            // After a hole, the replay is from before it: the next live
+            // line still doesn't follow on, but more of the replay does.
+            let dest = self.dest(target);
+            if let Some(id) = lines.iter().rev().find(|l| cache::cacheable(&dest, l)).and_then(|l| l.msgid.clone()) {
+                let behind = matches!(self.tail.get(&key), Some(Tail::Hole | Tail::Behind(_)));
+                self.tail.insert(key, if behind { Tail::Behind(id) } else { Tail::At(id) });
+            }
         }
         out.push(self.history_event(target, lines, false));
     }
@@ -1206,9 +1216,9 @@ impl Session {
         let shown = page.lines.len();
         if by_time
             && let Kind::After(from) | Kind::Before(from) = &request.kind
-            && let Some(id) = &from.msgid
+            && let Some(id) = from.server_msgid()
         {
-            let at = page.lines.iter().position(|l| l.msgid.as_ref() == Some(id));
+            let at = page.lines.iter().position(|l| l.msgid.as_deref() == Some(id));
             match (&request.kind, at) {
                 (Kind::After(_), Some(i)) => drop(page.lines.drain(..=i)),
                 (Kind::Before(_), Some(i)) => page.lines.truncate(i),
@@ -1241,9 +1251,12 @@ impl Session {
             self.book.reach(&request.target, query, first, last);
         }
         // How it meets what the cache holds: as it meets what is held here.
+        // From a made-up anchor the server was asked strictly by time, and
+        // the rest of the anchor's millisecond may be skipped: no join.
+        let joins = |a: &Anchor| a.server_msgid().map(str::to_owned);
         let (below, above) = match (&request.kind, partial) {
-            (Kind::After(a), _) if !over => (a.msgid.clone().map_or(Below::Breaks, Below::Joins), Above::Breaks),
-            (Kind::Before(a), false) => (Below::Breaks, a.msgid.clone().map_or(Above::Breaks, Above::Joins)),
+            (Kind::After(a), _) if !over => (joins(a).map_or(Below::Breaks, Below::Joins), Above::Breaks),
+            (Kind::Before(a), false) => (Below::Breaks, joins(a).map_or(Above::Breaks, Above::Joins)),
             _ => (Below::Breaks, Above::Breaks),
         };
         let before = matches!(request.kind, Kind::Before(_));
@@ -1281,7 +1294,7 @@ impl Session {
                 Some(last) => self.request(&request.target, Kind::After(last), out),
                 None if !full => {
                     if !partial {
-                        self.tail_unless_known(&request.target, newest_kept.or_else(|| from.msgid.clone()));
+                        self.tail_unless_known(&request.target, newest_kept.or_else(|| from.server_msgid().map(str::to_owned)));
                     }
                     self.close_gap(&key, &request.target);
                     out.push(self.filled(&request.target));
@@ -1356,7 +1369,7 @@ impl Session {
             out.push(self.history_event(&request.target, Vec::new(), start));
         }
         if let Kind::After(from) = &request.kind {
-            self.tail_unless_known(&request.target, from.msgid.clone());
+            self.tail_unless_known(&request.target, from.server_msgid().map(str::to_owned));
             self.close_gap(&key, &request.target);
         }
         if matches!(request.kind, Kind::Latest | Kind::After(_)) {
@@ -1377,8 +1390,9 @@ impl Session {
         // Already asked by time: nothing to retry.
         let again = match &request.kind {
             Kind::Before(_) | Kind::After(_) if retried || by_time => None,
-            Kind::Before(a) if a.msgid.is_some() => Some(Kind::Before(a.by_time())),
-            Kind::After(a) if a.msgid.is_some() => Some(Kind::After(a.by_time())),
+            // A made-up anchor went out by time already.
+            Kind::Before(a) if a.server_msgid().is_some() => Some(Kind::Before(a.by_time())),
+            Kind::After(a) if a.server_msgid().is_some() => Some(Kind::After(a.by_time())),
             _ => None,
         };
         if let Some(kind) = again {
@@ -3997,7 +4011,12 @@ pub(crate) mod tests {
 
     /// `sojud`, asking for pages of `page` lines.
     fn sojud_paged(book: Book, page: usize) -> Session {
-        let mut s = Session::new("soju", SessionConfig { history_page: Some(page), ..cfg() }).with_book(book);
+        sojud_with(SessionConfig { history_page: Some(page), ..cfg() }, book)
+    }
+
+    /// `sojud`, with `config`.
+    fn sojud_with(config: SessionConfig, book: Book) -> Session {
+        let mut s = Session::new("soju", config).with_book(book);
         s.start();
         let out: Vec<Output> = recorded(include_str!("../tests/data/soju-0.11.1-attach.txt"))
             .take_while(|l| !l.contains(" JOIN "))
@@ -4306,5 +4325,90 @@ pub(crate) mod tests {
         let out = feed_all(&mut s, &soju_answer(&answers, "m", &label));
         assert!(sent(&out).is_empty(), "{out:?}");
         assert_eq!(lines(&out).iter().filter(|(t, l)| *t == Target::Server && l.text.starts_with("Can't get history")).count(), 1, "{out:?}");
+    }
+
+    /// A held line as the cache has it from a ZNC era of the network: its
+    /// id made up, not the server's.
+    fn made_up_held(time: DateTime<Utc>) -> Line {
+        let l = Line { time, text: "fact 1".into(), nick: Some("bob".into()), ..local_line() };
+        Line { msgid: Some(crate::msgid::made_up(&Target::Channel("#test".into()), &l)), ..l }
+    }
+
+    #[test]
+    fn a_gap_from_a_made_up_anchor_is_asked_strictly_and_claims_no_join() {
+        // The cache came from ZNC (made-up ids); the network is now soju,
+        // which takes only times. A millisecond early would re-add that
+        // millisecond under soju's ids, so it is asked from the line's own
+        // time. Strict, that may skip the rest of its millisecond: no join.
+        let (lines, _, at) = soju_after();
+        let mut book = Book::default();
+        book.note("#test", false, &[made_up_held(at)]);
+        let mut s = sojud(book).keeping();
+        let (wire, label) = asked(&feed(&mut s, ":alice!alice@127.0.0.1 JOIN #test"));
+        assert_eq!(wire, format!("CHATHISTORY AFTER #test {} 20", timestamp(at)));
+        let out = feed_all(&mut s, &soju_answer(&lines, "t", &label));
+        assert_eq!(histories(&out).iter().map(|(_, l, _)| texts(l)).collect::<Vec<_>>(), [["fact 2", "fact 3"]]);
+        let kept = s.kept();
+        assert_eq!(kept.iter().map(|e| e.below.clone()).collect::<Vec<_>>(), [Below::Breaks], "{kept:?}");
+        // The same through a server that takes msgids (Ergo): the made-up
+        // id goes out as its time, strict, so again no join.
+        let mut book = Book::default();
+        book.note("#test", false, &[made_up_held(at)]);
+        let mut s = historied("", 50, book).keeping();
+        let (wire, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        assert_eq!(wire, format!("CHATHISTORY AFTER #test {} 20", timestamp(at)));
+        feed_all(&mut s, &soju_answer(&lines, "t", &label));
+        let kept = s.kept();
+        assert_eq!(kept.iter().map(|e| e.below.clone()).collect::<Vec<_>>(), [Below::Breaks], "{kept:?}");
+    }
+
+    #[test]
+    fn a_page_up_from_a_made_up_anchor_is_asked_strictly_and_claims_no_join() {
+        let mut s = soju_joined(&[made_up_held(soju_burst(2).time)], 2);
+        let (wire, label) = asked(&older(&mut s, "#test"));
+        assert_eq!(wire, format!("CHATHISTORY BEFORE #test {} 2", soju_bound(0)));
+        let out = feed_all(&mut s, &soju_page(&wire, &label));
+        // Not asked again: the made-up id is never looked for in the page.
+        assert!(sent(&out).iter().all(|m| !m.starts_with("CHATHISTORY")), "{out:?}");
+        assert_eq!(histories(&out).iter().map(|(_, l, _)| texts(l)).collect::<Vec<_>>(), [["fact 2", "fact 3"]]);
+        let kept = s.kept();
+        assert_eq!(kept.iter().map(|e| e.above.clone()).collect::<Vec<_>>(), [Above::Breaks], "{kept:?}");
+    }
+
+    #[test]
+    fn a_plain_znc_replay_is_shown_but_never_cached() {
+        // ZNC without its playback module (or with history off): ZNC's
+        // own replay on attach, in its playback batches all the same.
+        for chathistory in [true, false] {
+            let mut s = Session::new("net", SessionConfig { chathistory, ..cfg() }).keeping();
+            s.start();
+            let at = recorded_at();
+            let out: Vec<Output> =
+                recorded(include_str!("../tests/data/znc-1.10.3-attach-without-playback.txt")).flat_map(|l| s.handle(Message::parse(l).unwrap(), at)).collect();
+            let got = histories(&out);
+            let shown: Vec<Vec<&str>> = got.iter().map(|(_, l, _)| texts(l)).collect();
+            assert_eq!(shown, [vec!["fact 1", "fact 2", "fact 3", "fact live", "fact self"], vec!["fact dm"]], "{chathistory}");
+            let kept = s.kept();
+            assert!(kept.iter().all(|e| e.lines.iter().all(|l| !l.text.starts_with("fact"))), "{chathistory}: {kept:?}");
+        }
+    }
+
+    #[test]
+    fn a_password_said_to_bouncerserv_is_never_cached() {
+        // soju's own service, with history on or off: its echo (with or
+        // without a msgid) and its answer are kept nowhere.
+        for chathistory in [true, false] {
+            let mut s = sojud_with(SessionConfig { chathistory, ..cfg() }, Book::default()).keeping();
+            for l in [
+                "@time=2026-11-02T04:02:44.321Z;msgid=b1 :alice!alice@127.0.0.1 PRIVMSG BouncerServ :sasl set-plain alice soju-test-only",
+                "@time=2026-11-02T04:02:44.322Z :alice!alice@127.0.0.1 PRIVMSG BouncerServ :user update -password soju-test-only",
+                "@time=2026-11-02T04:02:44.323Z;msgid=b2 :BouncerServ!BouncerServ@BouncerServ NOTICE alice :updated SASL PLAIN credentials",
+            ] {
+                feed(&mut s, l);
+            }
+            let kept = s.kept();
+            // Never the lines themselves: they hold the test password.
+            assert!(kept.is_empty(), "{chathistory}: {} runs kept", kept.len());
+        }
     }
 }
