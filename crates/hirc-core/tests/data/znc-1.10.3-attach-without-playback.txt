@@ -1,0 +1,32 @@
+:irc.znc.in CAP unknown-nick LS :batch cap-notify chghost echo-message invite-notify message-tags multi-prefix sasl=* server-time userhost-in-names znc.in/batch znc.in/playback znc.in/self-message znc.in/server-time-iso
+@time=2026-11-02T02:28:03.225Z :irc.znc.in CAP unknown-nick ACK :batch server-time
+@time=2026-11-02T02:27:59.495Z :ergo.test 001 alice :Welcome to the HircTest IRC Network alice
+@time=2026-11-02T02:27:59.495Z :ergo.test 002 alice :Your host is ergo.test, running version ergo-2.19.1
+@time=2026-11-02T02:27:59.495Z :ergo.test 003 alice :This server was created Mon, 02 Nov 2026 02:27:59 UTC
+@time=2026-11-02T02:27:59.495Z :ergo.test 004 alice ergo.test ergo-2.19.1 BERTZios CEIMRUabefhiklmnoqstuv Iabefhkloqv
+@time=2026-11-02T02:27:59.495Z :ergo.test 005 alice AWAYLEN=390 BOT=B CASEMAPPING=ascii CHANLIMIT=#:100 CHANMODES=Ibe,k,fl,CEMRUimnstu CHANNELLEN=64 CHANTYPES=# CHATHISTORY=100 ELIST=U EXCEPTS EXTBAN=,m FORWARD=f INVEX :are supported by this server
+@time=2026-11-02T02:27:59.495Z :ergo.test 005 alice KICKLEN=390 MAXLIST=beI:60 MAXTARGETS=4 MODES MONITOR=100 MSGREFTYPES=msgid,timestamp NETWORK=HircTest NICKLEN=32 PREFIX=(qaohv)~&@%+ SAFELIST SAFERATE STATUSMSG=~&@%+ TARGMAX=NAMES:1,LIST:1,KICK:,WHOIS:1,USERHOST:10,PRIVMSG:4,TAGMSG:4,NOTICE:4,MONITOR:100 :are supported by this server
+@time=2026-11-02T02:27:59.495Z :ergo.test 005 alice TOPICLEN=390 UTF8ONLY WHOX draft/CHATHISTORY=100 :are supported by this server
+@time=2026-11-02T02:27:59.495Z :ergo.test 251 alice :There are 2 users and 0 invisible on 1 server(s)
+@time=2026-11-02T02:27:59.495Z :ergo.test 252 alice 0 :IRC Operators online
+@time=2026-11-02T02:27:59.495Z :ergo.test 254 alice 0 :channels formed
+@time=2026-11-02T02:27:59.495Z :ergo.test 255 alice :I have 2 clients and 0 servers
+@time=2026-11-02T02:27:59.495Z :ergo.test 265 alice 2 2 :Current local users 2, max 2
+@time=2026-11-02T02:27:59.495Z :ergo.test 266 alice 2 2 :Current global users 2, max 2
+@time=2026-11-02T02:27:59.495Z :ergo.test 422 alice :MOTD File is missing
+> PING :attached
+@time=2026-11-02T02:28:03.225Z :alice!~alice@127.0.0.1 JOIN :#test
+@time=2026-11-02T02:28:03.225Z :ergo.test 353 alice = #test :@alice bob
+@time=2026-11-02T02:28:03.225Z :ergo.test 366 alice #test :End of /NAMES list.
+@time=2026-11-02T02:28:03.225Z :znc.in BATCH +8f5180964ef46eeeae1b9d4f0d5de848 znc.in/playback #test
+@batch=8f5180964ef46eeeae1b9d4f0d5de848;time=2026-11-02T02:27:59.598Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact 1
+@batch=8f5180964ef46eeeae1b9d4f0d5de848;time=2026-11-02T02:28:00.699Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact 2
+@batch=8f5180964ef46eeeae1b9d4f0d5de848;time=2026-11-02T02:28:01.801Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact 3
+@batch=8f5180964ef46eeeae1b9d4f0d5de848;time=2026-11-02T02:28:03.217Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact live
+@batch=8f5180964ef46eeeae1b9d4f0d5de848;time=2026-11-02T02:28:03.218Z :alice!~alice@127.0.0.1 PRIVMSG #test :fact self
+@time=2026-11-02T02:28:03.225Z :znc.in BATCH -8f5180964ef46eeeae1b9d4f0d5de848
+@time=2026-11-02T02:28:03.225Z :znc.in BATCH +9f9d51bc70ef21ca5c14f307980a29d8 znc.in/playback bob
+@batch=9f9d51bc70ef21ca5c14f307980a29d8;time=2026-11-02T02:28:02.903Z :bob!~bob@127.0.0.1 PRIVMSG alice :fact dm
+@time=2026-11-02T02:28:03.225Z :znc.in BATCH -9f9d51bc70ef21ca5c14f307980a29d8
+@time=2026-11-02T02:28:03.225Z :irc.znc.in PONG irc.znc.in :attached
+@time=2026-11-02T02:28:03.225Z :irc.znc.in PONG irc.znc.in :hirc-done

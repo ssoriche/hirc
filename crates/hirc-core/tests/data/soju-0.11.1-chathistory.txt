@@ -1,0 +1,24 @@
+> CHATHISTORY LATEST #test * 100
+BATCH +1 chathistory #test
+@time=2026-11-02T02:27:59.571Z;msgid=9qyrebph5n8rh3cyc8gm7sr5ge;batch=1 :bob!~bob@127.0.0.1 PRIVMSG #test :fact 1
+@time=2026-11-02T02:27:59.578Z;msgid=5tjnb5twytqag9w55ig5h7ntsn;batch=1 :bob!~bob@127.0.0.1 PRIVMSG #test :fact 2
+@time=2026-11-02T02:27:59.584Z;msgid=4veznctg8wra8k6hyi7en8gjyi;batch=1 :bob!~bob@127.0.0.1 PRIVMSG #test :fact 3
+BATCH -1
+:localhost PONG localhost hirc-done
+> CHATHISTORY LATEST #test * 100000
+:localhost FAIL CHATHISTORY INVALID_PARAMS LATEST 100000 :Invalid limit
+:localhost PONG localhost hirc-done
+> CHATHISTORY TARGETS timestamp=2026-11-02T01:27:59.955Z timestamp=2026-11-02T03:27:59.955Z 100
+BATCH +2 draft/chathistory-targets
+@batch=2 CHATHISTORY TARGETS #test 2026-11-02T02:27:59.584Z
+@batch=2 CHATHISTORY TARGETS bob 2026-11-02T02:27:59.591Z
+BATCH -2
+:localhost PONG localhost hirc-done
+> CHATHISTORY LATEST bob * 100
+BATCH +3 chathistory bob
+@msgid=yhupq2zgj34ng42s25bu5d23pw;time=2026-11-02T02:27:59.591Z;batch=3 :bob!~bob@127.0.0.1 PRIVMSG alice :fact dm
+BATCH -3
+:localhost PONG localhost hirc-done
+> MARKREAD #test
+:alice!alice@127.0.0.1 MARKREAD #test *
+:localhost PONG localhost hirc-done

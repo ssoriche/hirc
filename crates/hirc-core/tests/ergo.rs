@@ -6,12 +6,12 @@
 
 mod common;
 
+use common::events::{line_in, net, next_matching, page, said};
 use common::{Ergo, Raw, register_account, register_always_on};
 use hirc_core::config::{Config, Sasl, Server};
 use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::store::{Delivery, Line, LineKind};
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedReceiver;
 
 fn alice(ergo: &Ergo, password_command: &str) -> Config {
     let mut config = Config::default();
@@ -28,32 +28,6 @@ fn alice(ergo: &Ergo, password_command: &str) -> Config {
         },
     );
     config
-}
-
-/// hirc's network side with no history cache.
-fn net(config: Config) -> (tokio::sync::mpsc::UnboundedSender<Command>, UnboundedReceiver<Event>) {
-    let (tx, rx, _) = hirc_core::conn::spawn(config, None);
-    (tx, rx)
-}
-
-async fn next_matching<T>(rx: &mut UnboundedReceiver<Event>, mut f: impl FnMut(&Event) -> Option<T>) -> T {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let ev = rx.recv().await.expect("core stopped");
-            if let Some(t) = f(&ev) {
-                return t;
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for event")
-}
-
-fn line_in(ev: &Event, chan: &str) -> Option<Line> {
-    match ev {
-        Event::Line { target: Target::Channel(c), line, .. } if c.eq_ignore_ascii_case(chan) => Some(line.clone()),
-        _ => None,
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -163,19 +137,6 @@ async fn failing_password_command_stops() {
     let ergo = Ergo::start();
     let (_tx, mut rx) = net(alice(&ergo, "exit 1"));
     next_matching(&mut rx, |e| matches!(e, Event::Status { status: ConnStatus::Failed { .. }, .. }).then_some(())).await;
-}
-
-/// The next page of history for `target`.
-async fn page(rx: &mut UnboundedReceiver<Event>, target: &str) -> (Vec<Line>, bool) {
-    next_matching(rx, |e| match e {
-        Event::History { target: t, lines, start, .. } if t.name().is_some_and(|n| n.eq_ignore_ascii_case(target)) => Some((lines.clone(), *start)),
-        _ => None,
-    })
-    .await
-}
-
-fn said(lines: &[Line]) -> Vec<String> {
-    lines.iter().filter(|l| l.kind == LineKind::Privmsg).map(|l| l.text.clone()).collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]

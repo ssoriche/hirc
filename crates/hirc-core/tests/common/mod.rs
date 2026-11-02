@@ -3,6 +3,10 @@
 
 #![allow(dead_code)]
 
+pub mod events;
+pub mod soju;
+pub mod znc;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -77,9 +81,15 @@ pub struct Raw {
 }
 
 impl Raw {
-    pub async fn connect(port: u16, nick: &str) -> Raw {
+    /// A socket with nothing sent yet: for a bouncer that wants PASS and
+    /// CAP before NICK.
+    pub async fn open(port: u16) -> Raw {
         let (r, w) = TcpStream::connect(("127.0.0.1", port)).await.unwrap().into_split();
-        let mut c = Raw { r: BufReader::new(r), w };
+        Raw { r: BufReader::new(r), w }
+    }
+
+    pub async fn connect(port: u16, nick: &str) -> Raw {
+        let mut c = Raw::open(port).await;
         c.send(&format!("NICK {nick}")).await;
         c.send(&format!("USER {nick} 0 * :{nick}")).await;
         c.expect(" 001 ").await;
@@ -90,24 +100,44 @@ impl Raw {
         self.w.write_all(format!("{line}\r\n").as_bytes()).await.unwrap();
     }
 
-    /// Reads until a line contains `needle` (answering PINGs). Panics after 10s.
-    pub async fn expect(&mut self, needle: &str) -> String {
+    /// The next line, without its CRLF (answering a PING). Panics after 10s.
+    pub async fn next(&mut self) -> String {
         tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let mut line = String::new();
-                if self.r.read_line(&mut line).await.unwrap() == 0 {
-                    panic!("connection closed waiting for {needle:?}");
-                }
-                if let Some(rest) = line.strip_prefix("PING ") {
-                    self.send(&format!("PONG {}", rest.trim_end())).await;
-                }
-                if line.contains(needle) {
-                    return line;
-                }
+            let mut line = String::new();
+            if self.r.read_line(&mut line).await.unwrap() == 0 {
+                panic!("connection closed");
             }
+            let line = line.trim_end_matches(['\r', '\n']).to_owned();
+            if let Some(rest) = line.strip_prefix("PING ") {
+                self.send(&format!("PONG {rest}")).await;
+            }
+            line
         })
         .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {needle:?}"))
+        .unwrap_or_else(|_| panic!("timed out waiting for a line"))
+    }
+
+    /// Every line up to and including the first that contains `needle`.
+    pub async fn until(&mut self, needle: &str) -> Vec<String> {
+        let mut got = Vec::new();
+        loop {
+            let line = self.next().await;
+            let done = line.contains(needle);
+            got.push(line);
+            if done {
+                return got;
+            }
+        }
+    }
+
+    /// Reads until a line contains `needle` (answering PINGs). Panics after 10s.
+    pub async fn expect(&mut self, needle: &str) -> String {
+        loop {
+            let line = self.next().await;
+            if line.contains(needle) {
+                return line;
+            }
+        }
     }
 }
 
@@ -141,4 +171,102 @@ pub async fn register_always_on(port: u16, nick: &str, password: &str) {
     // server's settings make it so: the second is the one that counts.
     c.expect("your client is always-on").await;
     c.send("QUIT").await;
+}
+
+/// The caps a server lists in its `CAP LS` lines, without values.
+fn offered(ls: &[String]) -> Vec<String> {
+    ls.iter()
+        .filter_map(|l| l.split_once(" LS ").map(|(_, rest)| rest))
+        .flat_map(|rest| rest.trim_start_matches("* ").trim_start_matches(':').split_whitespace())
+        .map(|c| c.split('=').next().unwrap_or(c).to_owned())
+        .collect()
+}
+
+/// Connects to a bouncer the way a client does:
+/// - `CAP LS 302`
+/// - `PASS`
+/// - a `CAP REQ` for the caps in `want` that it offers
+/// - `NICK`, `USER`, `CAP END`
+///
+/// It reads up to the end of the MOTD and gives back the client and every
+/// line it got, the CAP LS lines first. PASS is never in what it gives back.
+pub async fn register(port: u16, pass: &str, nick: &str, user: &str, want: &[&str]) -> (Raw, Vec<String>) {
+    let mut c = Raw::open(port).await;
+    c.send("CAP LS 302").await;
+    let mut got = Vec::new();
+    loop {
+        let line = c.next().await;
+        let last = line.contains(" LS ") && !line.contains(" LS * ");
+        got.push(line);
+        if last {
+            break;
+        }
+    }
+    let offered = offered(&got);
+    let req: Vec<&str> = want.iter().copied().filter(|w| offered.iter().any(|o| o == w)).collect();
+    c.send(&format!("PASS {pass}")).await;
+    if !req.is_empty() {
+        c.send(&format!("CAP REQ :{}", req.join(" "))).await;
+    }
+    c.send(&format!("NICK {nick}")).await;
+    c.send(&format!("USER {user} 0 * :{nick}")).await;
+    if !req.is_empty() {
+        got.extend(c.until(" ACK ").await);
+    }
+    c.send("CAP END").await;
+    loop {
+        let line = c.next().await;
+        let done = [" 376 ", " 422 "].iter().any(|n| line.contains(n));
+        got.push(line);
+        if done {
+            return (c, got);
+        }
+    }
+}
+
+/// Waits until `nick` is connected to `ergo` (a bouncer's own client),
+/// asking with ISON every 100 ms for up to 10 s.
+pub async fn wait_online(ergo: &Ergo, nick: &str) {
+    let mut w = Raw::connect(ergo.plain_port, &format!("w{}", free_port())).await;
+    for _ in 0..100 {
+        w.send(&format!("ISON {nick}")).await;
+        let reply = w.expect(" 303 ").await;
+        if reply.rsplit(':').next().is_some_and(|names| names.split_whitespace().any(|n| n.eq_ignore_ascii_case(nick))) {
+            w.send("QUIT").await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{nick} never came online");
+}
+
+/// Waits until `nick` is in `chan` on `ergo`, asking with NAMES every
+/// 100 ms for up to 10 s.
+pub async fn wait_in_channel(ergo: &Ergo, nick: &str, chan: &str) {
+    let mut w = Raw::connect(ergo.plain_port, &format!("w{}", free_port())).await;
+    for _ in 0..100 {
+        w.send(&format!("NAMES {chan}")).await;
+        let lines = w.until(" 366 ").await;
+        let here = lines
+            .iter()
+            .filter(|l| l.contains(" 353 "))
+            .any(|l| l.rsplit(':').next().is_some_and(|names| names.split_whitespace().any(|n| n.trim_start_matches(['@', '+']).eq_ignore_ascii_case(nick))));
+        if here {
+            w.send("QUIT").await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{nick} never joined {chan}");
+}
+
+/// Writes a transcript to `tests/data/<name>`: the server's lines as they
+/// came, and ours marked `> `. It refuses any line that holds a test
+/// password, and PASS is never one of the lines.
+pub fn record(name: &str, lines: &[String]) {
+    for l in lines {
+        assert!(!l.contains(znc::PASSWORD) && !l.contains(soju::PASSWORD) && !l.starts_with("> PASS"), "a password in the transcript for {name}");
+    }
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name);
+    std::fs::write(path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
 }

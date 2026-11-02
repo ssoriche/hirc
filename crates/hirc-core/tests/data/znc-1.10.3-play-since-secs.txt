@@ -1,0 +1,7 @@
+> PRIVMSG *playback :PLAY #test 1793586480
+@time=2026-11-02T02:28:03.212Z :alice!~alice@127.0.0.1 PRIVMSG *playback :PLAY #test 1793586480
+@time=2026-11-02T02:28:03.214Z :znc.in BATCH +8f5180964ef46eeeae1b9d4f0d5de848 znc.in/playback #test
+@batch=8f5180964ef46eeeae1b9d4f0d5de848;time=2026-11-02T02:28:00.699Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact 2
+@batch=8f5180964ef46eeeae1b9d4f0d5de848;time=2026-11-02T02:28:01.801Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact 3
+@time=2026-11-02T02:28:03.214Z :znc.in BATCH -8f5180964ef46eeeae1b9d4f0d5de848
+@time=2026-11-02T02:28:03.214Z :irc.znc.in PONG irc.znc.in :hirc-done

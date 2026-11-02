@@ -1,0 +1,14 @@
+> (second client) PRIVMSG #test :fact self
+@time=2026-11-02T02:28:03.218Z :alice!~alice@127.0.0.1 PRIVMSG #test :fact self
+> (the second client's own lines follow)
+> PING :echo
+@time=2026-11-02T02:28:03.218Z :alice!~alice@127.0.0.1 JOIN :#test
+@time=2026-11-02T02:28:03.218Z :ergo.test 353 alice = #test :@alice bob
+@time=2026-11-02T02:28:03.218Z :ergo.test 366 alice #test :End of /NAMES list.
+@time=2026-11-02T02:28:03.218Z :znc.in BATCH +8f5180964ef46eeeae1b9d4f0d5de848 znc.in/playback #test
+@time=2026-11-02T02:28:03.218Z :znc.in BATCH -8f5180964ef46eeeae1b9d4f0d5de848
+@time=2026-11-02T02:28:03.218Z :znc.in BATCH +9f9d51bc70ef21ca5c14f307980a29d8 znc.in/playback bob
+@time=2026-11-02T02:28:03.218Z :znc.in BATCH -9f9d51bc70ef21ca5c14f307980a29d8
+@time=2026-11-02T02:28:03.218Z :alice!~alice@127.0.0.1 PRIVMSG #test :fact self
+@time=2026-11-02T02:28:03.218Z :irc.znc.in PONG irc.znc.in :echo
+@time=2026-11-02T02:28:03.218Z :irc.znc.in PONG irc.znc.in :hirc-done

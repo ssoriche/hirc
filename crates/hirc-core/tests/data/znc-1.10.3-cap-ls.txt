@@ -1,0 +1,1 @@
+:irc.znc.in CAP unknown-nick LS :batch cap-notify chghost echo-message invite-notify message-tags multi-prefix sasl=* server-time userhost-in-names znc.in/batch znc.in/playback znc.in/self-message znc.in/server-time-iso

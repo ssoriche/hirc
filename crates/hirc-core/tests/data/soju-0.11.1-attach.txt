@@ -1,0 +1,21 @@
+:localhost CAP * LS :soju.im/webpush chghost draft/extended-monitor account-notify labeled-response cap-notify draft/metadata-2=before-connect,max-keys=0,max-value-bytes=1 draft/no-implicit-names draft/extended-isupport setname soju.im/account-required draft/read-marker batch soju.im/search extended-monitor draft/message-redaction sasl=PLAIN extended-join multi-prefix server-time soju.im/bouncer-networks echo-message soju.im/bouncer-networks-notify draft/chathistory draft/pre-away soju.im/no-implicit-names away-notify soju.im/read no-implicit-names invite-notify message-tags account-tag
+:localhost CAP * ACK :batch server-time message-tags echo-message cap-notify labeled-response draft/chathistory draft/read-marker
+:localhost CAP * DEL draft/extended-monitor
+:localhost CAP * NEW sasl=PLAIN,ANONYMOUS
+:localhost CAP * NEW draft/account-registration
+:localhost CAP * NEW draft/event-playback
+:localhost 001 alice :Welcome to soju, alice
+:localhost 002 alice :Your host is localhost
+:localhost 004 alice localhost soju aiwroO OovaimnqpsrtklbeI
+:localhost 005 * AWAYLEN=390 BOT=B BOUNCER_NETID=1 CASEMAPPING=ascii CHANLIMIT=#:100 CHANMODES=Ibe,k,fl,CEMRUimnstu CHANNELLEN=64 CHANTYPES=# CHATHISTORY=1000 ELIST=U EXCEPTS EXTBAN=,m INVEX :are supported
+:localhost 005 * KICKLEN=390 MAXLIST=beI:60 MAXTARGETS=4 MODES MONITOR=100 MSGREFTYPES=timestamp NETWORK=HircTest NICKLEN=32 PREFIX=(qaohv)~&@%+ SAFELIST STATUSMSG=~&@%+ TARGMAX=NAMES:1,LIST:1,KICK:,WHOIS:1,USERHOST:10,PRIVMSG:4,TAGMSG:4,NOTICE:4,MONITOR:100 TOPICLEN=390 :are supported
+:localhost 005 * UTF8ONLY WHOX draft/ACCOUNTREQUIRED soju.im/SAFERATE :are supported
+:localhost 221 alice +Z
+:localhost 422 alice :Use /motd to read the message of the day
+> PING :attached
+:alice!alice@127.0.0.1 JOIN #test
+:alice!alice@127.0.0.1 MARKREAD #test *
+:localhost 353 * = #test :@alice bob
+:localhost 366 * #test :End of /NAMES list
+:localhost PONG localhost attached
+:localhost PONG localhost hirc-done

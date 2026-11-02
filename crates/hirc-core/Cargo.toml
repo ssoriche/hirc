@@ -28,3 +28,6 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 [features]
 # Integration tests against a local Ergo (scripts/ergo-test.sh setup first).
 ergo-tests = []
+# Integration tests through ZNC (with its playback module) and soju, each in
+# front of a local Ergo. Inside `flox activate`, after scripts/ergo-test.sh setup.
+bouncer-tests = []

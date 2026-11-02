@@ -1,0 +1,6 @@
+@msgid=sk38vrjyvftx4wfiminhjwnzsi;time=2026-11-02T02:27:59.956Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact live
+> CHATHISTORY LATEST #test * 1
+BATCH +4 chathistory #test
+@time=2026-11-02T02:27:59.956Z;msgid=sk38vrjyvftx4wfiminhjwnzsi;batch=4 :bob!~bob@127.0.0.1 PRIVMSG #test :fact live
+BATCH -4
+:localhost PONG localhost hirc-done

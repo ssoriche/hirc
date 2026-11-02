@@ -1,0 +1,8 @@
+> PRIVMSG *playback :PLAY * 0
+@time=2026-11-02T02:27:59.598Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact 1
+@time=2026-11-02T02:28:00.699Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact 2
+@time=2026-11-02T02:28:01.801Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact 3
+@time=2026-11-02T02:28:03.217Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact live
+@time=2026-11-02T02:28:03.218Z :alice!~alice@127.0.0.1 PRIVMSG #test :fact self
+@time=2026-11-02T02:28:02.903Z :bob!~bob@127.0.0.1 PRIVMSG alice :fact dm
+@time=2026-11-02T02:28:03.225Z :irc.znc.in PONG irc.znc.in :hirc-done
