@@ -62,6 +62,17 @@ pub struct Server {
     /// Relay bots (a Discord bridge, say) whose `<name> text` lines read
     /// as `name`'s own. hirc's key; Halloy ignores it.
     pub bridges: Vec<String>,
+    /// This client's name to IRCCloud's bouncer, put into its `bnc:`
+    /// password so it replays what this client missed (`irccloud`).
+    /// hirc's key; Halloy ignores it.
+    #[serde(deserialize_with = "client_id")]
+    pub bouncer_client_id: Option<String>,
+}
+
+/// A `bouncer_client_id` IRCCloud can read back out of the password.
+fn client_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let id = String::deserialize(d)?;
+    if crate::irccloud::valid_id(&id) { Ok(Some(id)) } else { Err(serde::de::Error::custom("bouncer_client_id must not be empty, or hold spaces, `:` or `@`")) }
 }
 
 impl Default for Server {
@@ -83,6 +94,7 @@ impl Default for Server {
             history_page_size: None,
             sasl: None,
             bridges: Vec::new(),
+            bouncer_client_id: None,
         }
     }
 }
@@ -315,6 +327,15 @@ password_command = "printf hunter22"
     fn plaintext_default_port() {
         let c: Config = toml::from_str("[servers.x]\nnickname='n'\nserver='localhost'\nuse_tls=false\n").unwrap();
         assert_eq!(c.servers["x"].port(), 6667);
+    }
+
+    #[test]
+    fn a_bouncer_client_id_is_checked_as_it_loads() {
+        let c: Config = toml::from_str("[servers.x]\nnickname='n'\nserver='h'\nbouncer_client_id='laptop'\n[servers.y]\nnickname='n'\nserver='h'\n").unwrap();
+        assert_eq!(c.servers["x"].bouncer_client_id.as_deref(), Some("laptop"));
+        assert_eq!(c.servers["y"].bouncer_client_id, None);
+        let e = toml::from_str::<Config>("[servers.x]\nnickname='n'\nserver='h'\nbouncer_client_id='my laptop'\n").unwrap_err();
+        assert!(e.to_string().contains("bouncer_client_id must not"), "{e}");
     }
 
     #[test]

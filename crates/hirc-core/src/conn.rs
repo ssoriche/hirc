@@ -6,6 +6,7 @@ use crate::cache::{Reach, Shared};
 use crate::config::{self, Config, ConfigError, Sasl, Server};
 use crate::event::{Command, ConnStatus, Event, Target};
 use crate::history::{self, Anchor, Book};
+use crate::irccloud;
 use crate::isupport::Isupport;
 use crate::proto::Message;
 use crate::services;
@@ -361,12 +362,19 @@ fn session_config(s: &Server) -> Result<SessionConfig, ConfigError> {
         }
         Some(Sasl::External { .. }) | None => None,
     };
+    // IRCCloud's: with this client's id in it, so it replays what we missed.
+    let mut password = config::secret(s.password.as_deref(), s.password_file.as_deref(), s.password_command.as_deref())?;
+    let irccloud = irccloud::is_host(&s.server);
+    if irccloud && let (Some(p), Some(id)) = (&mut password, &s.bouncer_client_id) {
+        *p = irccloud::password(p, id);
+    }
     Ok(SessionConfig {
         nickname: s.nickname.clone(),
         alt_nicks: s.alt_nicks.clone(),
         username: s.username.clone().unwrap_or_else(|| s.nickname.clone()),
         realname: s.realname.clone().unwrap_or_else(|| s.nickname.clone()),
-        password: config::secret(s.password.as_deref(), s.password_file.as_deref(), s.password_command.as_deref())?,
+        self_replays: irccloud && password.as_deref().is_some_and(irccloud::replays),
+        password,
         sasl,
         channels: s.channels.clone(),
         bridges: s.bridges.clone(),
@@ -1137,5 +1145,25 @@ mod tests {
         assert_eq!(seeded, [vec!["away 5".to_owned(), "away 6".to_owned()]]);
         let (mut s, _) = znc_keeping(book);
         assert_eq!(got(&older_of(&mut s, &cache, "#test")), [(vec!["seen 1".to_owned(), "seen 2".to_owned()], false), (vec![], true)]);
+    }
+
+    #[test]
+    fn irccloud_gets_the_client_id_in_its_password_and_replays() {
+        let irccloud = |password: &str, id: Option<&str>| {
+            let s =
+                Server { server: "bnc.irccloud.com".into(), password: Some(password.into()), bouncer_client_id: id.map(str::to_owned), ..Server::default() };
+            let c = session_config(&s).unwrap();
+            (c.password.unwrap(), c.self_replays)
+        };
+        assert_eq!(irccloud("bnc:testkey", Some("laptop")), ("bnc@laptop:testkey".to_owned(), true));
+        // No id: as IRCCloud gave it, and no replay.
+        assert_eq!(irccloud("bnc:testkey", None), ("bnc:testkey".to_owned(), false));
+        // An id written into the password by hand replays too.
+        assert_eq!(irccloud("bnc@desk:testkey", None), ("bnc@desk:testkey".to_owned(), true));
+        // Any other server's password goes as it is, id or not.
+        let other =
+            Server { server: "irc.example.org".into(), password: Some("bnc:testkey".into()), bouncer_client_id: Some("laptop".into()), ..Server::default() };
+        let c = session_config(&other).unwrap();
+        assert_eq!((c.password.as_deref(), c.self_replays), (Some("bnc:testkey"), false));
     }
 }

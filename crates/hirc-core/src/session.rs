@@ -58,6 +58,9 @@ pub struct SessionConfig {
     pub chathistory: bool,
     /// Lines per history page as configured (`history_page_size`).
     pub history_page: Option<usize>,
+    /// The bouncer replays what this client missed as it attaches, timed
+    /// but unasked and unbatched: IRCCloud's, given a client id.
+    pub self_replays: bool,
 }
 
 impl std::fmt::Debug for SaslPlain {
@@ -80,6 +83,7 @@ impl std::fmt::Debug for SessionConfig {
             .field("bridges", &self.bridges)
             .field("chathistory", &self.chathistory)
             .field("history_page", &self.history_page)
+            .field("self_replays", &self.self_replays)
             .finish()
     }
 }
@@ -1023,10 +1027,27 @@ impl Session {
         self.cfg.chathistory && self.caps.is_enabled(playback::CAP) && !self.history_on()
     }
 
+    /// A bouncer that replays what we missed unasked (IRCCloud's, given a
+    /// client id), with no chathistory to ask instead.
+    fn self_replays(&self) -> bool {
+        self.cfg.self_replays && !self.history_on()
+    }
+
+    /// A bouncer's replay is history to keep: ZNC's, asked for with
+    /// `PLAY`, or one that replays unasked.
+    fn bouncer_replay(&self) -> bool {
+        self.playback_on() || self.self_replays()
+    }
+
     /// One `PLAY` asks for every buffer's lines (queries too) since the
     /// newest line held anywhere on this network, or for all of them when
-    /// nothing is held.
+    /// nothing is held. A bouncer that replays unasked gets no `PLAY`, but
+    /// what it sends timed before now is its replay all the same.
     fn play_back(&mut self, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        if self.self_replays() {
+            self.play = Some(now);
+            return;
+        }
         if !self.playback_on() {
             return;
         }
@@ -1055,11 +1076,12 @@ impl Session {
     /// A message outside any history batch that is still ZNC's replay:
     /// without batches, one timed at or before our `PLAY`. With batches
     /// the whole replay is in them, so a loose line is news even when a
-    /// clock ahead of the server's makes it look old.
+    /// clock ahead of the server's makes it look old. A bouncer that
+    /// replays unasked never batches it, batch on or not.
     fn loose_replay(&self, msg: &Message) -> bool {
         matches!(msg.command.as_str(), "PRIVMSG" | "NOTICE")
             && msg.tag("batch").is_none()
-            && !self.caps.is_enabled("batch")
+            && (self.self_replays() || !self.caps.is_enabled("batch"))
             && self.play.is_some_and(|until| server_time(msg).is_some_and(|t| t <= until))
     }
 
@@ -1104,7 +1126,7 @@ impl Session {
             return;
         }
         self.book.note(target, query, &lines);
-        if self.playback_on() {
+        if self.bouncer_replay() {
             let key = target.to_ascii_lowercase();
             let below = match self.tail.get(&key) {
                 Some(Tail::At(prev) | Tail::Behind(prev)) => Below::Joins(prev.clone()),
@@ -1518,14 +1540,15 @@ impl Session {
     /// from what it says (`msgid::made_up`) when that is the only way its
     /// live and replayed copies get one key, so they are one line and it
     /// can be cached:
-    /// - on a playback network (ZNC), always, the server's msgid replaced:
-    ///   ZNC passes it on live lines but replays without it (ruling Q1);
+    /// - on a replaying bouncer (ZNC's playback, IRCCloud's), always, the
+    ///   server's msgid replaced: ZNC passes it on live lines but replays
+    ///   without it (ruling Q1);
     /// - else without chathistory, on a line the server gave none.
     ///
     /// Never in the server buffer, and never without server-time: our
     /// clock differs between copies.
     fn stamped(&self, msg: &Message, target: Target, mut line: Line) -> Output {
-        let wanted = self.playback_on() || (line.msgid.is_none() && !self.history_on());
+        let wanted = self.bouncer_replay() || (line.msgid.is_none() && !self.history_on());
         if wanted && !matches!(target, Target::Server) && server_time(msg).is_some() {
             line.msgid = Some(crate::msgid::made_up(&target, &line));
         }
@@ -1897,6 +1920,7 @@ pub(crate) mod tests {
             bridges: vec![],
             chathistory: true,
             history_page: None,
+            self_replays: false,
         }
     }
 
@@ -3963,6 +3987,90 @@ pub(crate) mod tests {
         assert_eq!(kept.len(), 2, "{kept:?}");
         assert_eq!(kept[0].below, Below::Breaks);
         assert_eq!(kept[1].below, Below::Joins(kept[0].lines[0].msgid.clone().unwrap()));
+    }
+
+    /// What IRCCloud's bouncer ACKed in the user's wire log (2026-11-02):
+    /// batch, but no chathistory and no playback.
+    const IRCCLOUD: &str = "server-time echo-message cap-notify batch away-notify labeled-response znc.in/self-message";
+
+    /// Registered through IRCCloud's bouncer, its replay on (a client id in
+    /// the password) or not, the end of the MOTD at `at`. Gives back what
+    /// that end sent too.
+    fn irccloud_sent(self_replays: bool, at: DateTime<Utc>) -> (Session, Vec<Output>) {
+        let mut s = Session::new("net", SessionConfig { self_replays, ..cfg() });
+        s.start();
+        for l in [
+            format!(":bnc.irccloud.com CAP * LS :{IRCCLOUD}"),
+            format!(":bnc.irccloud.com CAP * ACK :{IRCCLOUD}"),
+            ":irc.example 001 alice :Welcome".to_owned(),
+            ":irc.example 005 alice CHANTYPES=# :are supported".to_owned(),
+        ] {
+            s.handle(Message::parse(&l).unwrap(), at);
+        }
+        let out = s.handle(Message::parse(":irc.example 376 alice :End of /MOTD").unwrap(), at);
+        (s, out)
+    }
+
+    fn irccloud_at(self_replays: bool, at: DateTime<Utc>) -> Session {
+        irccloud_sent(self_replays, at).0
+    }
+
+    fn irccloud(self_replays: bool) -> Session {
+        irccloud_at(self_replays, now())
+    }
+
+    #[test]
+    fn irccloud_s_replay_is_history_by_its_time_alone() {
+        let (s, out) = irccloud_sent(true, now());
+        // Nothing is asked for: IRCCloud replays by itself.
+        assert!(plays(&out).is_empty(), "{out:?}");
+        let mut s = s.keeping();
+        // Unbatched, though batch is on, and from before we attached.
+        for (at, text) in [("2026-10-22T11:00:00.000Z", "missed 1"), ("2026-10-22T11:30:00.000Z", "missed 2")] {
+            let out = feed(&mut s, &format!("@time={at} :bob!b@h PRIVMSG #test :{text}"));
+            assert!(lines(&out).is_empty(), "history is not news: {out:?}");
+            let got = histories(&out);
+            assert_eq!(got.iter().flat_map(|(_, l, _)| texts(l)).collect::<Vec<_>>(), [text]);
+            assert!(got[0].1[0].replayed && got[0].1[0].msgid.as_deref().is_some_and(|m| m.starts_with("hirc:")));
+        }
+        // Kept, one run after another, from a break.
+        let kept = s.kept();
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert_eq!(kept[0].below, Below::Breaks);
+        let missed2 = kept[1].lines[0].msgid.clone().unwrap();
+        assert_eq!(kept[1].below, Below::Joins(kept[0].lines[0].msgid.clone().unwrap()));
+        // After we attached: news, following on from the replay.
+        let out = feed(&mut s, "@time=2026-10-22T12:00:01.000Z :bob!b@h PRIVMSG #test :live");
+        assert_eq!(lines(&out).len(), 1, "{out:?}");
+        assert_eq!(s.kept()[0].below, Below::Joins(missed2));
+    }
+
+    #[test]
+    fn without_a_client_id_irccloud_s_old_lines_are_news() {
+        // No id, no replay: a line timed in the past is a clock off, not history.
+        let mut s = irccloud(false);
+        let out = feed(&mut s, "@time=2026-10-22T11:00:00.000Z :bob!b@h PRIVMSG #test :live");
+        assert_eq!(lines(&out).len(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn irccloud_s_replay_of_a_line_seen_live_gets_its_id() {
+        let line = "@time=2026-10-22T12:00:01.000Z :bob!b@h PRIVMSG #test :seen";
+        let live = feed(&mut irccloud(true), line);
+        let id = lines(&live)[0].1.msgid.clone();
+        assert!(id.is_some());
+        // Replayed on a later attach: the same made-up id, so it is one line.
+        let mut s = irccloud_at(true, "2026-10-22T13:00:00Z".parse().unwrap());
+        let got = histories(&feed(&mut s, line));
+        assert_eq!(got[0].1[0].msgid, id);
+    }
+
+    #[test]
+    fn irccloud_s_replay_of_a_services_query_opens_nothing() {
+        let mut s = irccloud(true).keeping();
+        let out = feed(&mut s, "@time=2026-10-22T11:00:00.000Z :NickServ!s@services NOTICE alice :You are now identified");
+        assert!(silent(&out), "{out:?}");
+        assert!(s.kept().is_empty());
     }
 
     #[test]

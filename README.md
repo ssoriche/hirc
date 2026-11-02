@@ -21,6 +21,7 @@ debug builds, so later builds and `cargo run` stay fast.
 ignored.
 
 - `history_page_size` (hirc only, default 100): lines per page of history, never more than the server allows (its `CHATHISTORY` limit). `chathistory = false` turns server history off for that server.
+- `bouncer_client_id` (hirc only): this machine's name to IRCCloud's bouncer (`server = "bnc.irccloud.com"`). Keep `password` as IRCCloud gave it (`bnc:…`); hirc sends it as `bnc@<id>:…`, so IRCCloud replays what this client missed while it was away. That replay shows as history: no unread counts, no notifications. Use a different id on each machine. No spaces, `:` or `@`.
 
 ## History
 
