@@ -225,6 +225,9 @@ struct Inflight {
     request: Request,
     /// Asked again by time after the server couldn't find the msgid.
     retried: bool,
+    /// Sent by time (`by_time`), as the server's MSGREFTYPES was then:
+    /// what its answer or FAIL is read against, whatever 005 comes later.
+    by_time: bool,
 }
 
 fn send<I, S>(command: &str, params: I) -> Output
@@ -242,6 +245,22 @@ fn last(msg: &Message) -> &str {
 /// `msg`'s `time` tag, when it has one that parses.
 fn server_time(msg: &Message) -> Option<DateTime<Utc>> {
     msg.tag("time").and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map(|t| t.with_timezone(&Utc))
+}
+
+/// A request as a server that names messages only by time is asked. A
+/// page from a line we hold starts a millisecond past it: BEFORE and
+/// AFTER by time are strict, and a burst can share one millisecond, so
+/// from that line's own time the rest of its burst would be skipped.
+/// `finish_page` cuts the lines this repeats, at the anchor's msgid.
+fn by_time(kind: &Kind) -> Kind {
+    let past = TimeDelta::milliseconds(1);
+    match kind {
+        Kind::Before(a) if a.msgid.is_some() => Kind::Before(Anchor { msgid: None, time: a.time + past }),
+        Kind::Before(a) => Kind::Before(a.by_time()),
+        Kind::After(a) if a.msgid.is_some() => Kind::After(Anchor { msgid: None, time: a.time - past }),
+        Kind::After(a) => Kind::After(a.by_time()),
+        k => k.clone(),
+    }
 }
 
 /// Nothing in `out` carries a made-up msgid to the server: not a
@@ -835,14 +854,17 @@ impl Session {
             self.tail.remove(&key);
         }
         let request = Request { target: target.to_owned(), kind, limit: self.page() };
-        let mut msg = request.message();
+        // The request keeps its msgid (the gap's bookkeeping needs it); a
+        // server that names messages only by time is asked by time.
+        let by_time = !self.isupport.takes_msgid();
+        let mut msg = if by_time { Request { kind: self::by_time(&request.kind), ..request.clone() }.message() } else { request.message() };
         if self.caps.is_enabled("labeled-response") {
             self.label_seq += 1;
             let label = format!("hl{}", self.label_seq);
             msg.tags.push(("label".into(), Some(label.clone())));
             self.labels.insert(label, key.clone());
         }
-        self.inflight.insert(key, Inflight { request, retried: false });
+        self.inflight.insert(key, Inflight { request, retried: false, by_time });
         out.push(Output::Send(msg));
     }
 
@@ -1159,7 +1181,7 @@ impl Session {
     /// asked for is shown all the same. Empty, before the oldest, it is the
     /// start of history; full, after the newest, there is more to fetch;
     /// short, after the newest, the gap is closed.
-    fn finish_page(&mut self, page: Page, cut: bool, out: &mut Vec<Output>) {
+    fn finish_page(&mut self, mut page: Page, cut: bool, out: &mut Vec<Output>) {
         if page.playback {
             return self.finish_playback(&page.target, page.lines, out);
         }
@@ -1169,7 +1191,7 @@ impl Session {
         let over = page.items > page.cap;
         let partial = cut || over;
         let answered = self.answers(page.label.as_deref(), &page.target).and_then(|k| self.inflight.remove(&k).map(|i| (k, i)));
-        let Some((key, Inflight { request, .. })) = answered else {
+        let Some((key, Inflight { request, by_time, .. })) = answered else {
             self.widen_unsolicited(&page);
             self.keep_run(&page.target, &page.lines, Below::Breaks, Above::Breaks, false);
             if !page.lines.is_empty() {
@@ -1178,6 +1200,32 @@ impl Session {
             return;
         };
         self.labels.retain(|_, k| *k != key);
+        let full = page.items >= request.limit;
+        // Asked from a millisecond past the anchor (`by_time`): the anchor,
+        // and its millisecond on the held side of it, are held already.
+        let shown = page.lines.len();
+        if by_time
+            && let Kind::After(from) | Kind::Before(from) = &request.kind
+            && let Some(id) = &from.msgid
+        {
+            let at = page.lines.iter().position(|l| l.msgid.as_ref() == Some(id));
+            match (&request.kind, at) {
+                (Kind::After(_), Some(i)) => drop(page.lines.drain(..=i)),
+                (Kind::Before(_), Some(i)) => page.lines.truncate(i),
+                _ => {}
+            }
+            // Full of held lines only (the anchor past the page's far end,
+            // or nothing past it): one millisecond holds more than a page,
+            // and asking from it again would bring the same page. Asked
+            // once more strictly by time, the rest of that millisecond is
+            // given up on (no join is claimed across it), and paging moves on.
+            if full && !cut && (at.is_none() || page.lines.is_empty()) {
+                let strict = if matches!(request.kind, Kind::After(_)) { Kind::After(from.by_time()) } else { Kind::Before(from.by_time()) };
+                self.request(&request.target, strict, out);
+                return;
+            }
+        }
+        let fresh = page.items.saturating_sub(shown - page.lines.len());
         // Only the end the request moves: a page before can tie in time
         // with the newest held, and must not pull it back. Cut off, a page
         // after still got the part next to what is held; any other got its
@@ -1210,8 +1258,7 @@ impl Session {
             }
             return;
         }
-        let start = page.items == 0 && matches!(request.kind, Kind::Latest | Kind::Before(_));
-        let full = page.items >= request.limit;
+        let start = fresh == 0 && matches!(request.kind, Kind::Latest | Kind::Before(_));
         // Short before: the server's history ends here, the cache's may not.
         let ended = matches!(request.kind, Kind::Before(_)) && !full && self.keep.is_some();
         if ended {
@@ -1325,11 +1372,13 @@ impl Session {
         let by_label = msg.tag("label").and_then(|l| self.labels.remove(l));
         let key = by_label.or_else(|| msg.params.get(3).map(|t| t.to_ascii_lowercase()).filter(|k| self.inflight.contains_key(k)));
         let Some(key) = key else { return };
-        let Some(Inflight { request, retried }) = self.inflight.remove(&key) else { return };
+        let Some(Inflight { request, retried, by_time }) = self.inflight.remove(&key) else { return };
         self.labels.retain(|_, k| *k != key);
+        // Already asked by time: nothing to retry.
         let again = match &request.kind {
-            Kind::Before(a) if a.msgid.is_some() && !retried => Some(Kind::Before(a.by_time())),
-            Kind::After(a) if a.msgid.is_some() && !retried => Some(Kind::After(a.by_time())),
+            Kind::Before(_) | Kind::After(_) if retried || by_time => None,
+            Kind::Before(a) if a.msgid.is_some() => Some(Kind::Before(a.by_time())),
+            Kind::After(a) if a.msgid.is_some() => Some(Kind::After(a.by_time())),
             _ => None,
         };
         if let Some(kind) = again {
@@ -1810,7 +1859,7 @@ impl Session {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::history::Book;
+    use crate::history::{Book, timestamp};
 
     pub(crate) fn now() -> DateTime<Utc> {
         "2026-10-22T12:00:00Z".parse().unwrap()
@@ -3938,5 +3987,324 @@ pub(crate) mod tests {
         assert_eq!(older(&feed(&mut s, ":znc.in BATCH -p")), [false]);
         let cached = s.cached("#test", vec![Line { msgid: Some("c1".into()), ..local_line() }]);
         assert_eq!(older(&cached), [true]);
+    }
+
+    /// A session through soju 0.11.1, as it attached (its caps, its 005s,
+    /// no MOTD), with `book` held from before and nothing in flight.
+    fn sojud(book: Book) -> Session {
+        sojud_paged(book, 20)
+    }
+
+    /// `sojud`, asking for pages of `page` lines.
+    fn sojud_paged(book: Book, page: usize) -> Session {
+        let mut s = Session::new("soju", SessionConfig { history_page: Some(page), ..cfg() }).with_book(book);
+        s.start();
+        let out: Vec<Output> = recorded(include_str!("../tests/data/soju-0.11.1-attach.txt"))
+            .take_while(|l| !l.contains(" JOIN "))
+            .flat_map(|l| s.handle(Message::parse(l).unwrap(), now()))
+            .collect();
+        // The TARGETS asked for at registration, answered with nothing.
+        if let Some(label) = out.iter().find_map(|o| match o {
+            Output::Send(m) if m.command == "CHATHISTORY" => m.tag("label").map(str::to_owned),
+            _ => None,
+        }) {
+            feed(&mut s, &format!("@label={label} :localhost ACK"));
+        }
+        s
+    }
+
+    /// soju's `AFTER` exchanges: by msgid (refused), then by time. Lines
+    /// other than ours, and the anchor we sent (its msgid and time).
+    fn soju_after() -> (Vec<&'static str>, String, DateTime<Utc>) {
+        let text = include_str!("../tests/data/soju-0.11.1-after.txt");
+        let sent: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("> ")).collect();
+        let id = sent[0].split_whitespace().find_map(|p| p.strip_prefix("msgid=")).unwrap().to_owned();
+        let at = sent[1].split_whitespace().find_map(|p| p.strip_prefix("timestamp=")).unwrap().parse().unwrap();
+        (recorded(text).collect(), id, at)
+    }
+
+    /// The lines of soju's answer to `@label=<label>`, relabelled `ours`.
+    fn soju_answer(lines: &[&str], label: &str, ours: &str) -> Vec<String> {
+        let start = format!("@label={label} ");
+        let i = lines.iter().position(|l| l.starts_with(&start)).unwrap();
+        let first = lines[i].replacen(&start, &format!("@label={ours} "), 1);
+        std::iter::once(first).chain(lines[i + 1..].iter().take_while(|l| !l.starts_with("@label=")).map(|l| (*l).to_owned())).collect()
+    }
+
+    #[test]
+    fn a_server_that_takes_only_timestamps_is_asked_by_time() {
+        let (lines, id, at) = soju_after();
+        let mut book = Book::default();
+        book.note("#test", false, &[Line { msgid: Some(id), time: at, ..local_line() }]);
+        let mut s = sojud(book);
+        // `MSGREFTYPES=timestamp`: soju's msgid is never sent as an anchor
+        // (the time is a millisecond early, for a burst in that one).
+        let (wire, label) = asked(&feed(&mut s, ":alice!alice@127.0.0.1 JOIN #test"));
+        assert_eq!(wire, format!("CHATHISTORY AFTER #test {} 20", timestamp(at - TimeDelta::milliseconds(1))));
+        // Its answer, in a labeled-response batch without a source.
+        let out: Vec<Output> = soju_answer(&lines, "t", &label).iter().flat_map(|l| feed(&mut s, l)).collect();
+        let got = histories(&out);
+        assert_eq!(got.len(), 1, "{out:?}");
+        assert_eq!(texts(&got[0].1), ["fact 2", "fact 3"]);
+        assert!(got[0].1.iter().all(|l| l.replayed && l.msgid.is_some()));
+    }
+
+    #[test]
+    fn a_server_without_msgreftypes_or_with_msgid_in_it_is_asked_by_msgid() {
+        for extra in ["", "MSGREFTYPES=msgid,timestamp"] {
+            let mut book = Book::default();
+            book.note("#test", false, &[Line { msgid: Some("m1".into()), time: "2026-10-22T10:00:00Z".parse().unwrap(), ..local_line() }]);
+            let mut s = historied("", 50, book);
+            feed(&mut s, &format!(":srv 005 alice {extra} :are supported"));
+            let (wire, _) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+            assert_eq!(wire, "CHATHISTORY AFTER #test msgid=m1 20", "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn soju_refusing_a_msgid_anchor_is_asked_again_by_time() {
+        // soju's FAIL names the anchor where the target would be; the label
+        // still finds the request.
+        let (lines, id, at) = soju_after();
+        let mut book = Book::default();
+        book.note("#test", false, &[Line { msgid: Some(id.clone()), time: at, ..local_line() }]);
+        let mut s = historied("", 50, book);
+        let (wire, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        assert_eq!(wire, format!("CHATHISTORY AFTER #test msgid={id} 20"));
+        let out: Vec<Output> = soju_answer(&lines, "m", &label).iter().flat_map(|l| feed(&mut s, l)).collect();
+        let (wire, label) = asked(&out);
+        assert_eq!(wire, format!("CHATHISTORY AFTER #test {} 20", timestamp(at)));
+        let out: Vec<Output> = soju_answer(&lines, "t", &label).iter().flat_map(|l| feed(&mut s, l)).collect();
+        assert_eq!(histories(&out).iter().map(|(_, l, _)| texts(l)).collect::<Vec<_>>(), [["fact 2", "fact 3"]]);
+    }
+
+    #[test]
+    fn a_gap_asked_by_time_keeps_the_lines_in_its_anchors_millisecond() {
+        // soju stamps a burst with one millisecond, and its AFTER by time
+        // is strict: from the newest line's time it would skip the rest.
+        let text = include_str!("../tests/data/soju-0.11.1-same-ms.txt");
+        let (asked_at, earlier) = {
+            let mut q = text.lines().filter_map(|l| l.strip_prefix("> CHATHISTORY AFTER #test ")).map(|l| l.split(' ').next().unwrap().to_owned());
+            (q.next().unwrap(), q.next().unwrap())
+        };
+        let held = Message::parse(text.lines().find(|l| l.ends_with(":burst 1")).unwrap()).unwrap();
+        let mut book = Book::default();
+        let (id, at) = (held.tag("msgid").unwrap().to_owned(), history::parse_timestamp(&asked_at).unwrap());
+        book.note("#test", false, &[Line { msgid: Some(id), time: at, ..local_line() }]);
+        let mut s = sojud(book);
+        let (wire, label) = asked(&feed(&mut s, ":alice!alice@127.0.0.1 JOIN #test"));
+        assert_eq!(wire, format!("CHATHISTORY AFTER #test {earlier} 20"));
+        // soju's answer from a millisecond early: the held line, then the rest.
+        let answer = text.lines().skip_while(|l| !(l.starts_with("> ") && l.contains(&earlier))).skip(1);
+        let out: Vec<Output> = answer
+            .take_while(|l| !l.contains(" PONG "))
+            .map(|l| if l.starts_with("BATCH +") { format!("@label={label} {l}") } else { l.to_owned() })
+            .flat_map(|l| feed(&mut s, &l))
+            .collect();
+        let got = histories(&out);
+        assert_eq!(got.iter().map(|(_, l, _)| texts(l)).collect::<Vec<_>>(), [["burst 2", "burst 3"]], "{out:?}");
+        assert!(lines(&out).iter().all(|(_, l)| !l.text.starts_with("burst")), "nothing live: {out:?}");
+    }
+
+    #[test]
+    fn a_page_asked_of_soju_is_never_past_its_chathistory_limit() {
+        // soju says `CHATHISTORY=1000`, and FAILs a LATEST past it.
+        let mut s = Session::new("soju", SessionConfig { history_page: Some(100_000), ..cfg() });
+        s.start();
+        for l in recorded(include_str!("../tests/data/soju-0.11.1-attach.txt")).take_while(|l| !l.contains(" JOIN ")) {
+            feed(&mut s, l);
+        }
+        assert_eq!(s.isupport().chathistory, Some(1000));
+        let out = feed(&mut s, ":alice!alice@127.0.0.1 JOIN #test");
+        let latest: Vec<String> = sent(&out).into_iter().filter(|m| m.contains("CHATHISTORY LATEST #test")).collect();
+        assert!(latest.len() == 1 && latest[0].ends_with(" * 1000"), "{out:?}");
+    }
+
+    #[test]
+    fn soju_saying_no_marker_after_our_join_moves_no_marker() {
+        // `MARKREAD #test *` comes unasked after the JOIN: "no marker set",
+        // never a time, so the window's own marker stays where it is.
+        let mut s = sojud(Book::default());
+        let out: Vec<Output> = recorded(include_str!("../tests/data/soju-0.11.1-attach.txt"))
+            .skip_while(|l| !l.contains(" JOIN "))
+            .take_while(|l| !l.contains(" PONG "))
+            .flat_map(|l| feed(&mut s, l))
+            .collect();
+        let markers: Vec<_> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::Event(Event::ReadMarker { target, time, .. }) => Some((target.clone(), *time)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers, [(Target::Channel("#test".into()), None)]);
+        assert!(sent(&out).iter().all(|m| !m.starts_with("MARKREAD #test timestamp=")), "{out:?}");
+    }
+
+    /// soju's pages through one millisecond's burst (`record_soju_facts`).
+    const SOJU_PAGES: &str = include_str!("../tests/data/soju-0.11.1-same-ms-pages.txt");
+
+    /// `burst <n>` as held from before, with soju's msgid and time.
+    fn soju_burst(n: usize) -> Line {
+        let m = Message::parse(SOJU_PAGES.lines().find(|l| l.ends_with(&format!(":burst {n}"))).unwrap()).unwrap();
+        Line { msgid: m.tag("msgid").map(str::to_owned), time: m.tag("time").unwrap().parse().unwrap(), text: format!("burst {n}"), ..local_line() }
+    }
+
+    /// The burst's millisecond, moved by `ms`, as a CHATHISTORY bound.
+    fn soju_bound(ms: i64) -> String {
+        timestamp(soju_burst(1).time + TimeDelta::milliseconds(ms))
+    }
+
+    /// soju's answer to `> <cmd>`, its BATCH labelled `label`.
+    fn soju_page(cmd: &str, label: &str) -> Vec<String> {
+        let wanted = format!("> {cmd}");
+        let i = SOJU_PAGES.lines().position(|l| l == wanted).unwrap_or_else(|| panic!("{cmd} not recorded"));
+        SOJU_PAGES
+            .lines()
+            .skip(i + 1)
+            .take_while(|l| !l.contains(" PONG "))
+            .map(|l| if l.starts_with("BATCH +") { format!("@label={label} {l}") } else { l.to_owned() })
+            .collect()
+    }
+
+    fn feed_all(s: &mut Session, lines: &[String]) -> Vec<Output> {
+        lines.iter().flat_map(|l| feed(s, l)).collect()
+    }
+
+    /// Joined `#test`, with the gap since `held` asked for and answered
+    /// with nothing new (an ACK), so only what comes next is in flight.
+    fn soju_joined(held: &[Line], page: usize) -> Session {
+        let mut book = Book::default();
+        book.note("#test", false, held);
+        let mut s = sojud_paged(book, page).keeping();
+        let (_, label) = asked(&feed(&mut s, ":alice!alice@127.0.0.1 JOIN #test"));
+        feed(&mut s, &format!("@label={label} :localhost ACK"));
+        s.kept();
+        s
+    }
+
+    #[test]
+    fn scrolling_up_by_time_keeps_the_lines_in_the_oldest_lines_millisecond() {
+        // Oldest held: burst 2. soju's BEFORE by time is strict, so from
+        // its own time burst 1 would never come.
+        let mut s = soju_joined(&[soju_burst(2), soju_burst(3)], 100);
+        let (wire, label) = asked(&older(&mut s, "#test"));
+        assert_eq!(wire, format!("CHATHISTORY BEFORE #test {} 100", soju_bound(1)));
+        let out = feed_all(&mut s, &soju_page(&wire, &label));
+        assert_eq!(
+            histories(&out).iter().map(|(_, l, start)| (texts(l), *start)).collect::<Vec<_>>(),
+            [(vec!["fact 1", "fact 2", "fact 3", "burst 1"], false)]
+        );
+        // The run meets burst 2 exactly: the repeats are cut, not kept.
+        let kept = s.kept();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].above, Above::Joins(soju_burst(2).msgid.unwrap()));
+        assert_eq!(texts(&kept[0].lines), ["fact 1", "fact 2", "fact 3", "burst 1"]);
+    }
+
+    #[test]
+    fn a_scroll_up_that_brings_only_the_held_line_is_the_start_of_history() {
+        // soju's page from a millisecond past fact 1 (the first line it
+        // has) holds fact 1 alone: nothing older, the start.
+        let fact1 = Message::parse(SOJU_PAGES.lines().find(|l| l.ends_with(":fact 1")).unwrap()).unwrap();
+        let held = Line { msgid: fact1.tag("msgid").map(str::to_owned), time: fact1.tag("time").unwrap().parse().unwrap(), ..local_line() };
+        let mut s = soju_joined(std::slice::from_ref(&held), 100);
+        let (wire, label) = asked(&older(&mut s, "#test"));
+        assert_eq!(wire, format!("CHATHISTORY BEFORE #test {} 100", timestamp(held.time + TimeDelta::milliseconds(1))));
+        let first = soju_page(&format!("CHATHISTORY BEFORE #test {} 100", soju_bound(1)), &label);
+        let only: Vec<String> = first.iter().filter(|l| l.starts_with("@label=") || l.starts_with("BATCH -") || l.ends_with(":fact 1")).cloned().collect();
+        assert_eq!(only.len(), 3, "{only:?}");
+        let out = feed_all(&mut s, &only);
+        assert!(histories(&out).iter().all(|(_, l, _)| l.is_empty()), "{out:?}");
+        assert!(out.iter().any(|o| matches!(o, Output::CacheOlder(_))) || histories(&out).iter().any(|(_, _, start)| *start), "the start: {out:?}");
+        assert!(s.server_ended("#test"));
+    }
+
+    #[test]
+    fn a_page_up_inside_one_millisecond_is_asked_again_strictly_and_moves_on() {
+        // Pages of 2 and a burst of 3: from a millisecond past burst 1,
+        // soju gives burst 2 and 3 again, the same page every time.
+        let mut s = soju_joined(&[soju_burst(1), soju_burst(2), soju_burst(3)], 2);
+        let (wire, label) = asked(&older(&mut s, "#test"));
+        assert_eq!(wire, format!("CHATHISTORY BEFORE #test {} 2", soju_bound(1)));
+        let out = feed_all(&mut s, &soju_page(&wire, &label));
+        assert!(histories(&out).is_empty(), "the repeats aren't shown: {out:?}");
+        let (wire, label) = asked(&out);
+        assert_eq!(wire, format!("CHATHISTORY BEFORE #test {} 2", soju_bound(0)));
+        let out = feed_all(&mut s, &soju_page(&wire, &label));
+        assert_eq!(histories(&out).iter().map(|(_, l, _)| texts(l)).collect::<Vec<_>>(), [["fact 2", "fact 3"]]);
+        // Asked strictly: what lies between is not claimed held.
+        let kept = s.kept();
+        assert_eq!(kept.iter().map(|e| e.above.clone()).collect::<Vec<_>>(), [Above::Breaks], "{kept:?}");
+    }
+
+    #[test]
+    fn a_gap_inside_one_millisecond_is_asked_again_strictly_and_moves_on() {
+        // Newest held: burst 3. Pages of 2: from a millisecond early, soju
+        // gives burst 1 and 2, the same page every time.
+        let mut book = Book::default();
+        book.note("#test", false, &[soju_burst(1), soju_burst(2), soju_burst(3)]);
+        let mut s = sojud_paged(book, 2).keeping();
+        let (wire, label) = asked(&feed(&mut s, ":alice!alice@127.0.0.1 JOIN #test"));
+        assert_eq!(wire, format!("CHATHISTORY AFTER #test {} 2", soju_bound(-1)));
+        let out = feed_all(&mut s, &soju_page(&wire, &label));
+        assert!(histories(&out).is_empty(), "the repeats aren't shown: {out:?}");
+        let (wire, label) = asked(&out);
+        assert_eq!(wire, format!("CHATHISTORY AFTER #test {} 2", soju_bound(0)));
+        let out = feed_all(&mut s, &soju_page(&wire, &label));
+        assert_eq!(histories(&out).iter().map(|(_, l, _)| texts(l)).collect::<Vec<_>>(), [["after burst"]]);
+        assert!(out.iter().any(|o| matches!(o, Output::Event(Event::Filled { .. }))), "the gap is closed: {out:?}");
+        let kept = s.kept();
+        assert_eq!(kept.iter().map(|e| e.below.clone()).collect::<Vec<_>>(), [Below::Breaks], "{kept:?}");
+    }
+
+    #[test]
+    fn a_request_sent_by_msgid_is_still_retried_by_time_after_a_late_msgreftypes() {
+        let (lines, id, at) = soju_after();
+        let mut book = Book::default();
+        book.note("#test", false, &[Line { msgid: Some(id.clone()), time: at, ..local_line() }]);
+        let mut s = historied("", 50, book);
+        let (wire, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        assert_eq!(wire, format!("CHATHISTORY AFTER #test msgid={id} 20"));
+        // The token comes once the request is out (a later 005).
+        feed(&mut s, ":srv 005 alice MSGREFTYPES=timestamp :are supported");
+        let out = feed_all(&mut s, &soju_answer(&lines, "m", &label));
+        let (wire, _) = asked(&out);
+        assert_eq!(wire, format!("CHATHISTORY AFTER #test {} 20", timestamp(at)));
+    }
+
+    #[test]
+    fn a_page_asked_by_time_is_cut_even_if_msgreftypes_goes_away() {
+        let text = include_str!("../tests/data/soju-0.11.1-same-ms.txt");
+        let held = Message::parse(text.lines().find(|l| l.ends_with(":burst 1")).unwrap()).unwrap();
+        let mut book = Book::default();
+        book.note("#test", false, &[Line { msgid: held.tag("msgid").map(str::to_owned), time: held.tag("time").unwrap().parse().unwrap(), ..local_line() }]);
+        let mut s = sojud(book);
+        let (wire, label) = asked(&feed(&mut s, ":alice!alice@127.0.0.1 JOIN #test"));
+        let early = wire.split(' ').nth(3).unwrap().to_owned();
+        feed(&mut s, ":localhost 005 * -MSGREFTYPES :are supported");
+        let answer: Vec<String> = text
+            .lines()
+            .skip_while(|l| !(l.starts_with("> ") && l.contains(&early)))
+            .skip(1)
+            .take_while(|l| !l.contains(" PONG "))
+            .map(|l| if l.starts_with("BATCH +") { format!("@label={label} {l}") } else { l.to_owned() })
+            .collect();
+        let out = feed_all(&mut s, &answer);
+        assert_eq!(histories(&out).iter().map(|(_, l, _)| texts(l)).collect::<Vec<_>>(), [["burst 2", "burst 3"]]);
+    }
+
+    #[test]
+    fn a_fail_to_a_request_by_time_is_not_retried() {
+        let (answers, id, at) = soju_after();
+        let mut book = Book::default();
+        book.note("#test", false, &[Line { msgid: Some(id), time: at, ..local_line() }]);
+        let mut s = sojud(book);
+        let (wire, label) = asked(&feed(&mut s, ":alice!alice@127.0.0.1 JOIN #test"));
+        assert!(wire.contains(" timestamp="), "{wire}");
+        // soju's FAIL shape, for this request.
+        let out = feed_all(&mut s, &soju_answer(&answers, "m", &label));
+        assert!(sent(&out).is_empty(), "{out:?}");
+        assert_eq!(lines(&out).iter().filter(|(t, l)| *t == Target::Server && l.text.starts_with("Can't get history")).count(), 1, "{out:?}");
     }
 }

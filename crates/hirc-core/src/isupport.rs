@@ -1,5 +1,6 @@
 //! RPL_ISUPPORT (005): what kind of names are channels, which nick prefixes
-//! exist, and the server's CHATHISTORY limit.
+//! exist, the server's CHATHISTORY limit, and how it lets a message be
+//! named (MSGREFTYPES).
 
 #[derive(Clone, Debug)]
 pub struct Isupport {
@@ -8,11 +9,14 @@ pub struct Isupport {
     /// (mode, symbol), highest first: `[('o', '@'), ('v', '+')]`.
     pub prefix: Vec<(char, char)>,
     pub chathistory: Option<usize>,
+    /// `MSGREFTYPES`: the kinds of message reference the server takes, in
+    /// its order; `None` when it doesn't say.
+    pub msgreftypes: Option<Vec<String>>,
 }
 
 impl Default for Isupport {
     fn default() -> Isupport {
-        Isupport { network: None, chantypes: "#&".into(), prefix: vec![('o', '@'), ('v', '+')], chathistory: None }
+        Isupport { network: None, chantypes: "#&".into(), prefix: vec![('o', '@'), ('v', '+')], chathistory: None, msgreftypes: None }
     }
 }
 
@@ -35,9 +39,18 @@ impl Isupport {
                 "PREFIX" => self.prefix = if neg { Isupport::default().prefix } else { parse_prefix(val) },
                 // 0 is the spec's "no limit".
                 "CHATHISTORY" | "draft/CHATHISTORY" => self.chathistory = if neg { None } else { val.parse().ok().filter(|&n| n > 0) },
+                "MSGREFTYPES" => self.msgreftypes = (!neg).then(|| val.split(',').filter(|t| !t.is_empty()).map(str::to_owned).collect()),
                 _ => {}
             }
         }
+    }
+
+    /// Whether a CHATHISTORY anchor may be `msgid=`. A server that lists
+    /// its MSGREFTYPES without `msgid` (soju: `timestamp` only) refuses
+    /// one, so it is asked by time. Without the token, msgids are taken,
+    /// as the chathistory spec has them.
+    pub fn takes_msgid(&self) -> bool {
+        self.msgreftypes.as_ref().is_none_or(|t| t.iter().any(|t| t == "msgid"))
     }
 
     pub fn is_channel(&self, target: &str) -> bool {
@@ -99,5 +112,18 @@ mod tests {
         assert_eq!(i.chathistory, None);
         i.apply(&params(":srv 005 alice draft/CHATHISTORY=50 :are supported"));
         assert_eq!(i.chathistory, Some(50));
+    }
+
+    #[test]
+    fn msgreftypes_say_whether_a_msgid_anchor_is_taken() {
+        let mut i = Isupport::default();
+        assert!(i.takes_msgid(), "no token: msgids are taken");
+        i.apply(&params(":localhost 005 * MSGREFTYPES=timestamp NETWORK=HircTest :are supported"));
+        assert!(!i.takes_msgid());
+        i.apply(&params(":srv 005 alice MSGREFTYPES=timestamp,msgid :are supported"));
+        assert!(i.takes_msgid());
+        i.apply(&params(":srv 005 alice MSGREFTYPES=timestamp :are supported"));
+        i.apply(&params(":srv 005 alice -MSGREFTYPES :are supported"));
+        assert!(i.takes_msgid());
     }
 }
