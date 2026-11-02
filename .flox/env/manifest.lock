@@ -43,6 +43,29 @@
       "rustfmt": {
         "pkg-path": "rustfmt",
         "pkg-group": "rust-toolchain"
+      },
+      "soju": {
+        "pkg-path": "soju",
+        "pkg-group": "bouncers",
+        "version": "0.11.1",
+        "systems": [
+          "aarch64-darwin"
+        ]
+      },
+      "znc": {
+        "pkg-path": "znc",
+        "pkg-group": "bouncers",
+        "version": "1.10.3",
+        "systems": [
+          "aarch64-darwin"
+        ]
+      },
+      "zncModules-playback": {
+        "pkg-path": "zncModules.playback",
+        "pkg-group": "bouncers",
+        "systems": [
+          "aarch64-darwin"
+        ]
       }
     },
     "options": {
@@ -643,6 +666,93 @@
       },
       "system": "x86_64-darwin",
       "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "soju",
+      "broken": false,
+      "derivation": "/nix/store/2b938fa79dvacw2ndwg95brml7z7b5d4-soju-0.11.1.drv",
+      "description": "User-friendly IRC bouncer",
+      "install_id": "soju",
+      "license": "AGPL-3.0-only",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=1c89083e451e891152365b799595cf7790a43325",
+      "name": "soju-0.11.1",
+      "pname": "soju",
+      "rev": "1c89083e451e891152365b799595cf7790a43325",
+      "rev_count": 1105037,
+      "rev_date": "2026-10-30T06:21:25Z",
+      "scrape_date": "2026-10-31T05:47:33.575229Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.11.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/2ik7ifhc4x4p014w24cxb1srff0bf0f1-soju-0.11.1"
+      },
+      "system": "aarch64-darwin",
+      "group": "bouncers",
+      "priority": 5
+    },
+    {
+      "attr_path": "znc",
+      "broken": false,
+      "derivation": "/nix/store/fkvxdvbqnqhg1110ka8paz2jf41yz6x0-znc-1.10.3.drv",
+      "description": "Advanced IRC bouncer",
+      "install_id": "znc",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=1c89083e451e891152365b799595cf7790a43325",
+      "name": "znc-1.10.3",
+      "pname": "znc",
+      "rev": "1c89083e451e891152365b799595cf7790a43325",
+      "rev_count": 1105037,
+      "rev_date": "2026-10-30T06:21:25Z",
+      "scrape_date": "2026-10-31T05:47:33.688380Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.10.3",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/a6p28hmnkjj188g33swj7ack3vr2c9wf-znc-1.10.3"
+      },
+      "system": "aarch64-darwin",
+      "group": "bouncers",
+      "priority": 5
+    },
+    {
+      "attr_path": "zncModules.playback",
+      "broken": false,
+      "derivation": "/nix/store/n578hxyqp15916svx7gyccgs4r23c9yy-znc-playback-0-unstable-2020-05-10.drv",
+      "description": "Advanced playback module for ZNC",
+      "install_id": "zncModules-playback",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=1c89083e451e891152365b799595cf7790a43325",
+      "name": "znc-playback-0-unstable-2020-05-10",
+      "pname": "playback",
+      "rev": "1c89083e451e891152365b799595cf7790a43325",
+      "rev_count": 1105037,
+      "rev_date": "2026-10-30T06:21:25Z",
+      "scrape_date": "2026-10-31T05:47:33.688403Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2020-05-10",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/zz166cn8zdr851zzyvm9cgxy02hc55xj-znc-playback-0-unstable-2020-05-10"
+      },
+      "system": "aarch64-darwin",
+      "group": "bouncers",
       "priority": 5
     }
   ]
