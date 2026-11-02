@@ -503,6 +503,9 @@ async fn connect_once(
                     let Some(line) = line? else { return Ok(End::Closed(session.closing().map(str::to_owned))) };
                     last_rx = Instant::now();
                     pinged = false;
+                    // What the server sent, never what we send: ours can
+                    // hold PASS or AUTHENTICATE. Off unless RUST_LOG asks.
+                    tracing::trace!(target: "hirc::wire", "{name} <- {line}");
                     match Message::parse(&line) {
                         Ok(m) => outs = session.handle(m, Utc::now()),
                         Err(e) => tracing::debug!("{name}: dropped line ({e}): {line:?}"),

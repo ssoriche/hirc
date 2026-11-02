@@ -72,6 +72,17 @@ The input line is vim-style and starts in Insert mode.
 
 Start a line with `//` to send a message that begins with a slash.
 
+## Wire log
+
+To see every line a server sends, run with the `hirc::wire` trace on:
+
+```fish
+env RUST_LOG=warn,hirc::wire=trace NO_COLOR=1 hirc 2> wire.log
+```
+
+It logs only what servers send, never what hirc sends, so passwords don't
+appear. It does hold your messages: trim it before sharing.
+
 ## Tests
 
 ```sh
