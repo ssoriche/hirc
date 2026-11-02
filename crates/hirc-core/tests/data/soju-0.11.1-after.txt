@@ -1,0 +1,11 @@
+> @label=m CHATHISTORY AFTER #test msgid=icpysztm3faamjxd2d5cgnjv5w 100
+@label=m :localhost FAIL CHATHISTORY INVALID_PARAMS AFTER msgid=icpysztm3faamjxd2d5cgnjv5w :Invalid first bound
+:localhost PONG localhost hirc-done
+> @label=t CHATHISTORY AFTER #test timestamp=2026-11-02T04:02:44.313Z 100
+@label=t BATCH +5 labeled-response
+@batch=5 BATCH +4 chathistory #test
+@msgid=39tanjm3swe8hja8gcgussyjas;time=2026-11-02T04:02:44.321Z;batch=4 :bob!~bob@127.0.0.1 PRIVMSG #test :fact 2
+@time=2026-11-02T04:02:44.328Z;msgid=ek24tu3qq22z9ivd4xp8mbiz5a;batch=4 :bob!~bob@127.0.0.1 PRIVMSG #test :fact 3
+@batch=5 BATCH -4
+BATCH -5
+:localhost PONG localhost hirc-done

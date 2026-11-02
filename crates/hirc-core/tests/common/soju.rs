@@ -90,6 +90,32 @@ impl Soju {
         );
     }
 
+    /// Waits until soju's store holds every one of `texts` in `target`'s
+    /// history. soju stores a line some time after it relays it, so a test
+    /// asks it (with LATEST) instead of guessing how long that takes.
+    /// Panics after 5s.
+    pub async fn holds(&self, target: &str, texts: &[&str]) {
+        let (mut c, _) = register(self.port, PASSWORD, USER, &username(), &["batch", "server-time", "message-tags", "draft/chathistory"]).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            c.send(&format!("CHATHISTORY LATEST {target} * 100")).await;
+            c.send("PING :soju-holds").await;
+            let got = c.until("soju-holds").await;
+            let said: Vec<String> = got
+                .iter()
+                .filter_map(|l| hirc_core::proto::Message::parse(l).ok())
+                .filter(|m| m.command == "PRIVMSG")
+                .filter_map(|m| m.params.last().cloned())
+                .collect();
+            if texts.iter().all(|t| said.iter().any(|s| s == t)) {
+                c.send("QUIT").await;
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "soju never stored {texts:?} in {target}: {got:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// What soju has logged, for a failing test to show.
     pub fn log(&self) -> String {
         std::fs::read_to_string(self.dir.path().join("soju.log")).unwrap_or_default()

@@ -1,6 +1,6 @@
-@msgid=sk38vrjyvftx4wfiminhjwnzsi;time=2026-11-02T02:27:59.956Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact live
+@time=2026-11-02T04:02:44.830Z;msgid=7fm7isyik3ptrwq65genakhzin :bob!~bob@127.0.0.1 PRIVMSG #test :fact live
 > CHATHISTORY LATEST #test * 1
-BATCH +4 chathistory #test
-@time=2026-11-02T02:27:59.956Z;msgid=sk38vrjyvftx4wfiminhjwnzsi;batch=4 :bob!~bob@127.0.0.1 PRIVMSG #test :fact live
-BATCH -4
+BATCH +15 chathistory #test
+@time=2026-11-02T04:02:44.778Z;msgid=ubj3c45qjb7gipsxapm6t6sb26;batch=15 :bob!~bob@127.0.0.1 PRIVMSG #test :after burst
+BATCH -15
 :localhost PONG localhost hirc-done

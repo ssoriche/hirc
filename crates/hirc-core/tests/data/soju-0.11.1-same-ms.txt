@@ -1,0 +1,18 @@
+> CHATHISTORY LATEST #test * 3
+BATCH +6 chathistory #test
+@time=2026-11-02T04:02:44.717Z;msgid=52atghybktdbe5zt267xsxm2ea;batch=6 :bob!~bob@127.0.0.1 PRIVMSG #test :burst 1
+@time=2026-11-02T04:02:44.717Z;msgid=cumysntxkaus5b9d58b5g37qde;batch=6 :bob!~bob@127.0.0.1 PRIVMSG #test :burst 2
+@time=2026-11-02T04:02:44.717Z;msgid=m7bnc9dzz4xprjhce75jaaf78a;batch=6 :bob!~bob@127.0.0.1 PRIVMSG #test :burst 3
+BATCH -6
+:localhost PONG localhost hirc-done
+> CHATHISTORY AFTER #test timestamp=2026-11-02T04:02:44.717Z 100
+BATCH +7 chathistory #test
+BATCH -7
+:localhost PONG localhost hirc-done
+> CHATHISTORY AFTER #test timestamp=2026-11-02T04:02:44.716Z 100
+BATCH +8 chathistory #test
+@time=2026-11-02T04:02:44.717Z;msgid=52atghybktdbe5zt267xsxm2ea;batch=8 :bob!~bob@127.0.0.1 PRIVMSG #test :burst 1
+@time=2026-11-02T04:02:44.717Z;msgid=cumysntxkaus5b9d58b5g37qde;batch=8 :bob!~bob@127.0.0.1 PRIVMSG #test :burst 2
+@time=2026-11-02T04:02:44.717Z;msgid=m7bnc9dzz4xprjhce75jaaf78a;batch=8 :bob!~bob@127.0.0.1 PRIVMSG #test :burst 3
+BATCH -8
+:localhost PONG localhost hirc-done

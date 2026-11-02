@@ -10,7 +10,7 @@
 mod common;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use common::events::{applied_until, joined, line_in, net, next_matching, offline, said, said_in};
+use common::events::{applied_until, joined, line_in, net, next_matching, offline, page, said, said_in};
 use common::soju::{self, Soju};
 use common::znc::{self, Znc};
 use common::{Ergo, Raw, record, register, wait_in_channel};
@@ -273,7 +273,9 @@ async fn record_znc_facts() {
 }
 
 /// Records what soju 0.11.1 really sends: its caps, its CHATHISTORY limit
-/// (005), LATEST past the limit, TARGETS, MARKREAD, and a live line.
+/// (005), LATEST past the limit, TARGETS, MARKREAD, AFTER by msgid and by
+/// time, BEFORE and AFTER inside a burst sharing one millisecond, and a
+/// live line.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "writes tests/data/soju-0.11.1-*.txt: run by hand when the harness changes"]
 async fn record_soju_facts() {
@@ -319,6 +321,53 @@ async fn record_soju_facts() {
         h.extend(ask(&mut c, &cmd).await);
     }
     record("soju-0.11.1-chathistory.txt", &h);
+    // soju says `MSGREFTYPES=timestamp`: what it does with a msgid anchor,
+    // and with the same place by time.
+    let first = h.iter().find(|l| l.ends_with(":fact 1")).and_then(|l| Message::parse(l).ok()).expect("fact 1 in LATEST");
+    let (id, at) = (first.tag("msgid").unwrap_or_default().to_owned(), first.tag("time").unwrap_or_default().to_owned());
+    let mut after = Vec::new();
+    for cmd in [format!("@label=m CHATHISTORY AFTER #test msgid={id} 100"), format!("@label=t CHATHISTORY AFTER #test timestamp={at} 100")] {
+        after.extend(ask(&mut c, &cmd).await);
+    }
+    record("soju-0.11.1-after.txt", &after);
+    // A burst, sent at once (on loopback, all in one millisecond): AFTER
+    // its first line's time, and AFTER a millisecond before it.
+    for i in 1..=3 {
+        bob.send(&format!("PRIVMSG #test :burst {i}")).await;
+    }
+    c.until("burst 3").await;
+    soju.holds("#test", &["burst 1", "burst 2", "burst 3"]).await;
+    let burst = ask(&mut c, "CHATHISTORY LATEST #test * 3").await;
+    let times: Vec<&str> =
+        burst.iter().filter(|l| l.contains(":burst ")).filter_map(|l| l.split(';').chain(l.split(' ')).find_map(|t| t.split("time=").nth(1))).collect();
+    assert!(times.len() == 3 && times.iter().all(|t| t.get(..24) == times[0].get(..24)), "re-run: the burst spread over milliseconds: {burst:#?}");
+    let first = burst.iter().find(|l| l.ends_with(":burst 1")).and_then(|l| Message::parse(l).ok()).unwrap_or_else(|| panic!("burst 1 in LATEST: {burst:#?}"));
+    let at: DateTime<Utc> = first.tag("time").and_then(|t| t.parse().ok()).expect("burst 1's time");
+    let mut same = burst;
+    for cmd in [format!("CHATHISTORY AFTER #test {} 100", timestamp(at)), format!("CHATHISTORY AFTER #test {} 100", timestamp(at - TimeDelta::milliseconds(1)))]
+    {
+        same.extend(ask(&mut c, &cmd).await);
+    }
+    record("soju-0.11.1-same-ms.txt", &same);
+    // Pages through that millisecond: BEFORE strictly and from a ms past
+    // it, and pages of 2, smaller than the burst, both ways.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    bob.send("PRIVMSG #test :after burst").await;
+    c.until("after burst").await;
+    soju.holds("#test", &["after burst"]).await;
+    let (early, past) = (timestamp(at - TimeDelta::milliseconds(1)), timestamp(at + TimeDelta::milliseconds(1)));
+    let mut pages = Vec::new();
+    for cmd in [
+        format!("CHATHISTORY BEFORE #test {} 100", timestamp(at)),
+        format!("CHATHISTORY BEFORE #test {past} 100"),
+        format!("CHATHISTORY BEFORE #test {past} 2"),
+        format!("CHATHISTORY BEFORE #test {} 2", timestamp(at)),
+        format!("CHATHISTORY AFTER #test {early} 2"),
+        format!("CHATHISTORY AFTER #test {} 2", timestamp(at)),
+    ] {
+        pages.extend(ask(&mut c, &cmd).await);
+    }
+    record("soju-0.11.1-same-ms-pages.txt", &pages);
     // A live line from Ergo, then the same line from history: one msgid?
     bob.send("PRIVMSG #test :fact live").await;
     let mut live = c.until("fact live").await;
@@ -561,4 +610,146 @@ async fn znc_a_restart_scrolls_up_through_the_cached_lines() {
     applied_until(&mut rx, &mut store, |e| matches!(e, Event::Status { status: ConnStatus::Connected { .. }, .. })).await;
     scroll_to_the_top(&tx, &mut rx, &mut store, "znc", &chan).await;
     assert_eq!(said_in(&mut store, &chan), ["m1", "m2", "m3", "m4", "m5"]);
+}
+
+/// Spec, soju: LATEST on join. A channel opens on what soju kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn soju_the_latest_page_comes_on_join() {
+    let ergo = Ergo::start();
+    let soju = Soju::start(&ergo).await;
+    let mut bob = join_bob(&ergo).await;
+    for t in ["s1", "s2", "s3"] {
+        bob.send(&format!("PRIVMSG #test :{t}")).await;
+    }
+    soju.holds("#test", &["s1", "s2", "s3"]).await;
+    let (_tx, mut rx) = net(via_soju(&soju));
+    let (lines, _) = page(&mut rx, "#test").await;
+    assert_eq!(said(&lines), ["s1", "s2", "s3"]);
+    assert!(lines.iter().all(|l| l.replayed), "{lines:?}");
+    assert!(lines.iter().all(|l| l.msgid.as_deref().is_some_and(|m| !hirc_core::msgid::is_made_up(m))), "soju's own msgids: {lines:?}");
+}
+
+/// Spec, soju: a reconnect fills the gap, without duplicates or news.
+#[tokio::test(flavor = "multi_thread")]
+async fn soju_a_reconnect_fills_the_gap_without_duplicates() {
+    let ergo = Ergo::start();
+    let soju = Soju::start(&ergo).await;
+    let mut bob = join_bob(&ergo).await;
+    let (tx, mut rx) = net(via_soju(&soju));
+    joined(&mut rx, "#test").await;
+    // The join's own LATEST page first, so it can't count as gap fill.
+    page(&mut rx, "#test").await;
+    bob.send("PRIVMSG #test :before the drop").await;
+    next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "before the drop")).await;
+    tx.send(Command::Disconnect { network: "soju".into(), reason: Some("brb".into()) }).unwrap();
+    offline(&mut rx).await;
+    for i in 1..=3 {
+        bob.send(&format!("PRIVMSG #test :gap {i}")).await;
+    }
+    soju.holds("#test", &["gap 1", "gap 2", "gap 3"]).await;
+    tx.send(Command::Reconnect { network: "soju".into() }).unwrap();
+    let (mut got, mut live) = (Vec::new(), Vec::new());
+    while got.len() < 3 {
+        match next_matching(&mut rx, |e| Some(e.clone())).await {
+            Event::History { lines, .. } => {
+                assert!(lines.iter().all(|l| l.replayed));
+                got.extend(said(&lines));
+            }
+            Event::Line { line, .. } if line.text.starts_with("gap") || line.text == "before the drop" => live.push(line.text),
+            _ => {}
+        }
+    }
+    assert_eq!(got, ["gap 1", "gap 2", "gap 3"]);
+    assert!(live.is_empty(), "came live: {live:?}");
+}
+
+/// Spec, soju: read markers, both ways. hirc's marker reaches our other
+/// client, and the other client's marker reaches hirc.
+#[tokio::test(flavor = "multi_thread")]
+async fn soju_read_markers_go_both_ways() {
+    let ergo = Ergo::start();
+    let soju = Soju::start(&ergo).await;
+    let mut bob = join_bob(&ergo).await;
+    // A few ms apart, so the two lines' times differ.
+    for t in ["r1", "r2"] {
+        bob.send(&format!("PRIVMSG #test :{t}")).await;
+        synced(&mut bob).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    soju.holds("#test", &["r1", "r2"]).await;
+    let (tx, mut rx) = net(via_soju(&soju));
+    let (lines, _) = page(&mut rx, "#test").await;
+    let at = |t: &str| lines.iter().find(|l| l.text == t).map(|l| l.time).unwrap_or_else(|| panic!("{t} not in {lines:?}"));
+    let (r1, r2) = (at("r1"), at("r2"));
+    assert!(r1 < r2);
+    // Our other client, on the same network through soju.
+    let (mut phone, _) = register(soju.port, soju::PASSWORD, soju::USER, &soju::username(), &["server-time", "message-tags", "draft/read-marker"]).await;
+    synced(&mut phone).await;
+    tx.send(Command::MarkRead { network: "soju".into(), target: "#test".into(), time: r1 }).unwrap();
+    let told = phone.expect("MARKREAD #test").await;
+    let t = told.split_whitespace().last().map(|p| p.trim_start_matches(':')).and_then(hirc_core::history::parse_timestamp);
+    assert_eq!(t, Some(r1), "{told}");
+    phone.send(&format!("MARKREAD #test {}", timestamp(r2))).await;
+    next_matching(&mut rx, |e| {
+        matches!(e, Event::ReadMarker { target: Target::Channel(c), time: Some(t), .. } if c.eq_ignore_ascii_case("#test") && *t == r2).then_some(())
+    })
+    .await;
+}
+
+/// Spec, soju: TARGETS opens a query that was busy while we were away.
+#[tokio::test(flavor = "multi_thread")]
+async fn soju_targets_open_a_query_from_while_we_were_away() {
+    let ergo = Ergo::start();
+    let soju = Soju::start(&ergo).await;
+    let (tx, mut rx) = net(via_soju(&soju));
+    joined(&mut rx, "#test").await;
+    // Something held, to anchor the next TARGETS on.
+    let mut bob = join_bob(&ergo).await;
+    bob.send("PRIVMSG #test :hi all").await;
+    next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "hi all")).await;
+    tx.send(Command::Disconnect { network: "soju".into(), reason: None }).unwrap();
+    offline(&mut rx).await;
+    // Not a wait for the store: the next TARGETS starts from "hi all"'s
+    // time, so the query's line must come in a later millisecond.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    bob.send("PRIVMSG alice :are you there?").await;
+    soju.holds("bob", &["are you there?"]).await;
+    tx.send(Command::Reconnect { network: "soju".into() }).unwrap();
+    let (lines, _) = page(&mut rx, "bob").await;
+    assert_eq!(said(&lines), ["are you there?"]);
+    assert!(lines.iter().all(|l| l.replayed));
+}
+
+/// Spec, soju: scrolling up reads every line, where the oldest line shown
+/// shares its millisecond with older ones. soju stamps a burst with one
+/// millisecond and pages strictly by time.
+#[tokio::test(flavor = "multi_thread")]
+async fn soju_scrolling_up_reads_a_burst_in_one_millisecond_whole() {
+    let ergo = Ergo::start();
+    let soju = Soju::start(&ergo).await;
+    let mut bob = join_bob(&ergo).await;
+    // Each in its own millisecond, but the burst (sent at once) in one.
+    bob.send("PRIVMSG #test :before").await;
+    synced(&mut bob).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    for i in 1..=3 {
+        bob.send(&format!("PRIVMSG #test :burst {i}")).await;
+    }
+    for t in ["after 1", "after 2"] {
+        synced(&mut bob).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        bob.send(&format!("PRIVMSG #test :{t}")).await;
+    }
+    let all = ["before", "burst 1", "burst 2", "burst 3", "after 1", "after 2"];
+    soju.holds("#test", &all).await;
+    // Pages of 4: the latest page starts mid-burst, at burst 2.
+    let mut config = via_soju(&soju);
+    config.servers.get_mut("soju").unwrap().history_page_size = Some(4);
+    let (tx, mut rx) = net(config);
+    let chan = Target::Channel("#test".into());
+    let mut store = Store::new(["soju".to_owned()]);
+    applied_until(&mut rx, &mut store, |e| matches!(e, Event::History { target, lines, .. } if target.same(&chan) && !lines.is_empty())).await;
+    assert_eq!(said_in(&mut store, &chan), ["burst 2", "burst 3", "after 1", "after 2"]);
+    scroll_to_the_top(&tx, &mut rx, &mut store, "soju", &chan).await;
+    assert_eq!(said_in(&mut store, &chan), all);
 }

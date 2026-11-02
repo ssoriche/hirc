@@ -1,0 +1,40 @@
+> CHATHISTORY BEFORE #test timestamp=2026-11-02T04:02:44.717Z 100
+BATCH +9 chathistory #test
+@msgid=icpysztm3faamjxd2d5cgnjv5w;time=2026-11-02T04:02:44.313Z;batch=9 :bob!~bob@127.0.0.1 PRIVMSG #test :fact 1
+@time=2026-11-02T04:02:44.321Z;batch=9;msgid=39tanjm3swe8hja8gcgussyjas :bob!~bob@127.0.0.1 PRIVMSG #test :fact 2
+@time=2026-11-02T04:02:44.328Z;msgid=ek24tu3qq22z9ivd4xp8mbiz5a;batch=9 :bob!~bob@127.0.0.1 PRIVMSG #test :fact 3
+BATCH -9
+:localhost PONG localhost hirc-done
+> CHATHISTORY BEFORE #test timestamp=2026-11-02T04:02:44.718Z 100
+BATCH +10 chathistory #test
+@batch=10;msgid=icpysztm3faamjxd2d5cgnjv5w;time=2026-11-02T04:02:44.313Z :bob!~bob@127.0.0.1 PRIVMSG #test :fact 1
+@msgid=39tanjm3swe8hja8gcgussyjas;time=2026-11-02T04:02:44.321Z;batch=10 :bob!~bob@127.0.0.1 PRIVMSG #test :fact 2
+@time=2026-11-02T04:02:44.328Z;msgid=ek24tu3qq22z9ivd4xp8mbiz5a;batch=10 :bob!~bob@127.0.0.1 PRIVMSG #test :fact 3
+@time=2026-11-02T04:02:44.717Z;msgid=52atghybktdbe5zt267xsxm2ea;batch=10 :bob!~bob@127.0.0.1 PRIVMSG #test :burst 1
+@time=2026-11-02T04:02:44.717Z;msgid=cumysntxkaus5b9d58b5g37qde;batch=10 :bob!~bob@127.0.0.1 PRIVMSG #test :burst 2
+@time=2026-11-02T04:02:44.717Z;msgid=m7bnc9dzz4xprjhce75jaaf78a;batch=10 :bob!~bob@127.0.0.1 PRIVMSG #test :burst 3
+BATCH -10
+:localhost PONG localhost hirc-done
+> CHATHISTORY BEFORE #test timestamp=2026-11-02T04:02:44.718Z 2
+BATCH +11 chathistory #test
+@time=2026-11-02T04:02:44.717Z;msgid=cumysntxkaus5b9d58b5g37qde;batch=11 :bob!~bob@127.0.0.1 PRIVMSG #test :burst 2
+@time=2026-11-02T04:02:44.717Z;msgid=m7bnc9dzz4xprjhce75jaaf78a;batch=11 :bob!~bob@127.0.0.1 PRIVMSG #test :burst 3
+BATCH -11
+:localhost PONG localhost hirc-done
+> CHATHISTORY BEFORE #test timestamp=2026-11-02T04:02:44.717Z 2
+BATCH +12 chathistory #test
+@msgid=39tanjm3swe8hja8gcgussyjas;time=2026-11-02T04:02:44.321Z;batch=12 :bob!~bob@127.0.0.1 PRIVMSG #test :fact 2
+@batch=12;time=2026-11-02T04:02:44.328Z;msgid=ek24tu3qq22z9ivd4xp8mbiz5a :bob!~bob@127.0.0.1 PRIVMSG #test :fact 3
+BATCH -12
+:localhost PONG localhost hirc-done
+> CHATHISTORY AFTER #test timestamp=2026-11-02T04:02:44.716Z 2
+BATCH +13 chathistory #test
+@batch=13;time=2026-11-02T04:02:44.717Z;msgid=52atghybktdbe5zt267xsxm2ea :bob!~bob@127.0.0.1 PRIVMSG #test :burst 1
+@time=2026-11-02T04:02:44.717Z;msgid=cumysntxkaus5b9d58b5g37qde;batch=13 :bob!~bob@127.0.0.1 PRIVMSG #test :burst 2
+BATCH -13
+:localhost PONG localhost hirc-done
+> CHATHISTORY AFTER #test timestamp=2026-11-02T04:02:44.717Z 2
+BATCH +14 chathistory #test
+@time=2026-11-02T04:02:44.778Z;msgid=ubj3c45qjb7gipsxapm6t6sb26;batch=14 :bob!~bob@127.0.0.1 PRIVMSG #test :after burst
+BATCH -14
+:localhost PONG localhost hirc-done
