@@ -2,6 +2,7 @@
 //! implements. Draft caps get renamed when they're ratified, so each wanted
 //! cap is a group of spellings and either one counts.
 
+use crate::playback;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub type CapGroups = &'static [&'static [&'static str]];
@@ -20,7 +21,16 @@ pub const WANTED: CapGroups = &[
     &["draft/chathistory", "chathistory"],
     &["draft/event-playback"],
     &["draft/read-marker"],
+    &[playback::SELF_MESSAGE],
+    // Last, so `WITHOUT_PLAYBACK` can leave it off.
+    &[playback::CAP],
 ];
+
+/// `WANTED` for a server whose history is turned off (the config's
+/// `chathistory`): ZNC's playback cap stops ZNC's own replay on attach,
+/// and nothing would ask for it instead, so it isn't requested. ZNC then
+/// replays as it does for any client, shown live and never cached.
+pub const WITHOUT_PLAYBACK: CapGroups = WANTED.split_at(WANTED.len() - 1).0;
 
 #[derive(Debug)]
 pub struct Caps {
@@ -164,13 +174,37 @@ mod tests {
         assert_eq!(
             req,
             [
-                "message-tags server-time echo-message cap-notify sasl batch away-notify draft/multiline labeled-response draft/chathistory draft/event-playback draft/read-marker"
+                "message-tags server-time echo-message cap-notify sasl batch away-notify draft/multiline labeled-response draft/chathistory draft/event-playback draft/read-marker znc.in/self-message znc.in/playback"
             ]
         );
         // Out-of-scope caps Ergo advertises are never requested.
-        assert!(!req[0].contains("ergo.chat/nope") && !req[0].contains("znc.in/playback"));
+        assert!(!req[0].contains("ergo.chat/nope"));
         // Already requested: a second call asks for nothing.
         assert!(caps.to_request().is_empty());
+    }
+
+    #[test]
+    fn golden_znc_ls_requests_playback_and_self_message() {
+        let golden = include_str!("../tests/data/znc-1.10.3-cap-ls.txt");
+        let mut caps = Caps::default();
+        let done: Vec<bool> = golden.lines().filter(|l| !l.starts_with("> ")).map(|l| ls(&mut caps, l)).collect();
+        assert_eq!(done.last(), Some(&true));
+        let req = caps.to_request().join(" ");
+        for want in ["server-time", "batch", "znc.in/playback", "znc.in/self-message"] {
+            assert!(req.split(' ').any(|c| c == want), "{want} not asked for: {req}");
+        }
+        assert!(!req.contains("chathistory"), "ZNC has no chathistory: {req}");
+    }
+
+    #[test]
+    fn without_playback_is_wanted_less_only_znc_s_playback() {
+        assert_eq!(WITHOUT_PLAYBACK, &WANTED[..WANTED.len() - 1]);
+        assert_eq!(WANTED.last(), Some(&&[playback::CAP][..]));
+        let mut caps = Caps::new(WITHOUT_PLAYBACK);
+        ls(&mut caps, include_str!("../tests/data/znc-1.10.3-cap-ls.txt").trim());
+        let req = caps.to_request().join(" ");
+        assert!(req.split(' ').any(|c| c == playback::SELF_MESSAGE) && !req.contains(playback::CAP), "{req}");
+        assert!(!caps.is_enabled(playback::CAP));
     }
 
     #[test]

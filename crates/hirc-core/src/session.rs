@@ -5,14 +5,14 @@
 
 use crate::batch::{self, Batches};
 use crate::cache::{self, Above, Below, Entry};
-use crate::caps::Caps;
+use crate::caps::{self, Caps};
 use crate::event::{Command, ConnStatus, Event, PeerChange, Target};
 use crate::history::{self, Anchor, Book, Kind, Request};
 use crate::isupport::Isupport;
 use crate::multiline::{self, Limits};
 use crate::proto::Message;
 use crate::store::{Delivery, Line, LineKind};
-use crate::{bridge, sasl, services, split};
+use crate::{bridge, playback, sasl, services, split};
 use chrono::{DateTime, TimeDelta, Utc};
 use std::collections::{HashMap, HashSet};
 
@@ -165,6 +165,12 @@ pub struct Session {
     /// Per lowercased target, what the next live line follows on from in
     /// the cache. Absent: not known (a gap opened, a new connection).
     tail: HashMap<String, Tail>,
+    /// Once this connection's `PLAY` is out: when it asked, by our clock
+    /// (or its `<t>`, if that is later). Without batches, a line timed at
+    /// or before this is ZNC's replay: ZNC sends no brackets to a client
+    /// with server-time, and replays buffer by buffer, not in time order.
+    /// Approximate, by one-way latency plus clock skew.
+    play: Option<DateTime<Utc>>,
 }
 
 /// The live end of a target, as the cache holds it.
@@ -206,6 +212,8 @@ struct Page {
     cap: usize,
     first: Option<Anchor>,
     last: Option<Anchor>,
+    /// ZNC's buffer playback (`znc.in/playback`), not a CHATHISTORY page.
+    playback: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +233,11 @@ where
 
 fn last(msg: &Message) -> &str {
     msg.params.last().map_or("", String::as_str)
+}
+
+/// `msg`'s `time` tag, when it has one that parses.
+fn server_time(msg: &Message) -> Option<DateTime<Utc>> {
+    msg.tag("time").and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map(|t| t.with_timezone(&Utc))
 }
 
 // The event lines' words, shared by the live handlers and by replay, so a
@@ -266,13 +279,14 @@ fn mode_text(by: &str, modes: &str) -> String {
 
 impl Session {
     pub fn new(network: &str, cfg: SessionConfig) -> Session {
+        let wanted = if cfg.chathistory { caps::WANTED } else { caps::WITHOUT_PLAYBACK };
         Session {
             network: network.to_owned(),
             nick: cfg.nickname.clone(),
             cfg,
             alt: 0,
             reg: Reg::CapLs,
-            caps: Caps::default(),
+            caps: Caps::new(wanted),
             isupport: Isupport::default(),
             members: HashMap::new(),
             seq: 0,
@@ -298,6 +312,7 @@ impl Session {
             multiline_said: None,
             keep: None,
             tail: HashMap::new(),
+            play: None,
         }
     }
 
@@ -446,6 +461,7 @@ impl Session {
         self.targets_pages = 0;
         self.multiline_said = None;
         self.tail.clear();
+        self.play = None;
         // A query's lines can come before registration ends and its gap is
         // asked for: until then they wait, as they would in an open gap.
         for q in self.book.queries() {
@@ -534,6 +550,15 @@ impl Session {
                 }
                 return;
             }
+        }
+        // Our PLAY, echoed back: not a line, and no `*playback` window.
+        if self.play_echo(&msg) {
+            return;
+        }
+        // ZNC's replay without batches: anything timed at or before our
+        // PLAY is history.
+        if self.loose_replay(&msg) {
+            return self.replay_loose(&msg, now, out);
         }
         match msg.command.as_str() {
             "PING" => out.push(send("PONG", msg.params.clone())),
@@ -691,7 +716,14 @@ impl Session {
                 let target = msg.params.get(2).cloned().unwrap_or_default();
                 let label = self.batch_label(&r, msg);
                 let cap = self.answers(label.as_deref(), &target).and_then(|k| self.inflight.get(&k)).map_or(0, |i| i.request.limit).max(self.page());
-                self.pages.insert(r, Page { target, label, lines: Vec::new(), items: 0, cap, first: None, last: None });
+                self.pages.insert(r, Page { target, label, lines: Vec::new(), items: 0, cap, first: None, last: None, playback: false });
+            }
+            // ZNC's buffer playback: history, whoever asked for it. Its ref
+            // comes back on every replay of that buffer (closed above).
+            Some(playback::BATCH) if self.pages.len() < batch::MAX_OPEN => {
+                let target = msg.params.get(2).cloned().unwrap_or_default();
+                let page = Page { target, label: None, lines: Vec::new(), items: 0, cap: playback::MAX_LINES, first: None, last: None, playback: true };
+                self.pages.insert(r, page);
             }
             // Only the answer to our TARGETS: anyone else's names open nothing.
             Some(history::TARGETS_BATCH) if self.found.len() < batch::MAX_OPEN => {
@@ -730,11 +762,11 @@ impl Session {
         self.cfg.chathistory && ["batch", "server-time", history::CAP].iter().all(|c| self.caps.is_enabled(c))
     }
 
-    /// The history page batch `r` is part of: the nearest tracked one
-    /// around it, else `r` itself when it is a page the tracker had no
-    /// room for.
+    /// The history page (a chathistory page or ZNC's playback) batch `r`
+    /// is part of: the nearest tracked one around it, else `r` itself when
+    /// it is a page the tracker had no room for.
     fn page_of(&self, r: &str) -> Option<String> {
-        self.within(r, history::BATCH, &self.pages)
+        self.within(r, history::BATCH, &self.pages).or_else(|| self.within(r, playback::BATCH, &self.pages))
     }
 
     /// The batch of type `kind` held in `held` that `r` is part of: the
@@ -877,6 +909,7 @@ impl Session {
                 self.older(&target, out);
             }
         }
+        self.play_back(now, out);
     }
 
     /// `CHATHISTORY TARGETS` to a little past now (the server's clock may
@@ -933,6 +966,84 @@ impl Session {
         if let Some(at) = self.discovering {
             self.book.set_discovered(at);
         }
+    }
+
+    /// `PLAY` is how history comes: the user wants history, ZNC's playback
+    /// cap is on, and the server has no chathistory (which wins).
+    fn playback_on(&self) -> bool {
+        self.cfg.chathistory && self.caps.is_enabled(playback::CAP) && !self.history_on()
+    }
+
+    /// One `PLAY` asks for every buffer's lines (queries too) since the
+    /// newest line held anywhere on this network, or for all of them when
+    /// nothing is held.
+    fn play_back(&mut self, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        if !self.playback_on() {
+            return;
+        }
+        let since = playback::since(self.book.last_seen());
+        self.play = Some(DateTime::from_timestamp(since, 0).map_or(now, |t| t.max(now)));
+        out.push(Output::Send(playback::play(since)));
+    }
+
+    /// ZNC's echo of our own `PLAY` (with echo-message), however ZNC
+    /// spells it back: by what it is, not its exact text.
+    fn play_echo(&self, msg: &Message) -> bool {
+        self.play.is_some()
+            && matches!(msg.command.as_str(), "PRIVMSG" | "NOTICE")
+            && msg.nick().is_some_and(|n| self.is_me(n))
+            && msg.params.first().is_some_and(|t| t.eq_ignore_ascii_case(playback::MODULE))
+            && msg.params.get(1).and_then(|t| t.get(..5)).is_some_and(|p| p.eq_ignore_ascii_case("PLAY "))
+    }
+
+    /// A services query the user hasn't opened. Our own lines there (an
+    /// echo, or one sent from another client) open nothing: they can hold
+    /// a password.
+    fn unopened_service(&self, target: &Target) -> bool {
+        matches!(target, Target::Query(n) if services::is_service(n) && !self.book.get(n).is_some_and(|k| k.query))
+    }
+
+    /// A message outside any history batch that is still ZNC's replay:
+    /// without batches, one timed at or before our `PLAY`. With batches
+    /// the whole replay is in them, so a loose line is news even when a
+    /// clock ahead of the server's makes it look old.
+    fn loose_replay(&self, msg: &Message) -> bool {
+        matches!(msg.command.as_str(), "PRIVMSG" | "NOTICE")
+            && msg.tag("batch").is_none()
+            && !self.caps.is_enabled("batch")
+            && self.play.is_some_and(|until| server_time(msg).is_some_and(|t| t <= until))
+    }
+
+    /// One loose replayed message: shown as its live copy would be, but as
+    /// a page of one replayed line. Nothing else the live one does (peers)
+    /// happens. A server-buffer line passes through as it is.
+    fn replay_loose(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let mut shown = Vec::new();
+        self.on_message(msg, now, &mut shown);
+        for o in shown {
+            match o {
+                Output::Event(Event::Line { target: Target::Server, .. }) => out.push(o),
+                Output::Event(Event::Line { target, line, .. }) => {
+                    let name = target.name().unwrap_or_default().to_owned();
+                    self.finish_playback(&name, vec![Line { replayed: true, ..line }], out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// ZNC's replay of one buffer (or one line of it, without batches):
+    /// history, as one page. Empty (ZNC sends one per buffer on attach),
+    /// it shows nothing. A services query's replay opens no window: only
+    /// one the user has open shows it.
+    fn finish_playback(&mut self, target: &str, lines: Vec<Line>, out: &mut Vec<Output>) {
+        let query = !self.isupport.is_channel(target);
+        let unasked_service = query && services::is_service(target) && !self.book.get(target).is_some_and(|k| k.query);
+        if target.is_empty() || lines.is_empty() || unasked_service {
+            return;
+        }
+        self.book.note(target, query, &lines);
+        out.push(self.history_event(target, lines, false));
     }
 
     /// A name from a TARGETS answer that we may open a query for: a nick
@@ -1005,6 +1116,9 @@ impl Session {
     /// start of history; full, after the newest, there is more to fetch;
     /// short, after the newest, the gap is closed.
     fn finish_page(&mut self, page: Page, cut: bool, out: &mut Vec<Output>) {
+        if page.playback {
+            return self.finish_playback(&page.target, page.lines, out);
+        }
         // Items past the cap were dropped, next to the anchor or the live
         // end, so the page can't be said to join either. Cut off by the
         // drop, a page after still holds the part next to its anchor.
@@ -1313,6 +1427,9 @@ impl Session {
         for o in out {
             let Output::Event(Event::Line { target, line, .. }) = o else { continue };
             let Some(name) = target.name() else { continue };
+            if line.own && self.unopened_service(target) {
+                continue;
+            }
             let query = matches!(target, Target::Query(_));
             match self.gaps.get_mut(&name.to_ascii_lowercase()) {
                 Some(pending) => {
@@ -1370,6 +1487,9 @@ impl Session {
         } else {
             Target::Query(from.to_owned())
         };
+        if own && self.unopened_service(&target) {
+            return;
+        }
         if from_user && !own {
             out.push(self.seen(msg, from));
         }
@@ -1562,6 +1682,11 @@ impl Session {
         let wrap = if action { "\x01ACTION \x01".len() } else { 0 };
         let budget = split::body_budget("PRIVMSG", target, self.nick.len() + 75).saturating_sub(wrap).max(1);
         let dest = if self.isupport.is_channel(target) { Target::Channel(target.to_owned()) } else { Target::Query(target.to_owned()) };
+        // Writing to a services query is the user opening it: its echo
+        // (and later lines of ours there) show in it.
+        if self.unopened_service(&dest) {
+            self.book.open(target, true);
+        }
         let mut out = Vec::new();
         // Several lines, and the server takes them as one message: a batch
         // (or several, to stay inside its limits), each shown as one line
@@ -1703,7 +1828,7 @@ pub(crate) mod tests {
     fn no_wanted_caps_ends_negotiation() {
         let mut s = Session::new("net", cfg());
         s.start();
-        assert_eq!(sent(&feed(&mut s, ":srv CAP * LS :znc.in/playback")), ["CAP END"]);
+        assert_eq!(sent(&feed(&mut s, ":srv CAP * LS :ergo.chat/nope")), ["CAP END"]);
     }
 
     #[test]
@@ -2706,6 +2831,305 @@ pub(crate) mod tests {
             boundary: false,
             replayed: false,
         }
+    }
+
+    /// What ZNC with its playback module offers: no chathistory.
+    const ZNC: &str = "batch server-time message-tags znc.in/playback znc.in/self-message";
+
+    /// Registered through ZNC with `caps` (all ACKed), `book` carried in,
+    /// with the clock at `at`. Gives back what the end of the MOTD sent
+    /// (the PLAY).
+    fn zncd_at(caps: &str, book: Book, at: DateTime<Utc>) -> (Session, Vec<Output>) {
+        let mut s = Session::new("net", cfg()).with_book(book);
+        s.start();
+        for l in [
+            format!(":irc.znc.in CAP * LS :{caps}"),
+            format!(":irc.znc.in CAP alice ACK :{caps}"),
+            ":irc.znc.in 001 alice :Welcome".to_owned(),
+            ":irc.znc.in 005 alice CHANTYPES=# :are supported".to_owned(),
+        ] {
+            s.handle(Message::parse(&l).unwrap(), at);
+        }
+        let out = s.handle(Message::parse(":irc.znc.in 376 alice :End of MOTD").unwrap(), at);
+        (s, out)
+    }
+
+    /// Registered through ZNC with `caps` (all ACKed), `book` carried in.
+    /// Gives back what the end of the MOTD sent (the PLAY).
+    pub(crate) fn zncd_with(caps: &str, book: Book) -> (Session, Vec<Output>) {
+        zncd_at(caps, book, now())
+    }
+
+    pub(crate) fn zncd(book: Book) -> (Session, Vec<Output>) {
+        zncd_with(ZNC, book)
+    }
+
+    /// A recorded transcript's server lines (`> ` marks what the client sent).
+    fn recorded(text: &str) -> impl Iterator<Item = &str> {
+        text.lines().filter(|l| !l.is_empty() && !l.starts_with("> "))
+    }
+
+    fn plays(out: &[Output]) -> Vec<String> {
+        sent(out).into_iter().filter(|m| m.starts_with("PRIVMSG *playback")).collect()
+    }
+
+    /// When the recordings were made: just after their last replayed line.
+    fn recorded_at() -> DateTime<Utc> {
+        "2026-11-02T02:28:03.220Z".parse().unwrap()
+    }
+
+    #[test]
+    fn znc_is_asked_for_everything_after_the_newest_line_held() {
+        let (_, out) = zncd(Book::default());
+        assert_eq!(plays(&out), ["PRIVMSG *playback :PLAY * 0"]);
+        // held(): #test up to 2026-10-22T10:00:00Z.
+        let (_, out) = zncd(held());
+        assert_eq!(plays(&out), ["PRIVMSG *playback :PLAY * 1792663200"]);
+    }
+
+    #[test]
+    fn chathistory_wins_over_playback_and_the_config_can_say_no() {
+        let (_, out) = zncd_with(&format!("{ZNC} draft/chathistory"), Book::default());
+        assert!(plays(&out).is_empty(), "{out:?}");
+        assert!(sent(&out).iter().any(|m| m.starts_with("CHATHISTORY TARGETS")), "{out:?}");
+        // Without the cap, nothing to ask.
+        let (_, out) = zncd_with("batch server-time", Book::default());
+        assert!(plays(&out).is_empty(), "{out:?}");
+        // History turned off for this server.
+        let mut s = Session::new("net", SessionConfig { chathistory: false, ..cfg() });
+        s.start();
+        feed(&mut s, &format!(":irc.znc.in CAP * LS :{ZNC}"));
+        feed(&mut s, &format!(":irc.znc.in CAP alice ACK :{ZNC}"));
+        feed(&mut s, ":irc.znc.in 001 alice :Welcome");
+        assert!(plays(&feed(&mut s, ":irc.znc.in 376 alice :End of MOTD")).is_empty());
+    }
+
+    #[test]
+    fn a_playback_batch_is_one_page_of_history() {
+        let (mut s, _) = zncd(Book::default());
+        feed(&mut s, ":znc.in BATCH +p znc.in/playback #test");
+        for t in ["one", "two"] {
+            let out = feed(&mut s, &format!("@batch=p;time=2026-10-22T10:01:00.000Z :bob!b@h PRIVMSG #test :{t}"));
+            assert!(lines(&out).is_empty(), "history is not news: {out:?}");
+        }
+        let got = histories(&feed(&mut s, ":znc.in BATCH -p"));
+        let [(target, l, start)] = got.as_slice() else { panic!("{got:?}") };
+        assert_eq!((target, *start), (&Target::Channel("#test".into()), false));
+        assert_eq!(texts(l), ["one", "two"]);
+        assert!(l.iter().all(|l| l.replayed));
+    }
+
+    #[test]
+    fn a_query_replay_opens_its_window_with_both_sides() {
+        let (mut s, _) = zncd(Book::default());
+        feed(&mut s, ":znc.in BATCH +q znc.in/playback bob");
+        feed(&mut s, "@batch=q;time=2026-10-22T10:01:00.000Z :bob!b@h PRIVMSG alice :psst");
+        feed(&mut s, "@batch=q;time=2026-10-22T10:02:00.000Z :alice!a@znc.in PRIVMSG bob :hey");
+        let got = histories(&feed(&mut s, ":znc.in BATCH -q"));
+        let [(target, l, _)] = got.as_slice() else { panic!("{got:?}") };
+        assert_eq!(*target, Target::Query("bob".into()));
+        assert_eq!(texts(l), ["psst", "hey"]);
+        assert_eq!(l.iter().map(|l| l.own).collect::<Vec<_>>(), [false, true]);
+    }
+
+    #[test]
+    fn without_batches_a_line_timed_at_or_before_the_play_is_history() {
+        let (mut s, out) = zncd_with("server-time znc.in/playback", held());
+        assert_eq!(plays(&out), ["PRIVMSG *playback :PLAY * 1792663200"]);
+        // Anything from before we asked is ZNC's replay, whichever buffer
+        // it is from and in whatever order it comes.
+        for at in ["2026-10-22T10:30:00.000Z", "2026-10-22T12:00:00.000Z", "2026-10-22T10:00:00.000Z"] {
+            let out = feed(&mut s, &format!("@time={at} :bob!b@h PRIVMSG #test :old"));
+            assert!(lines(&out).is_empty(), "{out:?}");
+            assert_eq!(histories(&out).iter().flat_map(|(_, l, _)| texts(l)).collect::<Vec<_>>(), ["old"]);
+            assert!(histories(&out)[0].1[0].replayed);
+        }
+        let out = feed(&mut s, "@time=2026-10-22T12:00:01.000Z :bob!b@h PRIVMSG #test :new");
+        assert_eq!(lines(&out).len(), 1, "{out:?}");
+        assert!(histories(&out).is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn with_batches_only_the_batch_is_history() {
+        // The batch holds the whole replay: a loose line timed in the past
+        // (a clock ahead of the server's) is still news.
+        let (mut s, _) = zncd(held());
+        let out = feed(&mut s, "@time=2026-10-22T11:00:00.000Z :bob!b@h PRIVMSG #test :live");
+        assert_eq!(lines(&out).len(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn before_any_play_old_times_are_not_history() {
+        // History off: no PLAY, so no line is taken for its replay.
+        let (mut s, _) = zncd_with("server-time", Book::default());
+        let out = feed(&mut s, "@time=2026-10-22T10:00:00.000Z :bob!b@h PRIVMSG #test :old but live");
+        assert_eq!(lines(&out).len(), 1, "{out:?}");
+    }
+
+    /// No event at all in `out`: no line, no history, no window.
+    fn silent(out: &[Output]) -> bool {
+        out.iter().all(|o| !matches!(o, Output::Event(_)))
+    }
+
+    #[test]
+    fn our_play_echoed_back_shows_nothing() {
+        // The `*playback` query held open, so only the echo guard keeps
+        // the echo out (not the rule for services nobody opened).
+        let mut book = Book::default();
+        book.open("*playback", true);
+        let (mut s, _) = zncd_with(&format!("{ZNC} echo-message"), book.clone());
+        let out = feed(&mut s, "@time=2026-10-22T12:00:00.000Z :alice!~alice@127.0.0.1 PRIVMSG *playback :PLAY * 0");
+        assert!(silent(&out), "{out:?}");
+        // Without batches the echo is timed before the cut, and still shows nothing.
+        let (mut s, _) = zncd_with("server-time echo-message znc.in/playback", book);
+        let out = feed(&mut s, "@time=2026-10-22T11:59:59.000Z :alice!~alice@127.0.0.1 PRIVMSG *playback :PLAY * 0");
+        assert!(silent(&out), "{out:?}");
+    }
+
+    #[test]
+    fn our_play_echoed_back_altered_still_shows_nothing() {
+        let mut book = Book::default();
+        book.open("*playback", true);
+        let (mut s, _) = zncd_with(&format!("{ZNC} echo-message"), book);
+        for echo in ["PRIVMSG *playback :PLAY * 0 ", "PRIVMSG *Playback :play * 0", "PRIVMSG *playback :PLAY * 0.000", "NOTICE *playback :PLAY #test 0"] {
+            let out = feed(&mut s, &format!("@time=2026-10-22T12:00:00.000Z :alice!~alice@127.0.0.1 {echo}"));
+            assert!(silent(&out), "{echo}: {out:?}");
+        }
+        // With no PLAY out (history off), the user's own `PLAY` to an open
+        // `*playback` is an ordinary line.
+        let mut book = Book::default();
+        book.open("*playback", true);
+        let mut s = Session::new("net", SessionConfig { chathistory: false, ..cfg() }).with_book(book);
+        s.start();
+        feed(&mut s, &format!(":irc.znc.in CAP * LS :{ZNC} echo-message"));
+        feed(&mut s, ":irc.znc.in CAP alice ACK :server-time echo-message");
+        feed(&mut s, ":irc.znc.in 001 alice :Welcome");
+        feed(&mut s, ":irc.znc.in 376 alice :End of MOTD");
+        assert_eq!(lines(&feed(&mut s, ":alice!a@h PRIVMSG *playback :PLAY * 0")).len(), 1);
+    }
+
+    #[test]
+    fn our_own_line_to_a_service_opens_nothing_unless_the_user_opened_it() {
+        // Sent from another client (self-message), or echoed: no line, and
+        // the book holds no such query.
+        let mut s = registered("server-time echo-message");
+        for who in ["NickServ", "*status"] {
+            let out = feed(&mut s, &format!("@time=2026-10-22T12:00:00.000Z :alice!a@h PRIVMSG {who} :IDENTIFY not-a-real-one"));
+            assert!(silent(&out), "{who}: {out:?}");
+            assert!(s.book().get(who).is_none(), "{who} was opened");
+        }
+        // The user writing there opens it: the pending line and its echo show.
+        let out = s.command(Command::Say { network: "net".into(), target: "NickServ".into(), text: "HELP".into() }, now());
+        assert_eq!(lines(&out).len(), 1);
+        assert!(s.book().get("NickServ").is_some_and(|k| k.query));
+        let out = feed(&mut s, "@time=2026-10-22T12:00:01.000Z :alice!a@h PRIVMSG NickServ :HELP");
+        assert_eq!(lines(&out).iter().map(|(t, l)| (t.clone(), l.text.as_str())).collect::<Vec<_>>(), [(Target::Query("NickServ".into()), "HELP")]);
+        // One the user opened shows our lines from elsewhere too.
+        let mut s = registered("server-time");
+        s.command(Command::Open { network: "net".into(), target: "*status".into() }, now());
+        assert_eq!(lines(&feed(&mut s, ":alice!a@h PRIVMSG *status :ListNetworks")).len(), 1);
+    }
+
+    #[test]
+    fn with_history_off_znc_s_playback_is_not_asked_for() {
+        let mut s = Session::new("net", SessionConfig { chathistory: false, ..cfg() });
+        s.start();
+        let req = sent(&feed(&mut s, &format!(":irc.znc.in CAP * LS :{ZNC}")));
+        assert_eq!(req, ["CAP REQ :message-tags server-time batch znc.in/self-message"]);
+        // ZNC's own attach replay then comes plain, as news.
+        feed(&mut s, ":irc.znc.in CAP alice ACK :message-tags server-time batch znc.in/self-message");
+        feed(&mut s, ":irc.znc.in 001 alice :Welcome");
+        assert!(plays(&feed(&mut s, ":irc.znc.in 376 alice :End of MOTD")).is_empty());
+        let out = feed(&mut s, "@time=2026-10-22T10:00:00.000Z :bob!b@h PRIVMSG #test :old");
+        assert_eq!(lines(&out).len(), 1, "{out:?}");
+        // History on: asked for.
+        let mut s = Session::new("net", cfg());
+        s.start();
+        let req = sent(&feed(&mut s, &format!(":irc.znc.in CAP * LS :{ZNC}")));
+        assert_eq!(req, ["CAP REQ :message-tags server-time batch znc.in/self-message znc.in/playback"]);
+    }
+
+    #[test]
+    fn empty_playback_batches_show_nothing() {
+        let (mut s, _) = zncd(Book::default());
+        for r in ["8f5180964ef46eeeae1b9d4f0d5de848", "9f9d51bc70ef21ca5c14f307980a29d8"] {
+            assert!(feed(&mut s, &format!(":znc.in BATCH +{r} znc.in/playback #test")).is_empty());
+            assert!(feed(&mut s, &format!(":znc.in BATCH -{r}")).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_services_replay_opens_no_window() {
+        let (mut s, _) = zncd(Book::default());
+        for (r, who) in [("n", "NickServ"), ("z", "*status")] {
+            feed(&mut s, &format!(":znc.in BATCH +{r} znc.in/playback {who}"));
+            feed(&mut s, &format!("@batch={r};time=2026-10-22T10:01:00.000Z :{who}!s@services NOTICE alice :You are now identified"));
+            let out = feed(&mut s, &format!(":znc.in BATCH -{r}"));
+            assert!(histories(&out).is_empty(), "{out:?}");
+            assert!(s.book().get(who).is_none(), "{who} was opened");
+        }
+        // Loose, the same.
+        let (mut s, _) = zncd_with("server-time znc.in/playback", Book::default());
+        let out = feed(&mut s, "@time=2026-10-22T10:01:00.000Z :*status!znc@znc.in PRIVMSG alice :You have no networks");
+        assert!(out.iter().all(|o| !matches!(o, Output::Event(_))), "{out:?}");
+        // One the user has open shows it.
+        let mut book = Book::default();
+        book.open("NickServ", true);
+        let (mut s, _) = zncd(book);
+        feed(&mut s, ":znc.in BATCH +n znc.in/playback NickServ");
+        feed(&mut s, "@batch=n;time=2026-10-22T10:01:00.000Z :NickServ!s@services NOTICE alice :hi");
+        assert_eq!(histories(&feed(&mut s, ":znc.in BATCH -n")).len(), 1);
+    }
+
+    /// Feeds a recorded ZNC replay into a session registered with `caps`
+    /// at `at`, and checks it all came as history: `chan` in #test, and
+    /// `fact dm` from bob.
+    fn znc_replay_is_history(caps: &str, at: DateTime<Utc>, transcript: &str, chan: &[&str]) {
+        let (mut s, _) = zncd_at(caps, Book::default(), at);
+        let out: Vec<Output> = recorded(transcript).flat_map(|l| s.handle(Message::parse(l).unwrap(), at)).collect();
+        let news: Vec<(Target, String)> = lines(&out).into_iter().filter(|(t, _)| *t != Target::Server).map(|(t, l)| (t, l.text)).collect();
+        assert!(news.is_empty(), "came as news: {news:?}");
+        let got = histories(&out);
+        let said = |t: Target| got.iter().filter(|(target, ..)| *target == t).flat_map(|(_, l, _)| texts(l)).collect::<Vec<_>>();
+        assert_eq!(said(Target::Channel("#test".into())), chan);
+        assert_eq!(said(Target::Query("bob".into())), ["fact dm"]);
+        assert!(got.iter().all(|(t, ..)| matches!(t, Target::Channel(c) if c == "#test") || *t == Target::Query("bob".into())), "{got:?}");
+        assert!(s.book().get("*playback").is_none());
+    }
+
+    #[test]
+    fn the_recorded_znc_replay_is_history_not_news() {
+        // Batches don't need the clock: ours is days behind the recording.
+        let caps = format!("{ZNC} echo-message");
+        znc_replay_is_history(&caps, now(), include_str!("../tests/data/znc-1.10.3-play-batch.txt"), &["fact 1", "fact 2", "fact 3"]);
+    }
+
+    #[test]
+    fn the_recorded_znc_replay_without_batches_is_history_too() {
+        let chan = ["fact 1", "fact 2", "fact 3", "fact live", "fact self"];
+        znc_replay_is_history("server-time znc.in/playback", recorded_at(), include_str!("../tests/data/znc-1.10.3-play-plain.txt"), &chan);
+    }
+
+    #[test]
+    fn the_recorded_attach_then_play_reuses_batch_refs() {
+        // The real attach: ZNC's caps, its stale-timed burst, our JOIN and
+        // one empty batch per buffer. Then the PLAY's replay, in the same refs.
+        let mut s = Session::new("net", cfg());
+        s.start();
+        let at = recorded_at();
+        let mut out = Vec::new();
+        for l in recorded(include_str!("../tests/data/znc-1.10.3-attach.txt")) {
+            out.extend(s.handle(Message::parse(l).unwrap(), at));
+        }
+        assert_eq!(plays(&out), ["PRIVMSG *playback :PLAY * 0"]);
+        assert!(histories(&out).is_empty(), "{out:?}");
+        assert!(lines(&out).iter().all(|(t, _)| *t == Target::Server || *t == Target::Channel("#test".into())), "{out:?}");
+        let out: Vec<Output> =
+            recorded(include_str!("../tests/data/znc-1.10.3-play-batch.txt")).flat_map(|l| s.handle(Message::parse(l).unwrap(), at)).collect();
+        assert!(lines(&out).iter().all(|(t, _)| *t == Target::Server), "{out:?}");
+        let got = histories(&out);
+        let said: Vec<(Target, Vec<&str>)> = got.iter().map(|(t, l, _)| (t.clone(), texts(l))).collect();
+        assert_eq!(said, [(Target::Channel("#test".into()), vec!["fact 1", "fact 2", "fact 3"]), (Target::Query("bob".into()), vec!["fact dm"])]);
     }
 
     #[test]

@@ -10,14 +10,15 @@
 mod common;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use common::events::{joined, line_in, net, next_matching, offline};
+use common::events::{joined, line_in, net, next_matching, offline, said};
 use common::soju::{self, Soju};
 use common::znc::{self, Znc};
 use common::{Ergo, Raw, record, register, wait_in_channel};
 use hirc_core::config::{Config, Server};
-use hirc_core::event::Command;
+use hirc_core::event::{Command, Event, Target};
 use hirc_core::history::timestamp;
 use hirc_core::proto::Message;
+use hirc_core::store::Store;
 use std::time::Duration;
 
 /// hirc through ZNC, as network `znc`: plaintext on loopback, with
@@ -126,6 +127,56 @@ async fn soju_relays_a_line() {
     bob.send("PRIVMSG #test :hello through soju").await;
     let got = next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "hello through soju")).await;
     assert_eq!(got.nick.as_deref(), Some("bob"));
+}
+
+/// Spec, ZNC test 1. The first connect: the whole buffer comes as
+/// history (no unread counts), and the query window opens from it. Our
+/// PLAY, echoed back, opens no `*playback` window.
+#[tokio::test(flavor = "multi_thread")]
+async fn znc_the_first_connect_replays_the_whole_buffer_as_history() {
+    let ergo = Ergo::start();
+    let znc = Znc::start(&ergo);
+    wait_in_channel(&ergo, znc::USER, "#test").await;
+    let mut bob = join_bob(&ergo).await;
+    for t in ["b1", "b2", "b3"] {
+        bob.send(&format!("PRIVMSG #test :{t}")).await;
+    }
+    bob.send("PRIVMSG alice :psst").await;
+    synced(&mut bob).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (_tx, mut rx) = net(via_znc(&znc));
+    let mut store = Store::new(["znc".to_owned()]);
+    let (mut chan, mut query) = (Vec::new(), Vec::new());
+    while chan.len() < 3 || query.is_empty() {
+        let ev = next_matching(&mut rx, |e| Some(e.clone())).await;
+        match &ev {
+            Event::History { target: Target::Channel(c), lines, .. } if c.eq_ignore_ascii_case("#test") => {
+                assert!(lines.iter().all(|l| l.replayed));
+                chan.extend(said(lines));
+            }
+            Event::History { target: Target::Query(q), lines, .. } if q.eq_ignore_ascii_case("bob") => {
+                assert!(lines.iter().all(|l| l.replayed));
+                query.extend(said(lines));
+            }
+            Event::History { target, .. } => panic!("history for {target:?}"),
+            Event::Line { target, line, .. } => {
+                assert!(!["b1", "b2", "b3", "psst"].contains(&line.text.as_str()), "came live: {line:?}");
+                assert!(!matches!(target, Target::Query(q) if q.starts_with('*')), "a module's window opened: {line:?}");
+            }
+            _ => {}
+        }
+        store.apply(ev);
+    }
+    assert_eq!(chan, ["b1", "b2", "b3"]);
+    assert_eq!(query, ["psst"]);
+    for t in [Target::Channel("#test".into()), Target::Query("bob".into())] {
+        let b = store.buffer_ix(0, &t);
+        let buf = &store.networks[0].buffers[b];
+        assert_eq!((buf.unread, buf.mentions), (0, 0), "{t:?} counted history as news");
+    }
+    let modules: Vec<&Target> = store.networks[0].buffers.iter().map(|b| &b.target).filter(|t| matches!(t, Target::Query(q) if q.starts_with('*'))).collect();
+    assert!(modules.is_empty(), "{modules:?}");
 }
 
 /// Records what ZNC 1.10.3 with playback really sends, for the unit
