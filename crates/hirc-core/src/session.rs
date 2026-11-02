@@ -2337,6 +2337,28 @@ pub(crate) mod tests {
         assert_eq!(asked(&older(&mut s, "#test")).0, "CHATHISTORY BEFORE #test msgid=m0 20");
     }
 
+    /// A server's page BEFORE the oldest shown sits above what is on screen
+    /// and below what is cached: the event and the cache entry both say so.
+    #[test]
+    fn a_server_page_before_is_older_in_the_event_and_the_cache_entry() {
+        let mut s = historied("", 50, Book::default()).keeping();
+        let (_, label) = asked(&feed(&mut s, ":alice!a@h JOIN #test"));
+        feed(&mut s, &format!("@label={label} :srv BATCH +h chathistory #test"));
+        feed(&mut s, "@batch=h;time=2026-10-22T10:00:05.000Z;msgid=m5 :bob!b@h PRIVMSG #test :five");
+        feed(&mut s, ":srv BATCH -h");
+        s.kept();
+        let (_, label) = asked(&older(&mut s, "#test"));
+        feed(&mut s, &format!("@label={label} :srv BATCH +b chathistory #test"));
+        feed(&mut s, "@batch=b;time=2026-10-22T10:00:01.000Z;msgid=m1 :bob!b@h PRIVMSG #test :one");
+        let out = feed(&mut s, ":srv BATCH -b");
+        let olders: Vec<bool> = out.iter().filter_map(|o| if let Output::Event(Event::History { older, .. }) = o { Some(*older) } else { None }).collect();
+        assert_eq!(olders, [true]);
+        let kept = s.kept();
+        let [entry] = kept.as_slice() else { panic!("{kept:?}") };
+        assert_eq!(texts(&entry.lines), ["one"]);
+        assert!(entry.older, "{entry:?}");
+    }
+
     #[test]
     fn pages_in_one_millisecond_still_walk_back() {
         let mut s = historied("", 2, Book::default());

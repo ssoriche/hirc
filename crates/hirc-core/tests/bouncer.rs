@@ -391,3 +391,174 @@ async fn znc_an_overflowed_buffer_is_a_break_that_scrolling_reads_past() {
     scroll_to_the_top(&tx, &mut rx, &mut store, "znc", &chan).await;
     assert_eq!(said_in(&mut store, &chan), ["seen 1", "seen 2", "seen 3", "away 4", "away 5", "away 6", "away 7", "away 8"]);
 }
+
+/// Polls ZNC, with a second client, until its playback for `target` holds
+/// a line matching `want` (a substring of a raw line), for up to 10 s.
+/// `synced` only proves a line reached Ergo, not that ZNC has buffered it.
+/// Gives back that playback.
+async fn znc_holds(znc: &Znc, target: &str, want: &str) -> Vec<String> {
+    let mut held = Vec::new();
+    for _ in 0..50 {
+        let (mut check, _) = register(znc.port, &znc::pass(), znc::USER, znc::USER, &["batch", "server-time", "znc.in/playback"]).await;
+        held = ask(&mut check, &format!("PRIVMSG *playback :PLAY {target} 0")).await;
+        check.send("QUIT").await;
+        if held.iter().any(|l| !l.starts_with("> ") && l.contains(want)) {
+            return held;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("ZNC never held {want:?} for {target}: {held:?}");
+}
+
+/// Spec, ZNC test 2. A reconnect brings only what was missed, as history,
+/// and each line once.
+#[tokio::test(flavor = "multi_thread")]
+async fn znc_a_reconnect_brings_only_what_was_missed_and_each_line_once() {
+    let ergo = Ergo::start();
+    let znc = Znc::start(&ergo);
+    wait_in_channel(&ergo, znc::USER, "#test").await;
+    let mut bob = join_bob(&ergo).await;
+    let chan = Target::Channel("#test".into());
+    let (tx, mut rx) = net(via_znc(&znc));
+    let mut store = Store::new(["znc".to_owned()]);
+    applied_until(&mut rx, &mut store, |e| matches!(e, Event::Joined { .. })).await;
+    bob.send("PRIVMSG #test :before").await;
+    applied_until(&mut rx, &mut store, |e| line_in(e, "#test").is_some_and(|l| l.text == "before")).await;
+    tx.send(Command::Disconnect { network: "znc".into(), reason: None }).unwrap();
+    applied_until(&mut rx, &mut store, |e| matches!(e, Event::Status { status: ConnStatus::Offline, .. })).await;
+    for i in 1..=3 {
+        bob.send(&format!("PRIVMSG #test :missed {i}")).await;
+    }
+    znc_holds(&znc, "#test", "missed 3").await;
+    tx.send(Command::Reconnect { network: "znc".into() }).unwrap();
+    // Every #test text that arrives after the reconnect, live or as history.
+    let (mut live, mut played) = (Vec::new(), Vec::new());
+    let mut note = |e: &Event| match e {
+        Event::History { target, lines, .. } if target.same(&chan) => played.extend(said(lines)),
+        _ => live.extend(line_in(e, "#test").map(|l| l.text)),
+    };
+    applied_until(&mut rx, &mut store, |e| {
+        note(e);
+        matches!(e, Event::History { lines, .. } if lines.iter().any(|l| l.text == "missed 3"))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while let Ok(e) = rx.try_recv() {
+        note(&e);
+        store.apply(e);
+    }
+    // (Our own re-join shows live, as a notice; chat must not.)
+    assert!(!live.iter().any(|t| t == "before" || t.starts_with("missed")), "came live: {live:?}");
+    // PLAY takes whole seconds from the newest line held, so ZNC sends that
+    // one line again (`playback::since`); the store collapses it by msgid.
+    // Nothing else from before the drop may come back, and nothing twice.
+    played.sort();
+    let boundary = played.iter().filter(|t| *t == "before").count();
+    assert!(boundary <= 1, "history after the reconnect: {played:?}");
+    played.retain(|t| t != "before");
+    assert_eq!(played, ["missed 1", "missed 2", "missed 3"], "history after the reconnect");
+    assert_eq!(said_in(&mut store, &chan), ["before", "missed 1", "missed 2", "missed 3"]);
+}
+
+/// Spec, ZNC test 3. A line we send from another client shows as our own
+/// (self-message).
+#[tokio::test(flavor = "multi_thread")]
+async fn znc_a_line_from_our_other_client_shows_as_our_own() {
+    let ergo = Ergo::start();
+    let znc = Znc::start(&ergo);
+    wait_in_channel(&ergo, znc::USER, "#test").await;
+    let (_tx, mut rx) = net(via_znc(&znc));
+    joined(&mut rx, "#test").await;
+    let (mut phone, _) = register(znc.port, &znc::pass(), znc::USER, znc::USER, &["server-time"]).await;
+    phone.send("PRIVMSG #test :from my phone").await;
+    let got = next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "from my phone")).await;
+    assert!(got.own, "{got:?}");
+    assert_eq!(got.nick.as_deref(), Some(znc::USER));
+    assert!(!got.replayed);
+}
+
+/// Spec, ZNC test 4. A services buffer in the replay opens no window, and
+/// none is cached.
+///
+/// Real ZNC 1.10.3 never holds a services line here: Ergo's NickServ
+/// answers with NOTICEs, which ZNC does not buffer, and ZNC keeps no copy
+/// of our own queries. What it does hold is the (empty) NickServ buffer
+/// that talking to it creates, and PLAY brackets it like any other. That
+/// is what this test replays. It does not exercise the services filter:
+/// an empty batch is dropped before that check. A services line inside
+/// the brackets is covered by the session unit tests, from recorded lines.
+#[tokio::test(flavor = "multi_thread")]
+async fn znc_a_services_buffer_in_the_replay_opens_no_window_and_is_never_cached() {
+    let ergo = Ergo::start();
+    let znc = Znc::start(&ergo);
+    wait_in_channel(&ergo, znc::USER, "#test").await;
+    // Another client of ours talks to NickServ while hirc is away.
+    let (mut phone, _) = register(znc.port, &znc::pass(), znc::USER, znc::USER, &["server-time"]).await;
+    phone.send("PRIVMSG NickServ :HELP").await;
+    synced(&mut phone).await;
+    phone.send("QUIT").await;
+    let mut bob = join_bob(&ergo).await;
+    bob.send("PRIVMSG #test :after services").await;
+    // ZNC holds a NickServ buffer, so hirc's PLAY gets it.
+    znc_holds(&znc, "*", "znc.in/playback NickServ").await;
+    znc_holds(&znc, "#test", "after services").await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let (_tx, mut rx, flush) = hirc_core::conn::spawn(via_znc(&znc), Some(db.clone()));
+    let mut seen = Vec::new();
+    next_matching(&mut rx, |e| {
+        seen.push(e.clone());
+        matches!(e, Event::History { lines, .. } if lines.iter().any(|l| l.text == "after services")).then_some(())
+    })
+    .await;
+    // ZNC plays the buffers back in its own order: let the rest land.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    while let Ok(e) = rx.try_recv() {
+        seen.push(e);
+    }
+    let services = |t: &Target| matches!(t, Target::Query(q) if q.eq_ignore_ascii_case("NickServ"));
+    assert!(
+        !seen.iter().any(|e| matches!(e, Event::History { target, .. } | Event::Line { target, .. } if services(target))),
+        "a NickServ window opened: {seen:?}"
+    );
+    assert!(tokio::task::spawn_blocking(move || flush.wait()).await.unwrap());
+    let cached = hirc_core::cache::Cache::open(&db).unwrap().targets("znc").unwrap();
+    assert!(!cached.iter().any(|(t, _)| t.eq_ignore_ascii_case("nickserv")), "{cached:?}");
+}
+
+/// Spec, ZNC test 5. A cache round trip across a restart: the window
+/// opens on the cache, and scrolling up reads the rest of the cached ZNC
+/// lines.
+#[tokio::test(flavor = "multi_thread")]
+async fn znc_a_restart_scrolls_up_through_the_cached_lines() {
+    let ergo = Ergo::start();
+    let znc = Znc::start(&ergo);
+    wait_in_channel(&ergo, znc::USER, "#test").await;
+    let mut bob = join_bob(&ergo).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let mut config = via_znc(&znc);
+    config.servers.get_mut("znc").unwrap().history_page_size = Some(2);
+    let (tx, mut rx, flush) = hirc_core::conn::spawn(config.clone(), Some(db.clone()));
+    joined(&mut rx, "#test").await;
+    for i in 1..=5 {
+        bob.send(&format!("PRIVMSG #test :m{i}")).await;
+    }
+    next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "m5")).await;
+    assert!(tokio::task::spawn_blocking(move || flush.wait()).await.unwrap());
+    drop(tx);
+
+    let chan = Target::Channel("#test".into());
+    let (tx, mut rx, _flush) = hirc_core::conn::spawn(config, Some(db.clone()));
+    // Before any connection: the cache's latest page.
+    let first = next_matching(&mut rx, |e| Some(e.clone())).await;
+    let Event::History { lines, .. } = &first else { panic!("first event {first:?}") };
+    assert_eq!(said(lines), ["m4", "m5"]);
+    assert!(lines.iter().all(|l| l.replayed));
+    let mut store = Store::new(["znc".to_owned()]);
+    store.apply(first);
+    applied_until(&mut rx, &mut store, |e| matches!(e, Event::Status { status: ConnStatus::Connected { .. }, .. })).await;
+    scroll_to_the_top(&tx, &mut rx, &mut store, "znc", &chan).await;
+    assert_eq!(said_in(&mut store, &chan), ["m1", "m2", "m3", "m4", "m5"]);
+}

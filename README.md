@@ -78,10 +78,18 @@ Start a line with `//` to send a message that begins with a slash.
 cargo test --workspace
 scripts/ergo-test.sh setup        # once: downloads Ergo, makes test certs
 cargo test -p hirc-core --features ergo-tests --test ergo
+cargo test -p hirc-core --features bouncer-tests --test bouncer
 ```
 
 If the Ergo tests fail with certificate errors after an Ergo upgrade, delete
 `target/ergo/ca.pem` and rerun `scripts/ergo-test.sh setup`.
+
+The bouncer tests run hirc through ZNC (with its playback module) and soju,
+each in front of a test Ergo. Both bouncers come from the flox environment
+(run the tests inside `flox activate`), which installs them on aarch64-darwin
+only: the bouncer tests do not run on other systems.
+Add `-- --ignored` to re-record the ZNC and soju transcripts in
+`crates/hirc-core/tests/data/`, which the unit tests read.
 
 ## Snapshot mode
 
