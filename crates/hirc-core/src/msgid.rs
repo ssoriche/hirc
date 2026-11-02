@@ -1,10 +1,14 @@
-//! Made-up msgids, for servers that time their lines but give them no
-//! msgid (ZNC). With one, a line's live copy and its replayed copy are
-//! one line in the store, and it can go in the history cache, whose key,
-//! breaks and paging all need a msgid. The id is a hash of what the line
-//! says, so both copies get the same one. Two identical lines from one
-//! nick in the same millisecond become one (accepted). Made-up ids never
-//! leave hirc: `PREFIX` tells them apart, and nothing sends one.
+//! Made-up msgids, for lines whose live and replayed copies don't share
+//! a server msgid: on a server without chathistory that times its lines
+//! but gives them none, and on a playback network (ZNC) always, the
+//! server's msgid replaced, since ZNC passes it on live lines but replays
+//! without it (ruling Q1). With one, a line's live copy and its replayed
+//! copy are one line in the store, and it can go in the history cache,
+//! whose key, breaks and paging all need a msgid. The id is a hash of
+//! what the line says, so both copies get the same one. Two identical
+//! lines from one nick in the same millisecond become one (accepted).
+//! Made-up ids never leave hirc: `PREFIX` tells them apart, and nothing
+//! sends one.
 
 use crate::event::Target;
 use crate::store::Line;

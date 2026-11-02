@@ -187,7 +187,7 @@ fn seed(name: &str, server: &Server, cache: &Shared, book: &mut Book) -> Vec<Eve
         // apart by order only, and the last is the newest.
         book.reach(&target, query, lines.first().map(Anchor::of).as_ref(), lines.last().map(Anchor::of).as_ref());
         let target = if query { Target::Query(target) } else { Target::Channel(target) };
-        out.push(Event::History { network: name.to_owned(), target, lines, start: false });
+        out.push(Event::History { network: name.to_owned(), target, lines, start: false, older: false });
     }
     out
 }
@@ -553,7 +553,7 @@ async fn connect_once(
 mod tests {
     use super::*;
     use crate::cache::{Above, Below, Cache, Entry};
-    use crate::session::tests::{asked, feed, historied, histories, now, sent};
+    use crate::session::tests::{asked, feed, historied, histories, now, sent, zncd};
 
     fn line(id: &str, secs: i64) -> Line {
         Line {
@@ -573,7 +573,7 @@ mod tests {
     fn cache_with(dir: &tempfile::TempDir, entries: Vec<(Target, Vec<Line>)>) -> Shared {
         let cache = Shared::open(&dir.path().join("history.db")).unwrap();
         for (target, lines) in entries {
-            cache.write(Entry { network: "net".into(), target, lines, below: Below::Breaks, above: Above::Leave });
+            cache.write(Entry { network: "net".into(), target, lines, below: Below::Breaks, above: Above::Leave, older: false });
         }
         assert!(cache.flush());
         cache
@@ -1017,5 +1017,122 @@ mod tests {
         let configured = vec!["#a key".to_string(), "#b".to_string()];
         let rejoin = vec!["#A".to_string(), "#c".to_string()];
         assert_eq!(merge_channels(&configured, &rejoin), ["#a key", "#b", "#c"]);
+    }
+
+    /// A ZNC line said at 10:00:`secs`.500, live or (in `batch`) replayed.
+    fn znc_line(s: &mut Session, batch: Option<&str>, text: &str, secs: u32) -> Vec<Output> {
+        let tag = batch.map_or(String::new(), |b| format!("batch={b};"));
+        feed(s, &format!("@{tag}time=2026-10-22T10:00:{secs:02}.500Z :bob!b@h PRIVMSG #test :{text}"))
+    }
+
+    /// ZNC's replay of `#test`: `lines` (text, seconds) as one batch.
+    fn znc_replay(s: &mut Session, lines: &[(&str, u32)]) -> Vec<Output> {
+        feed(s, ":irc.znc.in BATCH +p znc.in/playback #test");
+        for (text, secs) in lines {
+            znc_line(s, Some("p"), text, *secs);
+        }
+        feed(s, ":irc.znc.in BATCH -p")
+    }
+
+    fn brk_of(dir: &tempfile::TempDir, text: &str) -> bool {
+        rusqlite::Connection::open(dir.path().join("history.db")).unwrap().query_row("SELECT brk FROM lines WHERE text = ?1", [text], |r| r.get(0)).unwrap()
+    }
+
+    /// Connected through ZNC and keeping a cache, `book` carried in.
+    fn znc_keeping(book: Book) -> (Session, Vec<Output>) {
+        let (s, out) = zncd(book);
+        (s.keeping(), out)
+    }
+
+    #[test]
+    fn a_znc_replay_that_meets_what_we_hold_has_no_break() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Shared::open(&dir.path().join("history.db")).unwrap();
+        let (mut s, _) = znc_keeping(Book::default());
+        znc_line(&mut s, None, "seen 1", 1);
+        znc_line(&mut s, None, "seen 2", 2);
+        assert!(written(&mut s, &cache));
+        // Back: PLAY from seen 2's second, so ZNC sends seen 2 again first.
+        let (mut s, out) = znc_keeping(s.take_book());
+        assert_eq!(sent(&out).into_iter().filter(|m| m.contains("PLAY")).collect::<Vec<_>>(), ["PRIVMSG *playback :PLAY * 1792663202"]);
+        znc_replay(&mut s, &[("seen 2", 2), ("away 1", 3)]);
+        assert!(written(&mut s, &cache));
+        assert!(!brk_of(&dir, "seen 2"));
+        assert!(!brk_of(&dir, "away 1"));
+        // Without batches, every line is a replay of its own, and each
+        // follows on from the one kept before it.
+        znc_replay(&mut s, &[("away 2", 4)]);
+        znc_replay(&mut s, &[("away 3", 5)]);
+        assert!(written(&mut s, &cache));
+        assert!(!brk_of(&dir, "away 2"));
+        assert!(!brk_of(&dir, "away 3"));
+    }
+
+    /// ZNC test 6 with every line in one millisecond, as a burst through
+    /// Ergo is: the cache's pages end inside that millisecond, and read
+    /// back up after a restart, the lines are still in the order said.
+    #[test]
+    fn one_millisecond_reads_back_in_order_across_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Shared::open(&dir.path().join("history.db")).unwrap();
+        let (mut s, _) = znc_keeping(Book::default());
+        for t in ["seen 1", "seen 2", "seen 3"] {
+            znc_line(&mut s, None, t, 1);
+        }
+        assert!(written(&mut s, &cache));
+        let (mut s, _) = znc_keeping(s.take_book());
+        znc_replay(&mut s, &[("away 4", 1), ("away 5", 1), ("away 6", 1), ("away 7", 1), ("away 8", 1)]);
+        assert!(written(&mut s, &cache));
+        cache.write_history("net", false);
+        assert!(cache.flush());
+        let server = Server { channels: vec!["#test".into()], history_page_size: Some(3), ..Server::default() };
+        let mut book = Book::default();
+        let mut store = crate::store::Store::new(["net".to_owned()]);
+        for e in seed("net", &server, &cache, &mut book) {
+            store.apply(e);
+        }
+        let (mut s, _) = znc_keeping(book);
+        for _ in 0..4 {
+            for o in older_of(&mut s, &cache, "#test") {
+                if let Output::Event(e) = o {
+                    store.apply(e);
+                }
+            }
+        }
+        let b = store.buffer_ix(0, &Target::Channel("#test".into()));
+        let said: Vec<&str> = store.networks[0].buffers[b].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(said, ["seen 1", "seen 2", "seen 3", "away 4", "away 5", "away 6", "away 7", "away 8"]);
+    }
+
+    #[test]
+    fn a_znc_replay_past_what_we_hold_is_a_break_that_the_cache_reads_past() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Shared::open(&dir.path().join("history.db")).unwrap();
+        let (mut s, _) = znc_keeping(Book::default());
+        znc_line(&mut s, None, "seen 1", 1);
+        znc_line(&mut s, None, "seen 2", 2);
+        assert!(written(&mut s, &cache));
+        // ZNC's buffer ran out while we were away: its replay starts later.
+        let (mut s, _) = znc_keeping(s.take_book());
+        znc_replay(&mut s, &[("away 5", 10), ("away 6", 11)]);
+        assert!(written(&mut s, &cache));
+        assert!(brk_of(&dir, "away 5"));
+        assert!(!brk_of(&dir, "away 6"));
+        // A restart. The last connection had no server history, so the
+        // cache is read past its breaks.
+        cache.write_history("net", false);
+        assert!(cache.flush());
+        let server = Server { channels: vec!["#test".into()], history_page_size: Some(2), ..Server::default() };
+        let mut book = Book::default();
+        let seeded: Vec<Vec<String>> = seed("net", &server, &cache, &mut book)
+            .into_iter()
+            .map(|e| match e {
+                Event::History { lines, .. } => lines.into_iter().map(|l| l.text).collect(),
+                e => panic!("{e:?}"),
+            })
+            .collect();
+        assert_eq!(seeded, [vec!["away 5".to_owned(), "away 6".to_owned()]]);
+        let (mut s, _) = znc_keeping(book);
+        assert_eq!(got(&older_of(&mut s, &cache, "#test")), [(vec!["seen 1".to_owned(), "seen 2".to_owned()], false), (vec![], true)]);
     }
 }

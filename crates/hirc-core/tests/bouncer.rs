@@ -10,16 +10,17 @@
 mod common;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use common::events::{joined, line_in, net, next_matching, offline, said};
+use common::events::{applied_until, joined, line_in, net, next_matching, offline, said, said_in};
 use common::soju::{self, Soju};
 use common::znc::{self, Znc};
 use common::{Ergo, Raw, record, register, wait_in_channel};
 use hirc_core::config::{Config, Server};
-use hirc_core::event::{Command, Event, Target};
+use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::history::timestamp;
 use hirc_core::proto::Message;
 use hirc_core::store::Store;
 use std::time::Duration;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// hirc through ZNC, as network `znc`: plaintext on loopback, with
 /// `PASS user/network:password`, the fixed test password.
@@ -323,4 +324,70 @@ async fn record_soju_facts() {
     let mut live = c.until("fact live").await;
     live.extend(ask(&mut c, "CHATHISTORY LATEST #test * 1").await);
     record("soju-0.11.1-live.txt", &live);
+}
+
+/// Asks for older lines of `target` on `network` until the start of its
+/// history, applying everything that comes to `store`.
+async fn scroll_to_the_top(tx: &UnboundedSender<Command>, rx: &mut UnboundedReceiver<Event>, store: &mut Store, network: &str, target: &Target) {
+    let name = target.name().unwrap_or_default().to_owned();
+    loop {
+        tx.send(Command::Older { network: network.into(), target: name.clone() }).unwrap();
+        let mut start = false;
+        applied_until(rx, store, |e| match e {
+            Event::History { target: t, lines, start: s, .. } if t.same(target) && (*s || !lines.is_empty()) => {
+                start = *s;
+                true
+            }
+            _ => false,
+        })
+        .await;
+        if start {
+            return;
+        }
+    }
+}
+
+/// Spec, ZNC test 6. ZNC kept only its last five lines while hirc was
+/// away. Its replay starts past what the cache holds, so its first line
+/// is a break. After a restart, scrolling up still reads past the break
+/// to the lines from before.
+#[tokio::test(flavor = "multi_thread")]
+async fn znc_an_overflowed_buffer_is_a_break_that_scrolling_reads_past() {
+    let ergo = Ergo::start();
+    let znc = Znc::with_buffer(&ergo, 5);
+    wait_in_channel(&ergo, znc::USER, "#test").await;
+    let mut bob = join_bob(&ergo).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let mut config = via_znc(&znc);
+    config.servers.get_mut("znc").unwrap().history_page_size = Some(3);
+    let (tx, mut rx, flush) = hirc_core::conn::spawn(config.clone(), Some(db.clone()));
+    joined(&mut rx, "#test").await;
+    for i in 1..=3 {
+        bob.send(&format!("PRIVMSG #test :seen {i}")).await;
+    }
+    next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "seen 3")).await;
+    tx.send(Command::Disconnect { network: "znc".into(), reason: None }).unwrap();
+    offline(&mut rx).await;
+    for i in 1..=8 {
+        bob.send(&format!("PRIVMSG #test :away {i}")).await;
+    }
+    synced(&mut bob).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    tx.send(Command::Reconnect { network: "znc".into() }).unwrap();
+    next_matching(&mut rx, |e| matches!(e, Event::History { lines, .. } if lines.iter().any(|l| l.text == "away 8")).then_some(())).await;
+    assert!(tokio::task::spawn_blocking(move || flush.wait()).await.unwrap());
+    drop(tx);
+    let brk =
+        |text: &str| -> bool { rusqlite::Connection::open(&db).unwrap().query_row("SELECT brk FROM lines WHERE text = ?1", [text], |r| r.get(0)).unwrap() };
+    // ZNC's five lines began at "away 4": past "seen 3", the newest held.
+    assert!(brk("away 4"));
+    assert!(!brk("away 5"));
+
+    let chan = Target::Channel("#test".into());
+    let (tx, mut rx, _flush) = hirc_core::conn::spawn(config, Some(db.clone()));
+    let mut store = Store::new(["znc".to_owned()]);
+    applied_until(&mut rx, &mut store, |e| matches!(e, Event::Status { status: ConnStatus::Connected { .. }, .. })).await;
+    scroll_to_the_top(&tx, &mut rx, &mut store, "znc", &chan).await;
+    assert_eq!(said_in(&mut store, &chan), ["seen 1", "seen 2", "seen 3", "away 4", "away 5", "away 6", "away 7", "away 8"]);
 }

@@ -321,14 +321,22 @@ pub enum Applied {
     },
 }
 
+/// The first seq a line arriving gets; older pages count down from it.
+const ARRIVAL: u64 = u64::MAX / 4;
+
 #[derive(Debug, Default)]
 pub struct Store {
     pub networks: Vec<Network>,
     local_seq: u64,
-    /// Numbers lines as they arrive. Sessions restart theirs on every
-    /// connection and cached lines have none, so the store's are the ones
-    /// the UI keys on (the "new" divider, the selection).
+    /// Numbers lines as they arrive, up from `ARRIVAL`. Sessions restart
+    /// theirs on every connection and cached lines have none, so the
+    /// store's are the ones the UI keys on (the "new" divider, the
+    /// selection).
     arrival: u64,
+    /// How many seqs below `ARRIVAL` older pages have taken: each one's
+    /// lines come below every line before it, so on a tie in time they go
+    /// before what was shown.
+    floor: u64,
     /// The time lines hirc writes itself are stamped with; `None` is the
     /// wall clock. Fixtures set it so their screenshots keep one clock.
     pub clock: Option<DateTime<Utc>>,
@@ -492,7 +500,7 @@ impl Store {
                 let n = self.network_ix(&network);
                 let b = self.buffer_ix(n, &target);
                 self.arrival += 1;
-                line.seq = self.arrival;
+                line.seq = ARRIVAL + self.arrival;
                 let net = &mut self.networks[n];
                 let me = net.nick.as_deref();
                 let buf = &mut net.buffers[b];
@@ -506,18 +514,29 @@ impl Store {
                     None => Applied::Nothing,
                 }
             }
-            Event::History { network, target, lines, start } => {
+            Event::History { network, target, lines, start, older } => {
                 let n = self.network_ix(&network);
                 let b = self.buffer_ix(n, &target);
                 let net = &mut self.networks[n];
                 let me = net.nick.as_deref();
                 let buf = &mut net.buffers[b];
                 let mut at = Vec::new();
+                // An older page takes seqs below every line so far, in its
+                // own order: on a tie in time it goes before them.
+                let below = older.then(|| {
+                    self.floor += lines.len() as u64;
+                    ARRIVAL - self.floor
+                });
                 // Never matched against our pending lines: an old line of
                 // ours with the same text is not the echo of a new one.
-                for mut line in lines {
-                    self.arrival += 1;
-                    line.seq = self.arrival;
+                for (i, mut line) in lines.into_iter().enumerate() {
+                    line.seq = match below {
+                        Some(base) => base + i as u64,
+                        None => {
+                            self.arrival += 1;
+                            ARRIVAL + self.arrival
+                        }
+                    };
                     at.extend(buf.add_counted(line, me));
                 }
                 buf.history = match (start, buf.history) {
@@ -789,7 +808,7 @@ mod tests {
     }
 
     fn page(target: &str, lines: Vec<Line>, start: bool) -> Event {
-        Event::History { network: "net".into(), target: Target::Channel(target.into()), lines, start }
+        Event::History { network: "net".into(), target: Target::Channel(target.into()), lines, start, older: false }
     }
 
     #[test]
@@ -893,5 +912,27 @@ mod tests {
         s.apply(Event::Status { network: "net".into(), status: ConnStatus::Disconnected { reason: "x".into(), retry: std::time::Duration::from_secs(2) } });
         let buf = &s.networks[0].buffers[b];
         assert_eq!((buf.history, buf.read_synced, buf.read), (HistoryState::Idle, false, Some(at(1))));
+    }
+
+    fn older_page(target: &str, lines: Vec<Line>) -> Event {
+        Event::History { network: "net".into(), target: Target::Channel(target.into()), lines, start: false, older: true }
+    }
+
+    /// A millisecond can hold many lines (a netsplit's QUITs, a bot, a
+    /// burst replayed), and a page can end inside one. A page before what
+    /// is shown arrives later but goes before every line it ties with, in
+    /// its own order; a newer page and a live line still go after them.
+    #[test]
+    fn an_older_page_goes_before_the_lines_it_ties_with() {
+        let mut s = Store::new(["net".to_string()]);
+        let chan = || Target::Channel("#a".into());
+        s.apply(page("#a", vec![old(0, 5, "n1", "n1"), old(0, 5, "n2", "n2")], false));
+        s.apply(older_page("#a", vec![old(0, 5, "o1", "o1"), old(0, 5, "o2", "o2")]));
+        s.apply(older_page("#a", vec![old(0, 5, "p1", "p1"), old(0, 5, "p2", "p2")]));
+        s.apply(page("#a", vec![old(0, 5, "x", "x")], false));
+        s.apply(Event::Line { network: "net".into(), target: chan(), line: line(0, 5, Some("y"), "y") });
+        let b = s.buffer_ix(0, &chan());
+        let texts: Vec<_> = s.networks[0].buffers[b].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["p1", "p2", "o1", "o2", "n1", "n2", "x", "y"]);
     }
 }

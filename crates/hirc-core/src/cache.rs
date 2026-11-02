@@ -116,6 +116,9 @@ pub struct Entry {
     pub below: Below,
     /// How its newest line meets the next newer line held.
     pub above: Above,
+    /// A page from before what is held: on a tie in time, its lines are
+    /// older than those held, though stored after them.
+    pub older: bool,
 }
 
 /// The older side of a run.
@@ -253,8 +256,9 @@ impl Cache {
 
     /// The `limit` lines of `target` just older than the line with
     /// `msgid`, oldest first, down to and including the first break, never
-    /// past it. Lines sharing the anchor's time that were stored before it
-    /// are older. An anchor that isn't held, or is a break itself, gives
+    /// past it. Lines sharing the anchor's time with a lower rowid are
+    /// older (a run from before what is held takes rowids below it). An
+    /// anchor that isn't held, or is a break itself, gives
     /// nothing: the cache can't say what comes before it. With
     /// `Reach::All`, breaks are read past (and never reported).
     pub fn before(&self, network: &str, target: &str, msgid: &str, limit: usize, reach: Reach) -> Result<Older, CacheError> {
@@ -349,14 +353,25 @@ fn put_run(db: &Connection, e: &Entry) -> Result<usize, CacheError> {
     lines.sort_by_key(|l| l.time);
     let (Some(oldest), Some(newest)) = (lines.first().and_then(|l| l.msgid.clone()), lines.last().and_then(|l| l.msgid.clone())) else { return Ok(0) };
     let mut insert = db.prepare_cached(
-        "INSERT OR IGNORE INTO lines (network, target, name, query, msgid, time, kind, nick, text, own, brk)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT OR IGNORE INTO lines (network, target, name, query, msgid, time, kind, nick, text, own, brk, rowid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
+    // Lines tied in time are ordered by rowid. A run from before what is
+    // held is stored after it, so it takes rowids below every row's (in
+    // its own order), else it would read as newer than the lines it ties
+    // with, and paging up from them would skip it. Others get the next.
+    let below = if e.older {
+        let min: i64 = db.query_row("SELECT coalesce(min(rowid), 1) FROM lines", [], |r| r.get(0))?;
+        Some(min.saturating_sub(i64::try_from(lines.len()).unwrap_or(i64::MAX)))
+    } else {
+        None
+    };
     let mut heal = db.prepare_cached("UPDATE lines SET brk = 0 WHERE network = ?1 AND target = ?2 AND msgid = ?3")?;
     let (mut n, mut newest_is_new) = (0, false);
     for (i, l) in lines.iter().enumerate() {
-        let new =
-            insert.execute(params![e.network, target, name, query, l.msgid, l.time.timestamp_millis(), kind_name(l.kind), l.nick, l.text, l.own, i == 0])? == 1;
+        let rowid = below.map(|b| b + i64::try_from(i).unwrap_or(0));
+        let row = params![e.network, target, name, query, l.msgid, l.time.timestamp_millis(), kind_name(l.kind), l.nick, l.text, l.own, i == 0, rowid];
+        let new = insert.execute(row)? == 1;
         if !new && i > 0 {
             heal.execute(params![e.network, target, l.msgid])?;
         }
@@ -633,7 +648,7 @@ mod tests {
     }
 
     fn entry(target: Target, lines: Vec<Line>) -> Entry {
-        Entry { network: "net".into(), target, lines, below: Below::Breaks, above: Above::Leave }
+        Entry { network: "net".into(), target, lines, below: Below::Breaks, above: Above::Leave, older: false }
     }
 
     fn texts(lines: &[Line]) -> Vec<&str> {
@@ -1063,5 +1078,25 @@ mod tests {
         assert_eq!(c.discovered("net").unwrap(), Some(at(9)));
         assert_eq!(c.discovered("other").unwrap(), Some(at(1)));
         assert_eq!(c.discovered("none").unwrap(), None);
+    }
+
+    /// A page before what is held, stored after it, in the millisecond of
+    /// the line it was asked before: paging up from that line finds it,
+    /// once, and it meets that line.
+    #[test]
+    fn an_older_run_in_the_anchors_millisecond_is_neither_skipped_nor_doubled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let mut c = Cache::open(&path).unwrap();
+        c.put(&[entry(chan("#a"), vec![line(Some("n1"), 5, "n1"), line(Some("n2"), 5, "n2")])]).unwrap();
+        let before = Entry { above: Above::Joins("n1".into()), older: true, ..entry(chan("#a"), vec![line(Some("o1"), 5, "o1"), line(Some("o2"), 5, "o2")]) };
+        c.put(&[before]).unwrap();
+        assert_eq!([brk(&path, "o1"), brk(&path, "o2"), brk(&path, "n1")], [true, false, false]);
+        let older = c.before("net", "#a", "n1", 10, Reach::ToBreak).unwrap();
+        assert_eq!((texts(&older.lines), older.broke), (vec!["o1", "o2"], true));
+        assert_eq!(texts(&c.before("net", "#a", "n2", 2, Reach::All).unwrap().lines), ["o2", "n1"]);
+        assert_eq!(texts(&c.before("net", "#a", "o2", 10, Reach::All).unwrap().lines), ["o1"]);
+        assert!(c.before("net", "#a", "o1", 10, Reach::All).unwrap().lines.is_empty());
+        assert_eq!(texts(&c.latest_in("net", "#a", 10, Reach::All).unwrap()), ["o1", "o2", "n1", "n2"]);
     }
 }

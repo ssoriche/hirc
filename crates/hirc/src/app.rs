@@ -1667,7 +1667,7 @@ mod tests {
         let chan = Target::Channel("#a".into());
         let (mut s, b) = with_lines(&chan, &[(1, "m1")], None);
         let on = Some((0, b));
-        let page = |lines| Event::History { network: "n".into(), target: chan.clone(), lines, start: false };
+        let page = |lines| Event::History { network: "n".into(), target: chan.clone(), lines, start: false, older: false };
         // Only lines already here: the server still has some.
         s.networks[0].buffers[b].history = HistoryState::Loading;
         let mut dry = None;
@@ -1727,7 +1727,7 @@ mod tests {
         absorb(&mut s, on, &mut sent, &mut None, Event::Line { network: "n".into(), target: chan.clone(), line: join });
         assert_eq!(read_command(&mut s, on, &mut sent, true, true), None, "the fill isn't in");
         let missed = |t, id| Line { replayed: true, ..said(t, Some(id)) };
-        let page = Event::History { network: "n".into(), target: chan.clone(), lines: vec![missed(2, "m2"), missed(3, "m3")], start: false };
+        let page = Event::History { network: "n".into(), target: chan.clone(), lines: vec![missed(2, "m2"), missed(3, "m3")], start: false, older: false };
         absorb(&mut s, on, &mut sent, &mut None, page);
         let buf = &s.networks[0].buffers[b];
         let ix = buf.first_unread().expect("m3 is new");
@@ -1761,12 +1761,12 @@ mod tests {
         s.apply(Event::Line { network: "n".into(), target: chan(), line: said(1, Some("m1")) });
         let b = s.buffer_ix(0, &chan());
         s.networks[0].buffers[b].history = HistoryState::Loading;
-        let page = Event::History { network: "n".into(), target: chan(), lines: vec![said(1, Some("m1"))], start: false };
+        let page = Event::History { network: "n".into(), target: chan(), lines: vec![said(1, Some("m1"))], start: false, older: false };
         let incoming = page_lines(&page);
         let Applied::History { at, .. } = s.apply(page) else { panic!("not a page") };
         assert!(at.is_empty(), "the line was already here");
         assert_eq!(page_dry(true, s.networks[0].buffers[b].history, incoming), Some(false), "the server sent lines: it hasn't given up");
-        let empty = Event::History { network: "n".into(), target: chan(), lines: vec![], start: false };
+        let empty = Event::History { network: "n".into(), target: chan(), lines: vec![], start: false, older: false };
         assert_eq!(page_lines(&empty), 0);
         assert_eq!(page_lines(&Event::OwnNick { network: "n".into(), nick: "me".into() }), 0);
     }

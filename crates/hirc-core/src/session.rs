@@ -181,6 +181,10 @@ enum Tail {
     /// A line shown since then that the cache can't keep: the next one
     /// kept doesn't follow on, whatever a page says later.
     Hole,
+    /// The newest line of a replay that came after a hole. The replay is
+    /// from before the hole, so more of it follows on from this line, but
+    /// a live line doesn't.
+    Behind(String),
 }
 
 /// A name in a TARGETS answer, and when it was last busy.
@@ -378,7 +382,7 @@ impl Session {
         if first.is_some() {
             self.book.reach(target, query, first.as_ref(), last.as_ref());
         }
-        vec![self.history_event(target, lines, false)]
+        vec![self.page_event(target, lines, false, true)]
     }
 
     /// Say what to write to the history cache, through `kept`.
@@ -396,12 +400,12 @@ impl Session {
         self.keep.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
-    fn keep_run(&mut self, target: &str, lines: &[Line], below: Below, above: Above) {
+    fn keep_run(&mut self, target: &str, lines: &[Line], below: Below, above: Above, older: bool) {
         let target = self.dest(target);
         if let Some(keep) = &mut self.keep
             && !lines.is_empty()
         {
-            keep.push(Entry { network: self.network.clone(), target, lines: lines.to_vec(), below, above });
+            keep.push(Entry { network: self.network.clone(), target, lines: lines.to_vec(), below, above, older });
         }
     }
 
@@ -414,14 +418,17 @@ impl Session {
         if let (true, Some(id)) = (cache::cacheable(target, line), &line.msgid) {
             let below = match self.tail.get(&key) {
                 Some(Tail::At(prev)) => Below::Joins(prev.clone()),
-                Some(Tail::Hole) | None => Below::Breaks,
+                Some(Tail::Hole | Tail::Behind(_)) | None => Below::Breaks,
             };
             if let Some(keep) = &mut self.keep {
-                keep.push(Entry { network: self.network.clone(), target: target.clone(), lines: vec![line.clone()], below, above: Above::Leave });
+                keep.push(Entry { network: self.network.clone(), target: target.clone(), lines: vec![line.clone()], below, above: Above::Leave, older: false });
             }
             self.tail.insert(key, Tail::At(id.clone()));
         } else if line.msgid.is_none() && line.delivery == Delivery::Sent && !line.boundary {
-            self.tail.insert(key, Tail::Hole);
+            // Behind a hole already: a replay still goes on from its line.
+            if !matches!(self.tail.get(&key), Some(Tail::Behind(_))) {
+                self.tail.insert(key, Tail::Hole);
+            }
         }
     }
 
@@ -1052,7 +1059,14 @@ impl Session {
     /// ZNC's replay of one buffer (or one line of it, without batches):
     /// history, as one page. Empty (ZNC sends one per buffer on attach),
     /// it shows nothing. A services query's replay opens no window: only
-    /// one the user has open shows it.
+    /// one the user has open shows it, and it is never cached.
+    ///
+    /// The run is kept following the last line kept for its target on
+    /// this connection, else as a break. The cache already holds the line
+    /// a replay starts on when ZNC kept everything since we left (PLAY
+    /// asks from that line's second). So only a replay that starts past
+    /// what we hold leaves a break: ZNC's buffer ran out. Live lines then
+    /// follow on from the replay.
     fn finish_playback(&mut self, target: &str, lines: Vec<Line>, out: &mut Vec<Output>) {
         let query = !self.isupport.is_channel(target);
         let unasked_service = query && services::is_service(target) && !self.book.get(target).is_some_and(|k| k.query);
@@ -1060,6 +1074,19 @@ impl Session {
             return;
         }
         self.book.note(target, query, &lines);
+        let key = target.to_ascii_lowercase();
+        let below = match self.tail.get(&key) {
+            Some(Tail::At(prev) | Tail::Behind(prev)) => Below::Joins(prev.clone()),
+            Some(Tail::Hole) | None => Below::Breaks,
+        };
+        self.keep_run(target, &lines, below, Above::Leave, false);
+        // After a hole, the replay is from before it: the next live line
+        // still doesn't follow on, but more of the replay does.
+        let dest = self.dest(target);
+        if let Some(id) = lines.iter().rev().find(|l| cache::cacheable(&dest, l)).and_then(|l| l.msgid.clone()) {
+            let behind = matches!(self.tail.get(&key), Some(Tail::Hole | Tail::Behind(_)));
+            self.tail.insert(key, if behind { Tail::Behind(id) } else { Tail::At(id) });
+        }
         out.push(self.history_event(target, lines, false));
     }
 
@@ -1144,7 +1171,7 @@ impl Session {
         let answered = self.answers(page.label.as_deref(), &page.target).and_then(|k| self.inflight.remove(&k).map(|i| (k, i)));
         let Some((key, Inflight { request, .. })) = answered else {
             self.widen_unsolicited(&page);
-            self.keep_run(&page.target, &page.lines, Below::Breaks, Above::Breaks);
+            self.keep_run(&page.target, &page.lines, Below::Breaks, Above::Breaks, false);
             if !page.lines.is_empty() {
                 out.push(self.history_event(&page.target, page.lines, false));
             }
@@ -1171,14 +1198,15 @@ impl Session {
             (Kind::Before(a), false) => (Below::Breaks, a.msgid.clone().map_or(Above::Breaks, Above::Joins)),
             _ => (Below::Breaks, Above::Breaks),
         };
-        self.keep_run(&request.target, &page.lines, below, above);
+        let before = matches!(request.kind, Kind::Before(_));
+        self.keep_run(&request.target, &page.lines, below, above, before);
         let newest_kept = {
             let dest = self.dest(&request.target);
             page.lines.iter().rev().find(|l| cache::cacheable(&dest, l)).and_then(|l| l.msgid.clone())
         };
         if cut {
             if !page.lines.is_empty() {
-                out.push(self.history_event(&request.target, page.lines, false));
+                out.push(self.page_event(&request.target, page.lines, false, before));
             }
             return;
         }
@@ -1192,7 +1220,7 @@ impl Session {
         if start && ended {
             out.push(Output::CacheOlder(request.target.clone()));
         } else {
-            out.push(self.history_event(&request.target, page.lines, start));
+            out.push(self.page_event(&request.target, page.lines, start, before));
         }
         // The page reaches the live end: live lines follow on from it.
         if matches!(request.kind, Kind::Latest) {
@@ -1451,7 +1479,12 @@ impl Session {
     }
 
     fn history_event(&self, target: &str, lines: Vec<Line>, start: bool) -> Output {
-        Output::Event(Event::History { network: self.network.clone(), target: self.dest(target), lines, start })
+        self.page_event(target, lines, start, false)
+    }
+
+    /// A page from before every line shown (`Event::History::older`).
+    fn page_event(&self, target: &str, lines: Vec<Line>, start: bool, older: bool) -> Output {
+        Output::Event(Event::History { network: self.network.clone(), target: self.dest(target), lines, start, older })
     }
 
     /// Every live line shown widens the book, so the next request starts
@@ -3732,6 +3765,37 @@ pub(crate) mod tests {
         assert_eq!(store.networks[0].buffers[b].lines.iter().filter(|l| l.text == "fact live").count(), 1);
     }
 
+    /// Every stamping site, not just `on_message` and `on_join`: a live
+    /// event or action and its copy in ZNC's replay get one made-up id.
+    #[test]
+    fn a_live_event_or_action_and_its_replay_are_one_line() {
+        for (i, (said, kind)) in [
+            (":bob!b@h PART #test :bye", LineKind::Part),
+            (":bob!b@h QUIT :gone", LineKind::Quit),
+            (":bob!b@h NICK bobby", LineKind::Nick),
+            (":bob!b@h TOPIC #test :new topic", LineKind::Topic),
+            (":bob!b@h PRIVMSG #test :\x01ACTION waves\x01", LineKind::Action),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut s, _) = zncd(Book::default());
+            feed(&mut s, OUR_JOIN);
+            feed(&mut s, "@time=2026-10-22T10:00:00.000Z :bob!b@h JOIN #test");
+            let time = format!("time=2026-10-22T10:01:0{i}.123Z");
+            let live = lines(&feed(&mut s, &format!("@{time} {said}")));
+            let [(Target::Channel(_), live)] = live.as_slice() else { panic!("{said}: {live:?}") };
+            assert_eq!(live.kind, kind, "{said}");
+            feed(&mut s, ":znc.in BATCH +p znc.in/playback #test");
+            feed(&mut s, &format!("@batch=p;{time} {said}"));
+            let replay = histories(&feed(&mut s, ":znc.in BATCH -p"));
+            let [(_, replayed, _)] = replay.as_slice() else { panic!("{said}: {replay:?}") };
+            let [replayed] = replayed.as_slice() else { panic!("{said}: {replayed:?}") };
+            assert!(live.msgid.as_deref().is_some_and(crate::msgid::is_made_up), "{said}: {live:?}");
+            assert_eq!((replayed.kind, &replayed.text, &replayed.msgid), (live.kind, &live.text, &live.msgid), "{said}");
+        }
+    }
+
     #[test]
     fn the_next_play_starts_at_the_newest_line_shown() {
         let (mut s, _) = zncd(Book::default());
@@ -3757,5 +3821,100 @@ pub(crate) mod tests {
         book.note("#test", false, &[Line { msgid: Some("hirc:0123456789abcdef".into()), time: "2026-10-22T10:00:00Z".parse().unwrap(), ..local_line() }]);
         let mut s = historied("", 50, book);
         assert_eq!(asked(&feed(&mut s, OUR_JOIN)).0, "CHATHISTORY AFTER #test timestamp=2026-10-22T10:00:00.000Z 20");
+    }
+
+    #[test]
+    fn a_znc_replay_is_kept_as_one_run_and_live_lines_follow_it() {
+        let (s, _) = zncd(Book::default());
+        let mut s = s.keeping();
+        feed(&mut s, ":irc.znc.in BATCH +p znc.in/playback #test");
+        feed(&mut s, "@batch=p;time=2026-10-22T10:01:00.000Z :bob!b@h PRIVMSG #test :r1");
+        feed(&mut s, "@batch=p;time=2026-10-22T10:02:00.000Z :bob!b@h PRIVMSG #test :r2");
+        feed(&mut s, ":irc.znc.in BATCH -p");
+        let kept = s.kept();
+        let [run] = kept.as_slice() else { panic!("{kept:?}") };
+        assert_eq!(texts(&run.lines), ["r1", "r2"]);
+        assert_eq!((&run.below, &run.above), (&Below::Breaks, &Above::Leave));
+        let r2 = run.lines[1].msgid.clone().expect("made up");
+        feed(&mut s, "@time=2026-10-22T10:03:00.000Z :bob!b@h PRIVMSG #test :live");
+        assert_eq!(s.kept()[0].below, Below::Joins(r2));
+    }
+
+    #[test]
+    fn loose_replayed_lines_follow_on_from_each_other() {
+        let (s, _) = zncd_with("server-time znc.in/playback", Book::default());
+        let mut s = s.keeping();
+        feed(&mut s, ":***!znc@znc.in PRIVMSG #test :Buffer Playback...");
+        feed(&mut s, "@time=2026-10-22T10:01:00.000Z :bob!b@h PRIVMSG #test :l1");
+        feed(&mut s, "@time=2026-10-22T10:02:00.000Z :bob!b@h PRIVMSG #test :l2");
+        let kept = s.kept();
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert_eq!(kept[0].below, Below::Breaks);
+        assert_eq!(kept[1].below, Below::Joins(kept[0].lines[0].msgid.clone().unwrap()));
+    }
+
+    #[test]
+    fn a_services_replay_is_never_kept() {
+        let mut book = Book::default();
+        book.open("NickServ", true);
+        let (s, _) = zncd(book);
+        let mut s = s.keeping();
+        feed(&mut s, ":irc.znc.in BATCH +n znc.in/playback NickServ");
+        feed(&mut s, "@batch=n;time=2026-10-22T10:01:00.000Z :NickServ!s@services NOTICE alice :IDENTIFY ok");
+        let shown = feed(&mut s, ":irc.znc.in BATCH -n");
+        assert_eq!(histories(&shown).len(), 1, "shown in the open window");
+        // But never cached.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let cache = cache::Shared::open(&path).unwrap();
+        for e in s.kept() {
+            cache.write(e);
+        }
+        assert!(cache.flush());
+        let rows: i64 = rusqlite::Connection::open(&path).unwrap().query_row("SELECT count(*) FROM lines", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// A line the cache can't keep is a hole. A replay after it never
+    /// fills it: the next live line still starts a break.
+    #[test]
+    fn a_replay_never_fills_a_hole() {
+        let (s, _) = zncd(Book::default());
+        let mut s = s.keeping();
+        // Untimed: no made-up id, so the cache can't keep it.
+        feed(&mut s, ":bob!b@h PRIVMSG #test :untimed");
+        feed(&mut s, ":znc.in BATCH +p znc.in/playback #test");
+        feed(&mut s, "@batch=p;time=2026-10-22T10:01:00.000Z :bob!b@h PRIVMSG #test :r1");
+        feed(&mut s, ":znc.in BATCH -p");
+        // More of the replay still follows on from it.
+        feed(&mut s, ":znc.in BATCH +q znc.in/playback #test");
+        feed(&mut s, "@batch=q;time=2026-10-22T10:02:00.000Z :bob!b@h PRIVMSG #test :r2");
+        feed(&mut s, ":znc.in BATCH -q");
+        feed(&mut s, "@time=2026-10-22T10:03:00.000Z :bob!b@h PRIVMSG #test :live");
+        let kept = s.kept();
+        let [r1, r2, live] = kept.as_slice() else { panic!("{kept:?}") };
+        assert_eq!((texts(&r1.lines), &r1.below), (vec!["r1"], &Below::Breaks));
+        assert_eq!((texts(&r2.lines), &r2.below), (vec!["r2"], &Below::Joins(r1.lines[0].msgid.clone().unwrap())));
+        assert_eq!((texts(&live.lines), &live.below), (vec!["live"], &Below::Breaks));
+    }
+
+    /// Pages before what is shown say so, so the store puts them before
+    /// the lines they tie with in time. Others don't.
+    #[test]
+    fn only_pages_before_what_is_shown_are_older() {
+        let older = |out: &[Output]| -> Vec<bool> {
+            out.iter()
+                .filter_map(|o| match o {
+                    Output::Event(Event::History { lines, older, .. }) if !lines.is_empty() => Some(*older),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (mut s, _) = zncd(Book::default());
+        feed(&mut s, ":znc.in BATCH +p znc.in/playback #test");
+        feed(&mut s, "@batch=p;time=2026-10-22T10:01:00.000Z :bob!b@h PRIVMSG #test :r1");
+        assert_eq!(older(&feed(&mut s, ":znc.in BATCH -p")), [false]);
+        let cached = s.cached("#test", vec![Line { msgid: Some("c1".into()), ..local_line() }]);
+        assert_eq!(older(&cached), [true]);
     }
 }
