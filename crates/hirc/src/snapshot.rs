@@ -374,7 +374,7 @@ fn take(fake: &mut Fake, network: &str, msg: Message, now: DateTime<Utc>, events
                 }
             }
             // Never said: the fake keeps no cache.
-            Output::Send(_) | Output::CacheOlder(_) => {}
+            Output::Send(_) | Output::CacheOlder(_) | Output::CacheLatest(_) => {}
         }
     }
     if error {
@@ -532,7 +532,7 @@ fn answer(session: &mut Fake, cmd: Command, now: DateTime<Utc>, echoes: &mut u64
                 events.push(ended(&network, out));
                 return (events, true);
             }
-            Output::CacheOlder(_) => {}
+            Output::CacheOlder(_) | Output::CacheLatest(_) => {}
         }
     }
     (events, false)

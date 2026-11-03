@@ -33,6 +33,12 @@ pub enum Output {
     /// only when the cache has nothing older either (`conn::resolve`).
     /// Only said while keeping a cache.
     CacheOlder(String),
+    /// We joined this channel, no server history will fill it, and its
+    /// window holds nothing: the network task opens it on the cache's
+    /// latest page (`conn::resolve`). A bouncer joins us to channels the
+    /// config doesn't name, so the cache didn't seed them. Only said
+    /// while keeping a cache.
+    CacheLatest(String),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1681,6 +1687,9 @@ impl Session {
         let line = self.line(msg, now, LineKind::Join, Some(&nick), join_text(&nick), me);
         out.push(self.stamped(msg, Target::Channel(chan.clone()), line));
         if me {
+            if !self.history_on() && self.keep.is_some() && self.book.oldest(&chan).is_none() {
+                out.push(Output::CacheLatest(chan.clone()));
+            }
             self.book.open(&chan, false);
             self.backfill(&chan, out);
         }
@@ -4015,7 +4024,7 @@ pub(crate) mod tests {
         irccloud_sent(self_replays, at).0
     }
 
-    fn irccloud(self_replays: bool) -> Session {
+    pub(crate) fn irccloud(self_replays: bool) -> Session {
         irccloud_at(self_replays, now())
     }
 

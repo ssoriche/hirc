@@ -230,6 +230,20 @@ fn older(session: &mut Session, cache: Option<&Shared>, network: &str, cmd: Comm
     session.command(cmd, Utc::now())
 }
 
+/// The cache's latest page for a window just joined that nothing else
+/// fills, past its breaks: without server history they are all there is.
+fn latest(session: &mut Session, cache: Option<&Shared>, network: &str, target: &str) -> Vec<Output> {
+    let Some(cache) = cache else { return Vec::new() };
+    match cache.read(|c| c.latest_in(network, target, session.page(), Reach::All)) {
+        Ok(lines) if !lines.is_empty() => session.cached(target, lines),
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            tracing::warn!("{network}: history cache: {e}");
+            Vec::new()
+        }
+    }
+}
+
 /// The session's outputs, with each `CacheOlder` answered: the server's
 /// history for that target ended, so the cache is read past its breaks,
 /// and "start" is said only when it has nothing older either.
@@ -238,6 +252,7 @@ fn resolve(session: &mut Session, cache: Option<&Shared>, network: &str, outs: V
     for out in outs {
         match out {
             Output::CacheOlder(target) => done.extend(older(session, cache, network, Command::Older { network: network.to_owned(), target })),
+            Output::CacheLatest(target) => done.extend(latest(session, cache, network, &target)),
             out => done.push(out),
         }
     }
@@ -498,7 +513,7 @@ async fn connect_once(
                         return Ok(End::Quit);
                     }
                     // Answered by `resolve`.
-                    Output::CacheOlder(_) => {}
+                    Output::CacheOlder(_) | Output::CacheLatest(_) => {}
                 }
             }
             keep(carry.cache.as_ref(), &mut session);
@@ -564,7 +579,7 @@ async fn connect_once(
 mod tests {
     use super::*;
     use crate::cache::{Above, Below, Cache, Entry};
-    use crate::session::tests::{asked, feed, historied, histories, now, sent, zncd};
+    use crate::session::tests::{asked, feed, historied, histories, irccloud, now, sent, zncd};
 
     fn line(id: &str, secs: i64) -> Line {
         Line {
@@ -614,6 +629,24 @@ mod tests {
         assert_eq!(book.newest("#a").and_then(|a| a.msgid.as_deref()), Some("a2"));
         assert_eq!(book.queries(), ["bob"]);
         assert_eq!(book.discovered(), None);
+    }
+
+    /// A bouncer joins us to channels the config doesn't name, so they
+    /// weren't seeded: the cache fills each as we join it, past its breaks
+    /// (there is no server history), then no more.
+    #[test]
+    fn a_channel_the_bouncer_joins_us_to_opens_on_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let chan = || Target::Channel("#test".into());
+        let cache = cache_with(&dir, vec![(chan(), vec![line("c1", 1)]), (chan(), vec![line("c2", 2)])]);
+        let mut s = irccloud(true).keeping();
+        let outs = feed(&mut s, ":alice!a@h JOIN #test");
+        assert_eq!(got(&served(&mut s, &cache, outs)), [(vec!["c1".to_owned(), "c2".to_owned()], false)]);
+        assert_eq!(s.book().oldest("#test").and_then(|a| a.msgid.as_deref()), Some("c1"));
+        // Joined again (a reconnect in the same run): the window has its lines.
+        feed(&mut s, ":alice!a@h PART #test");
+        let outs = feed(&mut s, ":alice!a@h JOIN #test");
+        assert!(histories(&served(&mut s, &cache, outs)).is_empty());
     }
 
     #[test]
