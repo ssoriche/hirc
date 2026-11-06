@@ -103,6 +103,9 @@ pub struct Buffer {
     pub target: Target,
     pub lines: Vec<Line>,
     pub topic: Option<String>,
+    /// For channels: who is in it, as the server last said
+    /// (`Event::Members`).
+    pub members: Vec<String>,
     /// For channels: are we in it right now.
     pub joined: bool,
     pub unread: usize,
@@ -132,6 +135,7 @@ impl Buffer {
             target,
             lines: Vec::new(),
             topic: None,
+            members: Vec::new(),
             joined: false,
             unread: 0,
             mentions: 0,
@@ -510,6 +514,12 @@ impl Store {
                 self.networks[n].buffers[b].topic = topic;
                 Applied::Changed
             }
+            Event::Members { network, channel, nicks } => {
+                let n = self.network_ix(&network);
+                let b = self.buffer_ix(n, &Target::Channel(channel));
+                self.networks[n].buffers[b].members = nicks;
+                Applied::Changed
+            }
             Event::Line { network, target, mut line } => {
                 let n = self.network_ix(&network);
                 let b = self.buffer_ix(n, &target);
@@ -693,6 +703,16 @@ mod tests {
         s.apply(Event::Line { network: "net".into(), target: Target::Query("bob".into()), line: line(4, 4, None, "psst") });
         let q = s.buffer_ix(0, &Target::Query("bob".into()));
         assert_eq!(s.networks[0].buffers[q].mentions, 1);
+    }
+
+    #[test]
+    fn members_are_kept_per_channel() {
+        let mut s = Store::new(["net".to_string()]);
+        s.apply(Event::Members { network: "net".into(), channel: "#a".into(), nicks: vec!["alice".into(), "bob".into()] });
+        let b = s.buffer_ix(0, &Target::Channel("#A".into()));
+        assert_eq!(s.networks[0].buffers[b].members, ["alice", "bob"]);
+        s.apply(Event::Members { network: "net".into(), channel: "#a".into(), nicks: vec![] });
+        assert!(s.networks[0].buffers[b].members.is_empty());
     }
 
     #[test]

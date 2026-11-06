@@ -88,6 +88,33 @@ fn carol(ergo: &Ergo) -> Config {
     config
 }
 
+/// The member list the UI is told follows NAMES, joins, nick changes and parts.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_follow_names_join_nick_and_part() {
+    let ergo = Ergo::start();
+    register_account(ergo.plain_port, "alice", "hunter22").await;
+    let mut bob = Raw::connect(ergo.plain_port, "bob").await;
+    bob.send("JOIN #test").await;
+    bob.expect("JOIN").await;
+    let (_tx, mut rx) = net(alice(&ergo, "printf hunter22"));
+    let members = |want: &'static [&'static str]| {
+        move |e: &Event| match e {
+            Event::Members { channel, nicks, .. } if channel.eq_ignore_ascii_case("#test") && nicks.iter().map(String::as_str).eq(want.iter().copied()) => {
+                Some(())
+            }
+            _ => None,
+        }
+    };
+    next_matching(&mut rx, members(&["alice", "bob"])).await;
+    let mut carol = Raw::connect(ergo.plain_port, "carol").await;
+    carol.send("JOIN #test").await;
+    next_matching(&mut rx, members(&["alice", "bob", "carol"])).await;
+    bob.send("NICK robert").await;
+    next_matching(&mut rx, members(&["alice", "carol", "robert"])).await;
+    carol.send("PART #test").await;
+    next_matching(&mut rx, members(&["alice", "robert"])).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn multiline_round_trip() {
     let ergo = Ergo::start();

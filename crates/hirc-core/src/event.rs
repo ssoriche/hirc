@@ -116,6 +116,14 @@ pub enum Event {
         channel: String,
         topic: Option<String>,
     },
+    /// Who is in `channel` now, every nick as the server spelled it,
+    /// sorted (ignoring case): sent whenever that changes. Empty once we
+    /// have left.
+    Members {
+        network: String,
+        channel: String,
+        nicks: Vec<String>,
+    },
     OwnNick {
         network: String,
         nick: String,

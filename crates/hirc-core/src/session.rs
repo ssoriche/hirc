@@ -14,7 +14,7 @@ use crate::proto::Message;
 use crate::store::{Delivery, Line, LineKind};
 use crate::{bridge, playback, sasl, services, split};
 use chrono::{DateTime, TimeDelta, Utc};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The read-marker cap.
 const READ_MARKER: &str = "draft/read-marker";
@@ -114,8 +114,13 @@ pub struct Session {
     reg: Reg,
     caps: Caps,
     isupport: Isupport,
-    /// Lowercased channel -> (channel as the server spelled it, lowercased nicks), to route QUIT and NICK.
-    members: HashMap<String, (String, HashSet<String>)>,
+    /// Lowercased channel -> (channel as the server spelled it, lowercased
+    /// nick -> nick as last spelled), to route QUIT and NICK and to tell
+    /// the UI who is there.
+    members: HashMap<String, (String, HashMap<String, String>)>,
+    /// Channels whose members changed while handling this line:
+    /// lowercased -> as the server spelled it.
+    members_changed: BTreeMap<String, String>,
     seq: u64,
     /// SASL finished (903/907) on this connection.
     authed: bool,
@@ -340,6 +345,7 @@ impl Session {
             caps: Caps::new(wanted),
             isupport: Isupport::default(),
             members: HashMap::new(),
+            members_changed: BTreeMap::new(),
             seq: 0,
             authed: false,
             closing: None,
@@ -496,6 +502,7 @@ impl Session {
         self.caps.reset();
         self.isupport = Isupport::default();
         self.members.clear();
+        self.members_changed.clear();
         self.nick = self.cfg.nickname.clone();
         self.alt = 0;
         self.authed = false;
@@ -568,10 +575,27 @@ impl Session {
             self.synced = true;
             self.sync(now, &mut out);
         }
+        self.members_out(&mut out);
         self.note(&out);
         // Never with `out` in the message: it can hold AUTHENTICATE.
         debug_assert!(safe_to_send(&out), "a made-up msgid was about to go to the server");
         out
+    }
+
+    /// Each channel whose members changed on this line, as one
+    /// `Event::Members` with them all (empty once we have left).
+    fn members_out(&mut self, out: &mut Vec<Output>) {
+        for (key, spelled) in std::mem::take(&mut self.members_changed) {
+            let (channel, nicks) = match self.members.get(&key) {
+                Some((chan, m)) => {
+                    let mut nicks: Vec<String> = m.values().cloned().collect();
+                    nicks.sort_by_key(|n| n.to_ascii_lowercase());
+                    (chan.clone(), nicks)
+                }
+                None => (spelled, Vec::new()),
+            };
+            out.push(Output::Event(Event::Members { network: self.network.clone(), channel, nicks }));
+        }
     }
 
     fn dispatch(&mut self, msg: Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
@@ -676,7 +700,13 @@ impl Session {
                     out.push(Output::Event(Event::ReadMarker { network: self.network.clone(), target: self.dest(target), time: history::parse_timestamp(at) }));
                 }
             }
-            "TAGMSG" | "366" => {}
+            // The end of NAMES: the list is whole, so it goes up.
+            "366" => {
+                if let Some(chan) = msg.params.get(1) {
+                    self.members_changed.insert(chan.to_ascii_lowercase(), chan.clone());
+                }
+            }
+            "TAGMSG" => {}
             c if c.len() == 3 && c.bytes().all(|b| b.is_ascii_digit()) => {
                 let text = msg.params.get(1..).unwrap_or_default().join(" ");
                 let line = self.line(&msg, now, LineKind::Server, None, text, false);
@@ -1670,19 +1700,21 @@ impl Session {
         out.push(self.stamped(msg, target, line));
     }
 
-    fn members_of(&mut self, chan: &str) -> &mut HashSet<String> {
-        &mut self.members.entry(chan.to_ascii_lowercase()).or_insert_with(|| (chan.to_owned(), HashSet::new())).1
+    fn members_of(&mut self, chan: &str) -> &mut HashMap<String, String> {
+        let key = chan.to_ascii_lowercase();
+        self.members_changed.entry(key.clone()).or_insert_with(|| chan.to_owned());
+        &mut self.members.entry(key).or_insert_with(|| (chan.to_owned(), HashMap::new())).1
     }
 
     fn on_join(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
         let (Some(nick), Some(chan)) = (msg.nick().map(str::to_owned), msg.params.first().cloned()) else { return };
         if self.is_me(&nick) {
-            self.members.insert(chan.to_ascii_lowercase(), (chan.clone(), HashSet::new()));
+            self.members.insert(chan.to_ascii_lowercase(), (chan.clone(), HashMap::new()));
             out.push(Output::Event(Event::Joined { network: self.network.clone(), channel: chan.clone() }));
         } else {
             out.push(self.seen(msg, &nick));
         }
-        self.members_of(&chan).insert(nick.to_ascii_lowercase());
+        self.members_of(&chan).insert(nick.to_ascii_lowercase(), nick.clone());
         let me = self.is_me(&nick);
         let line = self.line(msg, now, LineKind::Join, Some(&nick), join_text(&nick), me);
         out.push(self.stamped(msg, Target::Channel(chan.clone()), line));
@@ -1698,6 +1730,7 @@ impl Session {
     fn left(&mut self, chan: &str, nick: &str, out: &mut Vec<Output>) {
         if self.is_me(nick) {
             self.members.remove(&chan.to_ascii_lowercase());
+            self.members_changed.insert(chan.to_ascii_lowercase(), chan.to_owned());
             out.push(Output::Event(Event::Parted { network: self.network.clone(), channel: chan.to_owned() }));
         } else {
             self.members_of(chan).remove(&nick.to_ascii_lowercase());
@@ -1727,7 +1760,7 @@ impl Session {
     /// Channels `nick` is in, spelled as the server first gave them.
     fn channels_with(&self, nick: &str) -> Vec<String> {
         let key = nick.to_ascii_lowercase();
-        let mut chans: Vec<String> = self.members.values().filter(|(_, m)| m.contains(&key)).map(|(c, _)| c.clone()).collect();
+        let mut chans: Vec<String> = self.members.values().filter(|(_, m)| m.contains_key(&key)).map(|(c, _)| c.clone()).collect();
         chans.sort();
         chans
     }
@@ -1758,7 +1791,7 @@ impl Session {
         for chan in self.channels_with(&old) {
             let m = self.members_of(&chan);
             m.remove(&old.to_ascii_lowercase());
-            m.insert(new.to_ascii_lowercase());
+            m.insert(new.to_ascii_lowercase(), new.clone());
             let line = self.line(msg, now, LineKind::Nick, Some(&old), nick_text(&old, &new), own);
             out.push(self.stamped(msg, Target::Channel(chan), line));
         }
@@ -1780,7 +1813,9 @@ impl Session {
             out.push(self.peer(nick, PeerChange::Seen { host: None }));
         }
         let chan = chan.clone();
-        self.members_of(&chan).extend(nicks.iter().map(|n| n.to_ascii_lowercase()));
+        // Not through `members_of`: the list is only sent at its end (366).
+        let m = &mut self.members.entry(chan.to_ascii_lowercase()).or_insert_with(|| (chan.clone(), HashMap::new())).1;
+        m.extend(nicks.iter().map(|n| (n.to_ascii_lowercase(), n.clone())));
     }
 
     fn on_mode(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
@@ -3439,6 +3474,34 @@ pub(crate) mod tests {
         assert!(lines(&feed(&mut s, ":carol!c@h QUIT :gone")).is_empty(), "carol was renamed");
         let out = feed(&mut s, ":alice!a@h PART #test :later");
         assert!(out.contains(&Output::Event(Event::Parted { network: "net".into(), channel: "#test".into() })));
+    }
+
+    fn members_said(out: &[Output]) -> Vec<(String, Vec<String>)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Event(Event::Members { channel, nicks, .. }) => Some((channel.clone(), nicks.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn members_go_up_when_they_change() {
+        let mut s = registered(ECHO);
+        feed(&mut s, ":alice!a@h JOIN #test");
+        // NAMES in two parts: one list, at its end.
+        assert!(members_said(&feed(&mut s, ":srv 353 alice = #test :alice @Bob")).is_empty());
+        assert!(members_said(&feed(&mut s, ":srv 353 alice = #test :+carol")).is_empty());
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(members_said(&feed(&mut s, ":srv 366 alice #test :End")), [("#test".to_owned(), names(&["alice", "Bob", "carol"]))]);
+        assert_eq!(members_said(&feed(&mut s, ":dave!d@h JOIN #test")), [("#test".to_owned(), names(&["alice", "Bob", "carol", "dave"]))]);
+        assert_eq!(members_said(&feed(&mut s, ":Bob!b@h NICK :Robert")), [("#test".to_owned(), names(&["alice", "carol", "dave", "Robert"]))]);
+        assert_eq!(members_said(&feed(&mut s, ":carol!c@h PART #test")), [("#test".to_owned(), names(&["alice", "dave", "Robert"]))]);
+        assert_eq!(members_said(&feed(&mut s, ":srv KICK #test dave :bye")), [("#test".to_owned(), names(&["alice", "Robert"]))]);
+        assert_eq!(members_said(&feed(&mut s, ":Robert!b@h QUIT :gone")), [("#test".to_owned(), names(&["alice"]))]);
+        // Nothing changed: nothing said.
+        assert!(members_said(&feed(&mut s, ":zed!z@h QUIT :not here")).is_empty());
+        assert_eq!(members_said(&feed(&mut s, ":alice!a@h PART #test")), [("#test".to_owned(), vec![])]);
     }
 
     #[test]
