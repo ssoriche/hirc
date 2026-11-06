@@ -1,0 +1,20 @@
+# Invented content for snapshot runs (see src/snapshot.rs), to check that
+# shortcodes show as emoji and that emoji wrap. No real nicks, servers or
+# channels belong here.
+base_time = "2026-01-01T12:00:00Z"
+
+[[server]]
+name = "demo"
+nick = "alice"
+echo_message = true
+lines = [
+  ":srv 001 alice :Welcome to the Demo network",
+  ":srv 005 alice CHANTYPES=# PREFIX=(ov)@+ NETWORK=Demo :are supported by this server",
+  ":alice!a@h JOIN #emoji",
+  ":srv 353 alice = #emoji :alice bob carol alistair alina",
+  ":srv 366 alice #emoji :End of /NAMES list.",
+  ":bob!b@h PRIVMSG #emoji :shipped it :tada: :rocket:",
+  ":carol!c@h PRIVMSG #emoji :nice :+1::skin-tone-4: and 👋 typed as unicode",
+  ":alistair!x@h PRIVMSG #emoji :wrapping test 🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉 end",
+  ":bob!b@h PRIVMSG #emoji :std::vec::Vec and 10:30:45 stay as typed",
+]

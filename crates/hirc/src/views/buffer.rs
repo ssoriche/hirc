@@ -341,8 +341,10 @@ impl Runs {
     }
 
     /// What someone wrote, in `color`, its links (see `links`) in `link`
-    /// and underlined.
+    /// and underlined. Shortcodes show as their emoji (`emoji::render`).
     fn push_text(&mut self, s: &str, color: Hsla, link: Hsla) -> &mut Runs {
+        let rendered = hirc_core::emoji::render(s);
+        let s = rendered.as_ref();
         let mut at = 0;
         for l in links::find(s) {
             if l.range.start > at {
