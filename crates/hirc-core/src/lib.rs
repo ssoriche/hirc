@@ -10,6 +10,7 @@ pub mod command;
 pub mod config;
 pub mod conn;
 pub mod display;
+pub mod emoji;
 pub mod event;
 pub mod history;
 pub mod irccloud;
