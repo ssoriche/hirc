@@ -702,8 +702,10 @@ impl Session {
             }
             // The end of NAMES: the list is whole, so it goes up.
             "366" => {
-                if let Some(chan) = msg.params.get(1) {
-                    self.members_changed.insert(chan.to_ascii_lowercase(), chan.clone());
+                if let Some(chan) = msg.params.get(1)
+                    && let Some((spelled, _)) = self.members.get(&chan.to_ascii_lowercase())
+                {
+                    self.members_changed.insert(chan.to_ascii_lowercase(), spelled.clone());
                 }
             }
             "TAGMSG" => {}
@@ -1700,10 +1702,22 @@ impl Session {
         out.push(self.stamped(msg, target, line));
     }
 
-    fn members_of(&mut self, chan: &str) -> &mut HashMap<String, String> {
+    /// Adds `nick` to a channel we are in, noting the change if there is one.
+    fn add_member(&mut self, chan: &str, nick: &str) {
         let key = chan.to_ascii_lowercase();
-        self.members_changed.entry(key.clone()).or_insert_with(|| chan.to_owned());
-        &mut self.members.entry(key).or_insert_with(|| (chan.to_owned(), HashMap::new())).1
+        let Some((spelled, m)) = self.members.get_mut(&key) else { return };
+        if m.insert(nick.to_ascii_lowercase(), nick.to_owned()).as_deref() != Some(nick) {
+            self.members_changed.insert(key, spelled.clone());
+        }
+    }
+
+    /// Drops `nick` from a channel we are in, noting the change if there is one.
+    fn drop_member(&mut self, chan: &str, nick: &str) {
+        let key = chan.to_ascii_lowercase();
+        let Some((spelled, m)) = self.members.get_mut(&key) else { return };
+        if m.remove(&nick.to_ascii_lowercase()).is_some() {
+            self.members_changed.insert(key, spelled.clone());
+        }
     }
 
     fn on_join(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
@@ -1714,7 +1728,7 @@ impl Session {
         } else {
             out.push(self.seen(msg, &nick));
         }
-        self.members_of(&chan).insert(nick.to_ascii_lowercase(), nick.clone());
+        self.add_member(&chan, &nick);
         let me = self.is_me(&nick);
         let line = self.line(msg, now, LineKind::Join, Some(&nick), join_text(&nick), me);
         out.push(self.stamped(msg, Target::Channel(chan.clone()), line));
@@ -1733,7 +1747,7 @@ impl Session {
             self.members_changed.insert(chan.to_ascii_lowercase(), chan.to_owned());
             out.push(Output::Event(Event::Parted { network: self.network.clone(), channel: chan.to_owned() }));
         } else {
-            self.members_of(chan).remove(&nick.to_ascii_lowercase());
+            self.drop_member(chan, nick);
         }
     }
 
@@ -1773,7 +1787,7 @@ impl Session {
             out.push(self.peer(&nick, PeerChange::Quit(reason)));
         }
         for chan in self.channels_with(&nick) {
-            self.members_of(&chan).remove(&nick.to_ascii_lowercase());
+            self.drop_member(&chan, &nick);
             let line = self.line(msg, now, LineKind::Quit, Some(&nick), text.clone(), false);
             out.push(self.stamped(msg, Target::Channel(chan), line));
         }
@@ -1789,9 +1803,8 @@ impl Session {
             out.push(self.peer(&old, PeerChange::Renamed(new.clone())));
         }
         for chan in self.channels_with(&old) {
-            let m = self.members_of(&chan);
-            m.remove(&old.to_ascii_lowercase());
-            m.insert(new.to_ascii_lowercase(), new.clone());
+            self.drop_member(&chan, &old);
+            self.add_member(&chan, &new);
             let line = self.line(msg, now, LineKind::Nick, Some(&old), nick_text(&old, &new), own);
             out.push(self.stamped(msg, Target::Channel(chan), line));
         }
@@ -1813,9 +1826,11 @@ impl Session {
             out.push(self.peer(nick, PeerChange::Seen { host: None }));
         }
         let chan = chan.clone();
-        // Not through `members_of`: the list is only sent at its end (366).
-        let m = &mut self.members.entry(chan.to_ascii_lowercase()).or_insert_with(|| (chan.clone(), HashMap::new())).1;
-        m.extend(nicks.iter().map(|n| (n.to_ascii_lowercase(), n.clone())));
+        // Only for a channel we are in, and not through `add_member`: the
+        // list is only sent at its end (366).
+        if let Some((_, m)) = self.members.get_mut(&chan.to_ascii_lowercase()) {
+            m.extend(nicks.iter().map(|n| (n.to_ascii_lowercase(), n.clone())));
+        }
     }
 
     fn on_mode(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
@@ -3502,6 +3517,27 @@ pub(crate) mod tests {
         // Nothing changed: nothing said.
         assert!(members_said(&feed(&mut s, ":zed!z@h QUIT :not here")).is_empty());
         assert_eq!(members_said(&feed(&mut s, ":alice!a@h PART #test")), [("#test".to_owned(), vec![])]);
+    }
+
+    #[test]
+    fn members_are_only_told_for_channels_we_are_in() {
+        let mut s = registered(ECHO);
+        feed(&mut s, ":alice!a@h JOIN #test");
+        feed(&mut s, ":srv 353 alice = #test :alice bob");
+        feed(&mut s, ":srv 366 alice #test :End");
+        // NAMES for a channel we never joined.
+        assert!(members_said(&feed(&mut s, ":srv 353 alice = #other :x y")).is_empty());
+        assert!(members_said(&feed(&mut s, ":srv 366 alice #other :End")).is_empty());
+        // A bare 366.
+        assert!(members_said(&feed(&mut s, ":srv 366 alice #nowhere :End")).is_empty());
+        // A part by someone who is not in the channel.
+        assert!(members_said(&feed(&mut s, ":zed!z@h PART #test")).is_empty());
+        // A part in a channel we are not in.
+        assert!(members_said(&feed(&mut s, ":zed!z@h PART #other")).is_empty());
+        assert!(!s.members.contains_key("#other"));
+        // A join there is no news either.
+        assert!(members_said(&feed(&mut s, ":zed!z@h JOIN #other")).is_empty());
+        assert!(!s.members.contains_key("#other"));
     }
 
     #[test]
