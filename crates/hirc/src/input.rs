@@ -290,6 +290,9 @@ impl TextInput {
         self.scroll_row = 0;
         self.is_selecting = false;
         self.note = None;
+        self.cycle = None;
+        self.popup = None;
+        self.dismissed = None;
     }
 
     /// The rows the text shows as, `width` wide, when it needs more than
@@ -1092,6 +1095,7 @@ impl TextInput {
         // With the popup open, Tab and the arrows choose and Esc closes it.
         if self.popup.is_some() {
             let step = match (ks.key.as_str(), ks.modifiers.control) {
+                ("tab", false) if ks.modifiers.shift => Some(-1),
                 ("tab", false) | ("down", false) | ("n", true) => Some(1),
                 ("up", false) | ("p", true) => Some(-1),
                 _ => None,

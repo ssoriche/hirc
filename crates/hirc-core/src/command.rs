@@ -46,7 +46,7 @@ pub enum Verb {
 /// The `/verb` a line starts with, and what it is (`Verb`). `None` for
 /// chat, `//` (a literal slash) included.
 pub fn verb(input: &str) -> Option<(&str, Verb)> {
-    let rest = input.strip_prefix('/').filter(|r| !r.starts_with('/'))?;
+    let rest = after_slash(input)?;
     let (cmd, ended) = rest.split_once(' ').map_or((rest, false), |(c, _)| (c, true));
     if cmd.is_empty() {
         return None;
@@ -66,13 +66,20 @@ fn is_channel(s: &str) -> bool {
     s.starts_with(['#', '&'])
 }
 
+/// What follows the slash of a command line: `None` for chat, `//` (a
+/// literal slash) included. The line is not trimmed at the front, so
+/// ` /raw` is chat, as `parse` reads it.
+pub fn after_slash(input: &str) -> Option<&str> {
+    input.strip_prefix('/').filter(|r| !r.starts_with('/'))
+}
+
 /// `target` is the current buffer's channel or nick (`None` in the server
 /// buffer). Errors are short sentences to show the user.
 pub fn parse(input: &str, network: &str, target: Option<&str>) -> Result<Input, String> {
     let net = network.to_owned();
     let here = || target.map(str::to_owned).ok_or_else(|| "This buffer has no channel or nick. Use /msg or /join.".to_owned());
     let input = input.trim_end();
-    let Some(rest) = input.strip_prefix('/').filter(|r| !r.starts_with('/')) else {
+    let Some(rest) = after_slash(input) else {
         let text = input.strip_prefix('/').unwrap_or(input).to_owned();
         return Ok(Input::Send(Command::Say { network: net, target: here()?, text }));
     };

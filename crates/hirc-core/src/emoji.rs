@@ -85,14 +85,20 @@ fn toned(emoji: &str, tone: char) -> String {
 }
 
 /// The `:name:` starting at byte `at` of `text` (which is a `:`): its
-/// name and where it ends, past the closing colon.
-fn code_at(text: &str, at: usize) -> Option<(&str, usize)> {
+/// name and where it ends, past the closing colon. A code opens at the
+/// start of the text, after a character that is neither a letter, a digit
+/// nor a colon, or at `glued` (where the code before it ended); a letter
+/// or digit after the closing colon spoils it. So `2001:db8:a:b::1` and
+/// `foo:x:bar` are not codes.
+fn code_at(text: &str, at: usize, glued: Option<usize>) -> Option<(&str, usize)> {
     if !text.get(at..)?.starts_with(':') {
         return None;
     }
+    let opens = glued == Some(at) || text[..at].chars().next_back().is_none_or(|c| !c.is_alphanumeric() && c != ':');
     let body = &text[at + 1..];
     let len = body.find(|c: char| !is_name_char(c))?;
-    (len > 0 && body[len..].starts_with(':')).then(|| (&body[..len], at + 1 + len + 1))
+    let end = at + 1 + len + 1;
+    (opens && len > 0 && body[len..].starts_with(':') && !text[end..].chars().next().is_some_and(char::is_alphanumeric)).then(|| (&body[..len], end))
 }
 
 /// Every known `:name:` (with a `:skin-tone-N:` after it, for an emoji
@@ -103,22 +109,28 @@ pub fn render(text: &str) -> Cow<'_, str> {
     }
     let mut out = String::with_capacity(text.len());
     let (mut i, mut copied, mut changed) = (0, 0, false);
+    // Where the last code (known or not) ended.
+    let mut prev_end = None;
     while let Some(off) = text[i..].find(':') {
         let at = i + off;
-        match code_at(text, at).and_then(|(name, end)| entry(name).map(|e| (e, end))) {
+        let code = code_at(text, at, prev_end);
+        if let Some((_, end)) = code {
+            prev_end = Some(end);
+        }
+        match code.and_then(|(name, end)| entry(name).map(|e| (e, end))) {
             Some((e, end)) => {
                 out.push_str(&text[copied..at]);
-                let tone =
-                    code_at(text, end).filter(|_| e.skin).and_then(|(n, end)| TONES.iter().find(|(t, _)| n.eq_ignore_ascii_case(t)).map(|(_, c)| (*c, end)));
+                let tone = code_at(text, end, prev_end)
+                    .filter(|_| e.skin)
+                    .and_then(|(n, end)| TONES.iter().find(|(t, _)| n.eq_ignore_ascii_case(t)).map(|(_, c)| (*c, end)));
+                i = end;
                 match tone {
-                    Some((c, end)) => {
+                    Some((c, tone_end)) => {
                         out.push_str(&toned(e.emoji, c));
-                        i = end;
+                        i = tone_end;
+                        prev_end = Some(tone_end);
                     }
-                    None => {
-                        out.push_str(e.emoji);
-                        i = end;
-                    }
+                    None => out.push_str(e.emoji),
                 }
                 copied = i;
                 changed = true;
@@ -179,6 +191,18 @@ mod tests {
             assert_eq!(expand(s), s, "{s:?}");
         }
         assert_eq!(expand(":nope::tada:"), ":nope:🎉");
+    }
+
+    #[test]
+    fn codes_inside_words_stay_as_typed() {
+        for s in ["2001:db8:a:b::1", "foo:x:bar", "a:ok:b", "hi:tada:", "self::a::b", "https://h/p:ok:1", ":wave:é"] {
+            assert_eq!(expand(s), s, "{s:?}");
+        }
+        assert_eq!(expand(":+1::tada:"), "👍🎉");
+        assert_eq!(expand(":nope::tada:"), ":nope:🎉");
+        assert_eq!(expand("(:tada:)"), "(🎉)");
+        assert_eq!(expand(":tada:!"), "🎉!");
+        assert_eq!(expand(":point_up::skin-tone-3:"), "\u{261D}\u{1F3FC}");
     }
 
     #[test]

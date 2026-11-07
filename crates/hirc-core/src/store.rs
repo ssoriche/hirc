@@ -458,6 +458,7 @@ impl Store {
                     net.multiline = None;
                     for b in &mut net.buffers {
                         b.joined = false;
+                        b.members.clear();
                         // A request that was out is gone with the socket,
                         // and the next server will say its marker again.
                         b.read_synced = false;
@@ -752,6 +753,16 @@ mod tests {
         assert!(s.networks[0].buffers[1].joined);
         s.apply(Event::Status { network: "net".into(), status: ConnStatus::Disconnected { reason: "x".into(), retry: std::time::Duration::from_secs(2) } });
         assert!(!s.networks[0].buffers[1].joined);
+    }
+
+    #[test]
+    fn disconnect_clears_members() {
+        let mut s = Store::new(["net".to_string()]);
+        s.apply(Event::Joined { network: "net".into(), channel: "#a".into() });
+        s.apply(Event::Members { network: "net".into(), channel: "#a".into(), nicks: vec!["alice".into()] });
+        assert_eq!(s.networks[0].buffers[1].members, ["alice"]);
+        s.apply(Event::Status { network: "net".into(), status: ConnStatus::Disconnected { reason: "x".into(), retry: std::time::Duration::from_secs(2) } });
+        assert!(s.networks[0].buffers[1].members.is_empty());
     }
 
     #[test]

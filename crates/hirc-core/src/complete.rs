@@ -6,6 +6,7 @@ use crate::command::COMMANDS;
 use crate::emoji;
 use crate::event::Target;
 use crate::store::{Buffer, LineKind};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 /// The emoji popup shows at most this many rows.
@@ -41,7 +42,7 @@ pub fn tab(text: &str, cursor: usize, nicks: &[String], cycle: Option<&Cycle>) -
     let word = &text[start..cursor];
     let matches: Vec<String> = if start == 0 && word.starts_with('/') && word.len() > 1 {
         let q = word[1..].to_ascii_lowercase();
-        let mut cmds: Vec<&str> = COMMANDS.iter().copied().filter(|c| c.starts_with(q.as_str())).collect();
+        let mut cmds: Vec<&str> = COMMANDS.iter().copied().filter(|c| c.starts_with(q.as_str()) && *c != q).collect();
         cmds.sort_unstable();
         cmds.into_iter().map(|c| format!("/{c} ")).collect()
     } else if !word.is_empty() {
@@ -66,27 +67,39 @@ fn put(text: &str, start: usize, end: usize, mut cycle: Cycle) -> (String, usize
     (out, cursor, cycle)
 }
 
+/// Tab looks back no further than this many lines for who spoke last.
+const RECENT_LINES: usize = 2000;
+
 /// Who Tab offers in `buf`: in a channel, its members, those who spoke
-/// last first (newest first), then the rest by name; never `me`. In a
-/// query, the other person.
+/// last first (newest first, among the newest `RECENT_LINES` lines), then
+/// the rest by name; never `me`. In a query, the other person.
 pub fn nicks(buf: &Buffer, me: Option<&str>) -> Vec<String> {
     let not_me = |n: &str| me.is_none_or(|m| !m.eq_ignore_ascii_case(n));
     match &buf.target {
         Target::Query(n) => vec![n.clone()],
         Target::Server => Vec::new(),
         Target::Channel(_) => {
+            let members: HashMap<String, &String> = buf.members.iter().filter(|m| not_me(m)).map(|m| (m.to_ascii_lowercase(), m)).collect();
+            let mut placed: HashSet<&str> = HashSet::new();
             let mut out: Vec<String> = Vec::new();
-            let spoke =
-                buf.lines.iter().rev().filter(|l| matches!(l.kind, LineKind::Privmsg | LineKind::Notice | LineKind::Action)).filter_map(|l| l.nick.as_deref());
+            let spoke = buf
+                .lines
+                .iter()
+                .rev()
+                .take(RECENT_LINES)
+                .filter(|l| matches!(l.kind, LineKind::Privmsg | LineKind::Notice | LineKind::Action))
+                .filter_map(|l| l.nick.as_deref());
             for nick in spoke {
-                if let Some(m) = buf.members.iter().find(|m| m.eq_ignore_ascii_case(nick))
-                    && not_me(m)
-                    && !out.iter().any(|o| o.eq_ignore_ascii_case(m))
+                if placed.len() == members.len() {
+                    break;
+                }
+                if let Some(m) = members.get(&nick.to_ascii_lowercase())
+                    && placed.insert(m.as_str())
                 {
-                    out.push(m.clone());
+                    out.push((*m).clone());
                 }
             }
-            let mut rest: Vec<String> = buf.members.iter().filter(|m| not_me(m) && !out.iter().any(|o| o.eq_ignore_ascii_case(m))).cloned().collect();
+            let mut rest: Vec<String> = members.values().filter(|m| !placed.contains(m.as_str())).map(|m| (*m).clone()).collect();
             rest.sort_by_key(|m| m.to_ascii_lowercase());
             out.extend(rest);
             out
@@ -233,6 +246,27 @@ mod tests {
         assert_eq!(nicks(&b, Some("alice")), ["Bob", "carol", "dave", "erin"]);
         let q = Buffer::new(Target::Query("Zed".into()));
         assert_eq!(nicks(&q, Some("alice")), ["Zed"]);
+    }
+
+    #[test]
+    fn a_speaker_older_than_the_scan_cap_sorts_with_the_rest() {
+        let mut b = Buffer::new(Target::Channel("#a".into()));
+        b.members = names(&["alice", "bob", "carol", "zed"]);
+        let mut lines = vec![said("zed", LineKind::Privmsg)];
+        lines.extend((0..RECENT_LINES).map(|_| said("carol", LineKind::Privmsg)));
+        b.lines = lines;
+        // zed spoke before the newest RECENT_LINES lines: alphabetical.
+        assert_eq!(nicks(&b, Some("alice")), ["carol", "bob", "zed"]);
+    }
+
+    #[test]
+    fn a_command_is_never_offered_as_itself() {
+        assert_eq!(tabs("/j", &[], 1), ["/join "]);
+        let got = tabs("/q", &[], 4);
+        assert_eq!(got[0], "/query ");
+        assert_eq!(got[1], "/quit ");
+        assert_eq!(got[2], "/quote ");
+        assert_eq!(got[3], "/query ");
     }
 
     #[test]

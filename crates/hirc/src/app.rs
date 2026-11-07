@@ -1142,8 +1142,8 @@ fn confirm(lines: usize, messages: usize, batches: bool) -> Option<String> {
 /// What goes out for `text`: shortcodes as their emoji, except in a raw
 /// line, which goes as written.
 fn outgoing(text: &str) -> String {
-    let word = text.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-    if matches!(word.as_str(), "/raw" | "/quote") { text.to_owned() } else { hirc_core::emoji::expand(text) }
+    let word = command::after_slash(text).map(|r| r.split(' ').next().unwrap_or("").to_ascii_lowercase());
+    if matches!(word.as_deref(), Some("raw" | "quote")) { text.to_owned() } else { hirc_core::emoji::expand(text) }
 }
 
 /// Whether to ask for older lines of `buf` now: `up` (its top is on
@@ -1800,5 +1800,9 @@ mod tests {
         assert_eq!(outgoing("/me waves :wave:"), "/me waves 👋");
         assert_eq!(outgoing("/RAW PRIVMSG #a ::tada:"), "/RAW PRIVMSG #a ::tada:");
         assert_eq!(outgoing("/quote X :tada:"), "/quote X :tada:");
+        // Raw exactly where the parser reads a raw command.
+        assert_eq!(outgoing("  /raw X :tada:"), "  /raw X 🎉");
+        assert_eq!(outgoing("//raw :tada:"), "//raw 🎉");
+        assert_eq!(outgoing("/raw\tX :tada:"), "/raw\tX 🎉");
     }
 }
