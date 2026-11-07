@@ -55,6 +55,12 @@ The input line is vim-style and starts in Insert mode.
   slash command `/cmd`. `Esc` on the ex line abandons it and restores the
   unsent draft; ex commands also keep the draft.
 
+## Emoji and completion
+
+- `:tada:` and the rest of Slack's shortcodes go out as the emoji itself (🎉), skin tones too (`:wave::skin-tone-3:`). Shortcodes in what others send show as emoji. `/raw` lines go as written.
+- In Insert mode, `:` and two letters at the start of a word open an emoji list above the input. `Tab`, `Down` or `ctrl-n` moves down, `Up` or `ctrl-p` up; `Enter` puts the emoji in. `Esc` closes the list (a second `Esc` is Normal mode).
+- `Tab` completes nicks, irssi style: whoever spoke last first, then everyone else by name. Each further `Tab` gives the next match. At the start of the line it adds `: `. At the start of a `/` line it completes commands.
+
 ## Commands
 
 | Command | Effect |

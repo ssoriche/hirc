@@ -724,6 +724,7 @@ impl HircApp {
         if text.trim().is_empty() {
             return;
         }
+        let text = outgoing(&text);
         let Some((n, b)) = self.selected else { return };
         let net = &self.store.networks[n];
         let target = net.buffers[b].target.name().map(str::to_owned);
@@ -1136,6 +1137,13 @@ const PLAIN_LINES: usize = 5;
 fn confirm(lines: usize, messages: usize, batches: bool) -> Option<String> {
     let ask = if batches { messages > 1 } else { lines > PLAIN_LINES };
     ask.then(|| format!("{lines} lines will be sent as {messages} messages — Enter to send, Esc to cancel"))
+}
+
+/// What goes out for `text`: shortcodes as their emoji, except in a raw
+/// line, which goes as written.
+fn outgoing(text: &str) -> String {
+    let word = text.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    if matches!(word.as_str(), "/raw" | "/quote") { text.to_owned() } else { hirc_core::emoji::expand(text) }
 }
 
 /// Whether to ask for older lines of `buf` now: `up` (its top is on
@@ -1784,5 +1792,13 @@ mod tests {
         // With them, only more than one batch asks.
         assert_eq!(confirm(24, 1, true), None);
         assert_eq!(confirm(30, 2, true).as_deref(), Some("30 lines will be sent as 2 messages — Enter to send, Esc to cancel"));
+    }
+
+    #[test]
+    fn shortcodes_go_out_as_emoji_but_raw_lines_as_written() {
+        assert_eq!(outgoing("ship it :tada:"), "ship it 🎉");
+        assert_eq!(outgoing("/me waves :wave:"), "/me waves 👋");
+        assert_eq!(outgoing("/RAW PRIVMSG #a ::tada:"), "/RAW PRIVMSG #a ::tada:");
+        assert_eq!(outgoing("/quote X :tada:"), "/quote X :tada:");
     }
 }
