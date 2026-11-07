@@ -246,6 +246,7 @@ mod tests {
             delivery: Delivery::Sent,
             boundary: false,
             replayed: false,
+            via: None,
         }
     }
 

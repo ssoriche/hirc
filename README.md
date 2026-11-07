@@ -60,6 +60,7 @@ The input line is vim-style and starts in Insert mode.
 - `:tada:` and the rest of Slack's shortcodes go out as the emoji itself (🎉), skin tones too (`:wave::skin-tone-3:`). Shortcodes in what others send show as emoji. `/raw` lines go as written.
 - In Insert mode, `:` and two letters at the start of a word open an emoji list above the input. `Tab`, `Down` or `ctrl-n` moves down, `Up` or `ctrl-p` up; `Enter` puts the emoji in. `Esc` closes the list (a second `Esc` is Normal mode).
 - `Tab` completes nicks, irssi style: whoever spoke last first, then everyone else by name. Each further `Tab` gives the next match. At the start of the line it adds `: `. At the start of a `/` line it completes commands.
+- People a bridge relays (the server's `bridges`, a Discord bot say) complete like everyone else once they've said something in the window; the bridge itself doesn't.
 
 ## Commands
 

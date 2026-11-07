@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex, mpsc};
 pub const FILE: &str = "history.db";
 
 /// The schema's version, kept in `PRAGMA user_version`. A file with another
-/// version is not ours to read, so it is moved aside. Version 1 (no `brk`)
-/// is brought up to date in place.
-const VERSION: i64 = 2;
+/// version is not ours to read, so it is moved aside. Versions 1 (no `brk`)
+/// and 2 (no `via`) are brought up to date in place.
+const VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS lines (
@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS lines (
     -- Not known to follow on from the next older line held for the target:
     -- lines between them may be missing, so paging stops here.
     brk     INTEGER NOT NULL DEFAULT 0,
+    -- The bridge that relayed the line, when one did.
+    via     TEXT,
     PRIMARY KEY (network, target, msgid)
 );
 CREATE INDEX IF NOT EXISTS lines_by_time ON lines (network, target, time);
@@ -203,25 +205,29 @@ impl Cache {
         // A file that isn't a database fails on its first statement.
         db.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 0 && version != 1 && version != VERSION {
+        if !(0..=VERSION).contains(&version) {
             return Err(CacheError::Version(version));
         }
         if version == 1 {
             // Every line already held stays as it was: following on.
             // Version 1 kept no breaks, and could have holes: what is held
             // is taken as following on, but not what came before it.
-            db.execute_batch(&format!(
+            db.execute_batch(
                 "BEGIN;
                  ALTER TABLE lines ADD COLUMN brk INTEGER NOT NULL DEFAULT 0;
                  UPDATE lines SET brk = 1 WHERE rowid IN (
                      SELECT (SELECT i.rowid FROM lines i WHERE i.network = o.network AND i.target = o.target ORDER BY i.time, i.rowid LIMIT 1)
                      FROM lines o GROUP BY o.network, o.target);
-                 PRAGMA user_version = {VERSION};
-                 COMMIT;"
-            ))?;
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+        }
+        if (1..=2).contains(&version) {
+            // Lines held from before kept no bridge: they read as said on IRC.
+            db.execute_batch(&format!("BEGIN; ALTER TABLE lines ADD COLUMN via TEXT; PRAGMA user_version = {VERSION}; COMMIT;"))?;
         }
         db.execute_batch(SCHEMA)?;
-        db.query_row("SELECT count(brk) FROM lines", [], |_| Ok(()))?;
+        db.query_row("SELECT count(brk), count(via) FROM lines", [], |_| Ok(()))?;
         if version == 0 {
             db.execute_batch(&format!("PRAGMA user_version = {VERSION}"))?;
         }
@@ -287,7 +293,7 @@ impl Cache {
 
     fn query(&self, network: &str, target: &str, time: i64, rowid: i64, limit: usize, reach: Reach) -> Result<Older, CacheError> {
         let mut st = self.db.prepare_cached(
-            "SELECT msgid, time, kind, nick, text, own, brk FROM lines WHERE network = ?1 AND target = ?2 AND (time < ?3 OR (time = ?3 AND rowid < ?4)) ORDER BY time DESC, rowid DESC LIMIT ?5",
+            "SELECT msgid, time, kind, nick, text, own, brk, via FROM lines WHERE network = ?1 AND target = ?2 AND (time < ?3 OR (time = ?3 AND rowid < ?4)) ORDER BY time DESC, rowid DESC LIMIT ?5",
         )?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut rows = st.query(params![network, target, time, rowid, limit])?;
@@ -295,9 +301,22 @@ impl Cache {
         while let Some(r) = rows.next()? {
             let (msgid, ms, kind) = (r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?);
             let (nick, text, own, brk) = (r.get::<_, Option<String>>(3)?, r.get::<_, String>(4)?, r.get::<_, bool>(5)?, r.get::<_, bool>(6)?);
+            let via = r.get::<_, Option<String>>(7)?;
             // A row this hirc can't read (a later version's kind) is skipped.
             if let (Some(time), Some(kind)) = (DateTime::from_timestamp_millis(ms), kind_of(&kind)) {
-                out.lines.push(Line { seq: 0, time, msgid: Some(msgid), kind, nick, text, own, delivery: Delivery::Sent, boundary: false, replayed: true });
+                out.lines.push(Line {
+                    seq: 0,
+                    time,
+                    msgid: Some(msgid),
+                    kind,
+                    nick,
+                    text,
+                    own,
+                    delivery: Delivery::Sent,
+                    boundary: false,
+                    replayed: true,
+                    via,
+                });
             }
             if brk && reach == Reach::ToBreak {
                 out.broke = true;
@@ -357,8 +376,8 @@ fn put_run(db: &Connection, e: &Entry) -> Result<usize, CacheError> {
     lines.sort_by_key(|l| l.time);
     let (Some(oldest), Some(newest)) = (lines.first().and_then(|l| l.msgid.clone()), lines.last().and_then(|l| l.msgid.clone())) else { return Ok(0) };
     let mut insert = db.prepare_cached(
-        "INSERT OR IGNORE INTO lines (network, target, name, query, msgid, time, kind, nick, text, own, brk, rowid)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT OR IGNORE INTO lines (network, target, name, query, msgid, time, kind, nick, text, own, brk, rowid, via)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
     )?;
     // Lines tied in time are ordered by rowid. A run from before what is
     // held is stored after it, so it takes rowids below every row's (in
@@ -387,7 +406,7 @@ fn put_run(db: &Connection, e: &Entry) -> Result<usize, CacheError> {
             continue;
         }
         let rowid = below.map(|b| b + i64::try_from(i).unwrap_or(0));
-        let row = params![e.network, target, name, query, l.msgid, ms, kind_name(l.kind), l.nick, l.text, l.own, i == 0 || skipped, rowid];
+        let row = params![e.network, target, name, query, l.msgid, ms, kind_name(l.kind), l.nick, l.text, l.own, i == 0 || skipped, rowid, l.via];
         let new = insert.execute(row)? == 1;
         if !new && i > 0 && !skipped {
             heal.execute(params![e.network, target, l.msgid])?;
@@ -662,6 +681,7 @@ mod tests {
             delivery: Delivery::Sent,
             boundary: false,
             replayed: false,
+            via: None,
         }
     }
 
@@ -990,6 +1010,38 @@ mod tests {
         drop(c);
         // And opens again as version 2.
         assert_eq!(Cache::open(&path).unwrap().latest("net", "#a", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn version_2_gains_bridges_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE lines (network TEXT NOT NULL, target TEXT NOT NULL, name TEXT NOT NULL, query INTEGER NOT NULL, msgid TEXT NOT NULL,
+                     time INTEGER NOT NULL, kind TEXT NOT NULL, nick TEXT, text TEXT NOT NULL, own INTEGER NOT NULL,
+                     brk INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (network, target, msgid));
+                 INSERT INTO lines VALUES ('net', '#a', '#a', 0, 'o1', 1800000001000, 'privmsg', 'bob', 'one', 0, 1);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        let c = Cache::open(&path).unwrap();
+        let got = c.latest("net", "#a", 10).unwrap();
+        assert_eq!((texts(&got).as_slice(), got[0].via.as_deref()), (["one"].as_slice(), None));
+        let v: i64 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, VERSION);
+    }
+
+    #[test]
+    fn a_relayed_line_keeps_its_bridge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Cache::open(&dir.path().join(FILE)).unwrap();
+        let relayed = Line { via: Some("IrcBot".into()), ..line(Some("r1"), 1, "hi") };
+        c.put(&[entry(chan("#a"), vec![relayed, line(Some("r2"), 2, "yo")])]).unwrap();
+        let got = c.latest("net", "#a", 10).unwrap();
+        assert_eq!(got.iter().map(|l| l.via.as_deref()).collect::<Vec<_>>(), [Some("IrcBot"), None]);
     }
 
     #[test]

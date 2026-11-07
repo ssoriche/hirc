@@ -70,36 +70,38 @@ fn put(text: &str, start: usize, end: usize, mut cycle: Cycle) -> (String, usize
 /// Tab looks back no further than this many lines for who spoke last.
 const RECENT_LINES: usize = 2000;
 
-/// Who Tab offers in `buf`: in a channel, its members, those who spoke
-/// last first (newest first, among the newest `RECENT_LINES` lines), then
-/// the rest by name; never `me`. In a query, the other person.
+/// Who Tab offers in `buf`: in a channel, its members and the people its
+/// bridges relayed, those who spoke last first (newest first, among the
+/// newest `RECENT_LINES` lines), then the other members by name. Never `me`,
+/// and never a bridge seen relaying there. In a query, the other person.
 pub fn nicks(buf: &Buffer, me: Option<&str>) -> Vec<String> {
     let not_me = |n: &str| me.is_none_or(|m| !m.eq_ignore_ascii_case(n));
     match &buf.target {
         Target::Query(n) => vec![n.clone()],
         Target::Server => Vec::new(),
         Target::Channel(_) => {
-            let members: HashMap<String, &String> = buf.members.iter().filter(|m| not_me(m)).map(|m| (m.to_ascii_lowercase(), m)).collect();
-            let mut placed: HashSet<&str> = HashSet::new();
+            let recent = || buf.lines.iter().rev().take(RECENT_LINES);
+            let bridges: HashSet<String> = recent().filter_map(|l| l.via.as_deref()).map(str::to_ascii_lowercase).collect();
+            let offered = |n: &str| not_me(n) && !bridges.contains(&n.to_ascii_lowercase());
+            let members: HashMap<String, &String> = buf.members.iter().filter(|m| offered(m)).map(|m| (m.to_ascii_lowercase(), m)).collect();
+            let mut placed: HashSet<String> = HashSet::new();
             let mut out: Vec<String> = Vec::new();
-            let spoke = buf
-                .lines
-                .iter()
-                .rev()
-                .take(RECENT_LINES)
-                .filter(|l| matches!(l.kind, LineKind::Privmsg | LineKind::Notice | LineKind::Action))
-                .filter_map(|l| l.nick.as_deref());
-            for nick in spoke {
-                if placed.len() == members.len() {
-                    break;
-                }
-                if let Some(m) = members.get(&nick.to_ascii_lowercase())
-                    && placed.insert(m.as_str())
-                {
-                    out.push((*m).clone());
+            let spoke = recent().filter(|l| matches!(l.kind, LineKind::Privmsg | LineKind::Notice | LineKind::Action));
+            for l in spoke {
+                let Some(nick) = l.nick.as_deref() else { continue };
+                let key = nick.to_ascii_lowercase();
+                // A member as the member list spells them; someone a bridge
+                // relayed (not on IRC, so in no member list) as it did.
+                let name = match members.get(&key) {
+                    Some(m) => m.as_str(),
+                    None if l.via.is_some() && offered(nick) => nick,
+                    None => continue,
+                };
+                if placed.insert(key) {
+                    out.push(name.to_owned());
                 }
             }
-            let mut rest: Vec<String> = members.values().filter(|m| !placed.contains(m.as_str())).map(|m| (*m).clone()).collect();
+            let mut rest: Vec<String> = members.iter().filter(|(k, _)| !placed.contains(*k)).map(|(_, m)| (*m).clone()).collect();
             rest.sort_by_key(|m| m.to_ascii_lowercase());
             out.extend(rest);
             out
@@ -234,6 +236,7 @@ mod tests {
             delivery: Delivery::Sent,
             boundary: false,
             replayed: false,
+            via: None,
         }
     }
 
@@ -257,6 +260,29 @@ mod tests {
         b.lines = lines;
         // zed spoke before the newest RECENT_LINES lines: alphabetical.
         assert_eq!(nicks(&b, Some("alice")), ["carol", "bob", "zed"]);
+    }
+
+    #[test]
+    fn people_a_bridge_relayed_are_offered_and_the_bridge_is_not() {
+        let mut b = Buffer::new(Target::Channel("#a".into()));
+        b.members = names(&["alice", "IrcBot", "Bob", "carol"]);
+        let relayed = |nick: &str| Line { via: Some("ircbot".into()), ..said(nick, LineKind::Privmsg) };
+        b.lines = vec![
+            relayed("dana"),
+            said("carol", LineKind::Privmsg),
+            said("IrcBot", LineKind::Privmsg),
+            relayed("bob"),
+            relayed("alice"),
+            relayed("IrcBot"),
+            relayed("Dana"),
+        ];
+        // Dana (on Discord) spoke last, as relayed; bob is a member too, so
+        // spelled as the member list has him. Not me, not the bridge, even
+        // in its own words; dana only once.
+        assert_eq!(nicks(&b, Some("alice")), ["Dana", "Bob", "carol"]);
+        // Someone gone from IRC, unrelayed, isn't offered.
+        b.lines.push(said("zed", LineKind::Privmsg));
+        assert_eq!(nicks(&b, Some("alice")), ["Dana", "Bob", "carol"]);
     }
 
     #[test]

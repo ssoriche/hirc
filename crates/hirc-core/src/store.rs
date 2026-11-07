@@ -50,6 +50,9 @@ pub struct Line {
     /// From history (a `chathistory` batch, or the cache), not said just
     /// now: never news, and unread only past the read marker.
     pub replayed: bool,
+    /// The bridge (`bridge`) that relayed it: `nick` is someone on the
+    /// other side, not on IRC.
+    pub via: Option<String>,
 }
 
 /// Where a line we sent stands. Everything else is `Sent`.
@@ -408,6 +411,7 @@ impl Store {
             delivery: Delivery::Sent,
             boundary: false,
             replayed: false,
+            via: None,
         };
         self.networks[network].buffers[buffer].insert(line).unwrap_or(0)
     }
@@ -631,6 +635,7 @@ mod tests {
             delivery: Delivery::Sent,
             boundary: false,
             replayed: false,
+            via: None,
         }
     }
 

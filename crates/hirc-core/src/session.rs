@@ -1557,7 +1557,19 @@ impl Session {
         self.seq += 1;
         let time = msg.tag("time").and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map_or(now, |t| t.with_timezone(&Utc));
         let msgid = msg.tag("msgid").filter(|m| !m.is_empty()).map(str::to_owned);
-        Line { seq: self.seq, time, msgid, kind, nick: nick.map(str::to_owned), text, own, delivery: Delivery::Sent, boundary: false, replayed: false }
+        Line {
+            seq: self.seq,
+            time,
+            msgid,
+            kind,
+            nick: nick.map(str::to_owned),
+            text,
+            own,
+            delivery: Delivery::Sent,
+            boundary: false,
+            replayed: false,
+            via: None,
+        }
     }
 
     fn peer(&self, nick: &str, change: PeerChange) -> Output {
@@ -1695,10 +1707,11 @@ impl Session {
         let mut text = text.to_owned();
         // A relay bot's `<name> text` reads as `name`'s own line; the bot's
         // own words and actions stay its.
+        let mut via = None;
         if relay && let Some((relayed, name, rest)) = bridge::unwrap_lines(&text) {
-            (kind, nick, text) = (relayed, Some(name), rest);
+            (kind, nick, text, via) = (relayed, Some(name), rest, Some(from.to_owned()));
         }
-        let line = self.line(msg, now, kind, nick.as_deref(), text, own);
+        let line = Line { via, ..self.line(msg, now, kind, nick.as_deref(), text, own) };
         out.push(self.stamped(msg, target, line));
     }
 
@@ -1893,7 +1906,7 @@ impl Session {
 
     fn local(&mut self, kind: LineKind, text: String, now: DateTime<Utc>) -> Line {
         self.seq += 1;
-        Line { seq: self.seq, time: now, msgid: None, kind, nick: None, text, own: true, delivery: Delivery::Sent, boundary: false, replayed: false }
+        Line { seq: self.seq, time: now, msgid: None, kind, nick: None, text, own: true, delivery: Delivery::Sent, boundary: false, replayed: false, via: None }
     }
 
     /// PRIVMSG, split to fit. Each piece shows at once as our own line.
@@ -2182,22 +2195,22 @@ pub(crate) mod tests {
         s.cfg.bridges = vec!["IrcBot".into()];
         let said = |s: &mut Session, line: &str| {
             let (t, l) = lines(&feed(s, line)).remove(0);
-            (t, l.kind, l.nick.unwrap_or_default(), l.text)
+            (t, l.kind, l.nick.unwrap_or_default(), l.text, l.via)
         };
         let chan = Target::Channel("#test".into());
         // Listed (in any case): the relayed name and text, zero-width gone.
         let got = said(&mut s, ":ircbot!b@h PRIVMSG #test :<ha\u{200B}cker> The only drawback");
-        assert_eq!(got, (chan.clone(), LineKind::Privmsg, "hacker".into(), "The only drawback".into()));
+        assert_eq!(got, (chan.clone(), LineKind::Privmsg, "hacker".into(), "The only drawback".into(), Some("ircbot".into())));
         let got = said(&mut s, ":IrcBot!b@h PRIVMSG #test :* hacker waves");
-        assert_eq!(got, (chan.clone(), LineKind::Action, "hacker".into(), "waves".into()));
+        assert_eq!(got, (chan.clone(), LineKind::Action, "hacker".into(), "waves".into(), Some("IrcBot".into())));
         // The bot's own words and its own CTCP ACTION stay its.
         let got = said(&mut s, ":IrcBot!b@h PRIVMSG #test :Bridge restarted");
-        assert_eq!(got, (chan.clone(), LineKind::Privmsg, "IrcBot".into(), "Bridge restarted".into()));
+        assert_eq!(got, (chan.clone(), LineKind::Privmsg, "IrcBot".into(), "Bridge restarted".into(), None));
         let got = said(&mut s, ":IrcBot!b@h PRIVMSG #test :\x01ACTION <hacker> waves\x01");
-        assert_eq!(got, (chan.clone(), LineKind::Action, "IrcBot".into(), "<hacker> waves".into()));
+        assert_eq!(got, (chan.clone(), LineKind::Action, "IrcBot".into(), "<hacker> waves".into(), None));
         // An unlisted nick is never unwrapped.
         let got = said(&mut s, ":OtherBot!b@h PRIVMSG #test :<hacker> hi");
-        assert_eq!(got, (chan.clone(), LineKind::Privmsg, "OtherBot".into(), "<hacker> hi".into()));
+        assert_eq!(got, (chan.clone(), LineKind::Privmsg, "OtherBot".into(), "<hacker> hi".into(), None));
         // The bot itself is still the peer seen.
         assert_eq!(peers(&feed(&mut s, ":IrcBot!b@h PRIVMSG #test :<hacker> x"))[0].0, "IrcBot");
     }
@@ -3076,6 +3089,7 @@ pub(crate) mod tests {
             delivery: Delivery::Sent,
             boundary: false,
             replayed: false,
+            via: None,
         }
     }
 

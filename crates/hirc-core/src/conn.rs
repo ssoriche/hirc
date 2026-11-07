@@ -148,6 +148,7 @@ fn note(text: String) -> Line {
         delivery: Delivery::Sent,
         boundary: false,
         replayed: false,
+        via: None,
     }
 }
 
@@ -593,6 +594,7 @@ mod tests {
             delivery: Delivery::Sent,
             boundary: false,
             replayed: false,
+            via: None,
         }
     }
 
