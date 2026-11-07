@@ -18,7 +18,7 @@ use crate::wrap;
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, deferred, div, fill, point, prelude::*, px, relative, size,
 };
 use hirc_core::command;
 use unicode_segmentation::*;
@@ -72,6 +72,11 @@ pub struct TextInput {
     pub note: Option<Note>,
     /// The Tab completion in progress, so another Tab offers the next match.
     cycle: Option<hirc_core::complete::Cycle>,
+    /// The emoji popup over the input, while a `:name` is being typed.
+    popup: Option<hirc_core::complete::Popup>,
+    /// The `:` of a popup closed with Esc, so it stays closed until that
+    /// `:name` is left.
+    dismissed: Option<usize>,
 }
 
 impl TextInput {
@@ -194,6 +199,7 @@ impl TextInput {
             Mode::Insert => offset,
         };
         self.selected_range = offset..offset;
+        self.refresh_popup();
         cx.notify()
     }
 
@@ -244,6 +250,7 @@ impl TextInput {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.refresh_popup();
         cx.notify()
     }
 
@@ -328,7 +335,17 @@ impl TextInput {
             self.selection_reversed = false;
             self.marked_range = None;
             self.cycle = Some(cycle);
+            self.refresh_popup();
             cx.notify();
+        }
+    }
+
+    /// The emoji popup for the text and cursor now (Insert mode only).
+    fn refresh_popup(&mut self) {
+        let cursor = self.cursor_offset();
+        self.popup = (self.vim.mode == Mode::Insert).then(|| hirc_core::complete::popup(&self.content, cursor, self.dismissed, self.popup.as_ref())).flatten();
+        if hirc_core::complete::trigger(&self.content, cursor).is_none_or(|r| Some(r.start) != self.dismissed) {
+            self.dismissed = None;
         }
     }
 
@@ -376,6 +393,7 @@ impl EntityInputHandler for TextInput {
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
         self.edited();
+        self.refresh_popup();
         cx.notify();
     }
 
@@ -407,6 +425,7 @@ impl EntityInputHandler for TextInput {
             None => range.start + new_text.len()..range.start + new_text.len(),
         };
 
+        self.refresh_popup();
         cx.notify();
     }
 
@@ -890,7 +909,9 @@ impl Render for TextInput {
             Note::Error(text) => (text.clone(), p.map(|p| p.error)),
             Note::Confirm(text) => (text.clone(), p.map(|p| p.hint)),
         });
+        let popup = self.popup.clone().zip(p.cloned());
         div()
+            .relative()
             .flex()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
@@ -933,6 +954,33 @@ impl Render for TextInput {
                     .child(TextElement { input: cx.entity() })
                     .when_some(note, |d, (text, color)| d.child(div().when_some(color, |d, c| d.text_color(c)).truncate().child(text))),
             )
+            // The popup sits above the input, over the message view; `deferred`
+            // paints it after the rest of the window.
+            .when_some(popup, |d, (popup, p)| {
+                let rows = popup.rows.iter().enumerate().map(|(i, (emoji, name))| {
+                    let row = div().flex().gap(cell).px(cell).child(*emoji).child(div().text_color(p.text_dim).child(format!(":{name}:")));
+                    if i == popup.selected { row.bg(p.selected).text_color(p.selected_text) } else { row.text_color(p.text) }
+                });
+                d.child(
+                    deferred(
+                        div()
+                            .absolute()
+                            .bottom_full()
+                            .left(px(self.column))
+                            .mb(px(4.))
+                            .min_w(px(200.))
+                            .bg(p.input_bg)
+                            .border_1()
+                            .border_color(p.border)
+                            .rounded_sm()
+                            .py(px(2.))
+                            .flex()
+                            .flex_col()
+                            .children(rows),
+                    )
+                    .with_priority(1),
+                )
+            })
     }
 }
 
@@ -969,6 +1017,8 @@ impl TextInput {
             width: 0.,
             note: None,
             cycle: None,
+            popup: None,
+            dismissed: None,
         }
     }
 
@@ -979,11 +1029,24 @@ impl TextInput {
         let end = if self.vim.mode == Mode::Normal { vim::clamp_normal(&next, next.len()) } else { next.len() };
         self.content = next.into();
         self.selected_range = end..end;
+        self.refresh_popup();
         cx.notify();
         draft
     }
 
     fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        // With the popup open, Enter takes the chosen emoji instead.
+        if let Some(p) = self.popup.take() {
+            let (text, cursor) = p.accept(&self.content, self.cursor_offset());
+            self.edited();
+            self.content = text.into();
+            self.selected_range = cursor..cursor;
+            self.selection_reversed = false;
+            self.marked_range = None;
+            self.refresh_popup();
+            cx.notify();
+            return;
+        }
         // Key bindings run before `capture_key_down`, so route through vim here.
         if self.vim_key(named_key(Named::Enter), cx) {
             return;
@@ -1008,6 +1071,7 @@ impl TextInput {
     pub fn sent(&mut self, cx: &mut Context<Self>) {
         self.reset();
         self.vim.reset();
+        self.refresh_popup();
         cx.notify();
     }
 
@@ -1024,6 +1088,28 @@ impl TextInput {
         // Enter and Backspace arrive as actions; alt/cmd chords are the app's.
         if ks.modifiers.alt || ks.modifiers.platform || ks.modifiers.function || matches!(ks.key.as_str(), "enter" | "backspace") {
             return;
+        }
+        // With the popup open, Tab and the arrows choose and Esc closes it.
+        if self.popup.is_some() {
+            let step = match (ks.key.as_str(), ks.modifiers.control) {
+                ("tab", false) | ("down", false) | ("n", true) => Some(1),
+                ("up", false) | ("p", true) => Some(-1),
+                _ => None,
+            };
+            if let Some(by) = step {
+                if let Some(p) = self.popup.as_mut() {
+                    p.step(by);
+                }
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if ks.key == "escape" {
+                self.dismissed = self.popup.take().map(|p| p.start);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
         }
         // Tab completes in Insert mode.
         if ks.key == "tab" && !ks.modifiers.shift && !ks.modifiers.control && self.vim.mode == Mode::Insert {
@@ -1064,6 +1150,7 @@ impl TextInput {
                 Effect::Scroll(_) | Effect::Nav(_) | Effect::Ex(_) | Effect::Dismiss => cx.emit(VimEvent(effect)),
             }
         }
+        self.refresh_popup();
         cx.notify();
         true
     }
