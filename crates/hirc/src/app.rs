@@ -1,7 +1,7 @@
 //! App state and the event loop. The network thread sends `Event`s; we
 //! apply them to the `Store` and redraw. Input goes back as `Command`s.
 
-use crate::input::{self, Note, Submit, TextInput, VimEvent};
+use crate::input::{self, Note, Submit, TextInput, VimEvent, WantTab};
 use crate::links;
 use crate::metrics::{Columns, Metrics, Shape};
 use crate::scroll::{self, Pos};
@@ -211,6 +211,11 @@ impl HircApp {
             input
         });
         cx.subscribe(&input, |this, _, ev: &Submit, cx| this.submit_input(ev.text.clone(), ev.confirmed, cx)).detach();
+        cx.subscribe(&input, |this, input, _: &WantTab, cx| {
+            let nicks = this.current().map(|(net, buf)| hirc_core::complete::nicks(buf, net.nick.as_deref())).unwrap_or_default();
+            input.update(cx, |input, cx| input.tab(&nicks, cx));
+        })
+        .detach();
         cx.subscribe(&input, |this, _, ev: &VimEvent, cx| this.vim_effect(&ev.0, cx)).detach();
         let handle = input.read(cx).focus_handle(cx);
         window.focus(&handle, cx);

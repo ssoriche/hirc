@@ -70,6 +70,8 @@ pub struct TextInput {
     pub width: f32,
     /// Shown under the text until the next edit (see `Note`).
     pub note: Option<Note>,
+    /// The Tab completion in progress, so another Tab offers the next match.
+    cycle: Option<hirc_core::complete::Cycle>,
 }
 
 impl TextInput {
@@ -312,6 +314,22 @@ impl TextInput {
     /// The width rows wrap against: the app's, else what was drawn last.
     fn wrap_width(&self, bounds: Option<Bounds<Pixels>>) -> f32 {
         if self.width > 0. { self.width } else { bounds.map_or(0., |b| f32::from(b.size.width)) }
+    }
+
+    /// Tab: complete the word before the cursor from `nicks` (or the
+    /// commands, at the start of a `/` line), or the next match on
+    /// another Tab.
+    pub fn tab(&mut self, nicks: &[String], cx: &mut Context<Self>) {
+        let cursor = clamp_range(&self.content, &(self.cursor_offset()..self.cursor_offset())).start;
+        if let Some((text, cursor, cycle)) = hirc_core::complete::tab(&self.content, cursor, nicks, self.cycle.as_ref()) {
+            self.edited();
+            self.content = text.into();
+            self.selected_range = cursor..cursor;
+            self.selection_reversed = false;
+            self.marked_range = None;
+            self.cycle = Some(cycle);
+            cx.notify();
+        }
     }
 
     /// The text changed: a note about what it was goes.
@@ -950,6 +968,7 @@ impl TextInput {
             column: 0.,
             width: 0.,
             note: None,
+            cycle: None,
         }
     }
 
@@ -1004,6 +1023,12 @@ impl TextInput {
         let ks = &ev.keystroke;
         // Enter and Backspace arrive as actions; alt/cmd chords are the app's.
         if ks.modifiers.alt || ks.modifiers.platform || ks.modifiers.function || matches!(ks.key.as_str(), "enter" | "backspace") {
+            return;
+        }
+        // Tab completes in Insert mode.
+        if ks.key == "tab" && !ks.modifiers.shift && !ks.modifiers.control && self.vim.mode == Mode::Insert {
+            cx.emit(WantTab);
+            cx.stop_propagation();
             return;
         }
         let Some(key) = to_key(ks.key.as_str(), ks.key_char.as_deref(), ks.modifiers.shift, ks.modifiers.control) else { return };
@@ -1077,6 +1102,12 @@ fn next_char_boundary(s: &str, at: usize) -> usize {
 pub struct VimEvent(pub vim::Effect);
 
 impl EventEmitter<VimEvent> for TextInput {}
+
+/// Tab in Insert mode: the app answers with `tab`, giving the nicks to
+/// offer here (it knows the window; the input doesn't).
+pub struct WantTab;
+
+impl EventEmitter<WantTab> for TextInput {}
 
 /// The text Enter submitted, and whether it confirms a note asking to.
 pub struct Submit {
