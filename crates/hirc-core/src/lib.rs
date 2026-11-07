@@ -7,6 +7,7 @@ pub mod bridge;
 pub mod cache;
 pub mod caps;
 pub mod command;
+pub mod complete;
 pub mod config;
 pub mod conn;
 pub mod display;
