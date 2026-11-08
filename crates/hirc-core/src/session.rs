@@ -186,6 +186,10 @@ pub struct Session {
     /// with server-time, and replays buffer by buffer, not in time order.
     /// Approximate, by one-way latency plus clock skew.
     play: Option<DateTime<Utc>>,
+    /// Identical lines in one millisecond so far, per stream (live, loose
+    /// replay, or a batch) and target: the run at the newest millisecond
+    /// seen there, by `msgid::made_up`, for `stamped` to number them.
+    alike: HashMap<(String, String), Run>,
 }
 
 /// The live end of a target, as the cache holds it.
@@ -215,6 +219,10 @@ struct Incoming {
     /// The history page this batch is part of, if any.
     history: Option<String>,
 }
+
+/// The millisecond of a run of lines in one stream and target, and how
+/// many of each (by `msgid::made_up`) it has had.
+type Run = (Option<DateTime<Utc>>, HashMap<String, u32>);
 
 /// A page of history being received (a `chathistory` batch).
 #[derive(Debug)]
@@ -370,6 +378,7 @@ impl Session {
             keep: None,
             tail: HashMap::new(),
             play: None,
+            alike: HashMap::new(),
         }
     }
 
@@ -523,6 +532,7 @@ impl Session {
         self.multiline_said = None;
         self.tail.clear();
         self.play = None;
+        self.alike.clear();
         // A query's lines can come before registration ends and its gap is
         // asked for: until then they wait, as they would in an open gap.
         for q in self.book.queries() {
@@ -541,11 +551,13 @@ impl Session {
     }
 
     /// The connection is gone: a multiline batch that never closed is
-    /// shown with the lines it got, rather than lost.
+    /// shown with the lines it got, rather than lost, but not as the
+    /// message it names: without its msgid it is neither held history nor
+    /// cached, so the gap fill brings it whole (and the store swaps it in).
     pub fn end(&mut self, now: DateTime<Utc>) -> Vec<Output> {
         let mut out = Vec::new();
         for (_, batch) in std::mem::take(&mut self.incoming) {
-            self.finish(batch, now, &mut out);
+            self.finish(batch, false, now, &mut out);
         }
         // Pages cut off by the drop: what came is still history.
         for (_, page) in std::mem::take(&mut self.pages) {
@@ -610,7 +622,7 @@ impl Session {
             if msg.command != "BATCH"
                 && let Some(h) = self.page_of(&r)
             {
-                return self.replay(&h, &msg, now);
+                return self.replay(&h, &msg, true, now);
             }
             // One name in our TARGETS answer. Only as many as were asked for
             // are kept.
@@ -778,7 +790,7 @@ impl Session {
         // what it got.
         if let Some(i) = self.incoming.iter().position(|(k, _)| *k == r) {
             let (_, batch) = self.incoming.remove(i);
-            self.finish(batch, now, out);
+            self.finish(batch, true, now, out);
         }
         self.batches.close(&r);
         if let Some(page) = self.pages.remove(&r) {
@@ -826,19 +838,21 @@ impl Session {
 
     /// A multiline batch's lines as the one message they are: `\n`
     /// between lines, continuations joined, the batch's sender and target,
-    /// and its time and msgid (else the first line's).
-    fn finish(&mut self, batch: Incoming, now: DateTime<Utc>, out: &mut Vec<Output>) {
+    /// and its time and msgid (else the first line's). Cut off (not
+    /// `whole`), its time only.
+    fn finish(&mut self, batch: Incoming, whole: bool, now: DateTime<Utc>, out: &mut Vec<Output>) {
         let Some(first) = batch.lines.first() else { return };
         let text = multiline::join(batch.lines.iter().map(|m| (m.params.get(1).map_or("", String::as_str), m.tag(multiline::CONCAT).is_some())));
-        let tags = ["time", "msgid"]
-            .into_iter()
+        let tags = ["time", "msgid"][..if whole { 2 } else { 1 }]
+            .iter()
+            .copied()
             .filter_map(|k| batch.open.tag(k).or_else(|| first.tag(k)).filter(|v| !v.is_empty()).map(|v| (k.to_owned(), Some(v.to_owned()))))
             .collect();
         let target = batch.open.params.get(2).or(first.params.first()).cloned().unwrap_or_default();
         let source = batch.open.source.clone().or_else(|| first.source.clone());
         let msg = Message { tags, source, command: first.command.clone(), params: vec![target, text] };
         match batch.history {
-            Some(h) if self.pages.contains_key(&h) => self.replay(&h, &msg, now),
+            Some(h) if self.pages.contains_key(&h) => self.replay(&h, &msg, whole, now),
             _ => self.on_message(&msg, now, out),
         }
     }
@@ -1200,9 +1214,11 @@ impl Session {
     /// but only its line goes in the page, flagged `replayed`. Nothing
     /// else the live one does (peers, members, the topic) happens.
     /// Past the page's cap an item is only counted.
-    fn replay(&mut self, h: &str, msg: &Message, now: DateTime<Utc>) {
+    fn replay(&mut self, h: &str, msg: &Message, whole: bool, now: DateTime<Utc>) {
         let Some(page) = self.pages.get_mut(h) else { return };
-        page.items += 1;
+        // A message cut off by the drop is not one of the page's items:
+        // the page reaches only as far as the last whole one.
+        page.items += usize::from(whole);
         if page.items > page.cap {
             return;
         }
@@ -1213,7 +1229,7 @@ impl Session {
         } else {
             self.replayed_event(&target, msg, now, &mut shown);
         }
-        let anchor = Anchor::from_tags(msg);
+        let anchor = Anchor::from_tags(msg).filter(|_| whole);
         let Some(page) = self.pages.get_mut(h) else { return };
         if let Some(a) = anchor {
             page.first.get_or_insert_with(|| a.clone());
@@ -1604,12 +1620,31 @@ impl Session {
     ///
     /// Never in the server buffer, and never without server-time: our
     /// clock differs between copies.
-    fn stamped(&self, msg: &Message, target: Target, mut line: Line) -> Output {
+    fn stamped(&mut self, msg: &Message, target: Target, mut line: Line) -> Output {
         let wanted = self.bouncer_replay() || (line.msgid.is_none() && !self.history_on());
         if wanted && !matches!(target, Target::Server) && server_time(msg).is_some() {
-            line.msgid = Some(crate::msgid::made_up(&target, &line));
+            line.msgid = Some(crate::msgid::made_up_nth(&target, &line, self.nth_alike(msg, &target, &line)));
         }
         self.event_line(target, line)
+    }
+
+    /// How many lines saying what `line` says, at its millisecond, came
+    /// before it in its stream: live, the loose replay, or one batch. A
+    /// replay numbers its copies as the live run did, so each meets its own.
+    fn nth_alike(&mut self, msg: &Message, target: &Target, line: &Line) -> u32 {
+        let stream = match msg.tag("batch") {
+            Some(b) => format!("batch {b}"),
+            None if self.loose_replay(msg) => "replay".to_owned(),
+            None => "live".to_owned(),
+        };
+        let name = target.name().unwrap_or_default().to_ascii_lowercase();
+        let run = self.alike.entry((stream, name)).or_default();
+        if run.0 != Some(line.time) {
+            *run = (Some(line.time), HashMap::new());
+        }
+        let n = run.1.entry(crate::msgid::made_up(target, line)).or_insert(0);
+        *n += 1;
+        *n - 1
     }
 
     fn is_me(&self, nick: &str) -> bool {

@@ -5,8 +5,9 @@
 //! without it (ruling Q1). With one, a line's live copy and its replayed
 //! copy are one line in the store, and it can go in the history cache,
 //! whose key, breaks and paging all need a msgid. The id is a hash of
-//! what the line says, so both copies get the same one. Two identical
-//! lines from one nick in the same millisecond become one (accepted).
+//! what the line says, so both copies get the same one. Identical lines
+//! from one nick in the same millisecond (all a whole-second server-time
+//! shows) are told apart by their place in that run (`made_up_nth`).
 //! Made-up ids never leave hirc: `PREFIX` tells them apart, and nothing
 //! sends one.
 
@@ -19,9 +20,19 @@ pub const PREFIX: &str = "hirc:";
 /// `hirc:<16 hex digits>`: FNV-1a over the line's time in milliseconds,
 /// its target (lowercased, as buffers match), kind, nick and text.
 pub fn made_up(target: &Target, line: &Line) -> String {
+    made_up_nth(target, line, 0)
+}
+
+/// The id of the `nth` (from 0) of identical lines in one millisecond, as
+/// they came: the first's is `made_up`'s, so ids already held still
+/// match, and a later one's hashes its place too. A replay of the run
+/// counts the same way, so each copy meets its own.
+pub fn made_up_nth(target: &Target, line: &Line, nth: u32) -> String {
     let ms = line.time.timestamp_millis().to_string();
     let name = target.name().unwrap_or_default().to_ascii_lowercase();
-    let fields = [ms.as_str(), name.as_str(), crate::cache::kind_name(line.kind), line.nick.as_deref().unwrap_or_default(), line.text.as_str()];
+    let place = nth.to_string();
+    let fields = [ms.as_str(), name.as_str(), crate::cache::kind_name(line.kind), line.nick.as_deref().unwrap_or_default(), line.text.as_str(), place.as_str()];
+    let fields = &fields[..if nth == 0 { 5 } else { 6 }];
     // A NUL after each field (IRC text never holds one), so fields can't
     // run into each other.
     format!("{PREFIX}{:016x}", fnv1a(fields.iter().flat_map(|f| f.bytes().chain(std::iter::once(0)))))
@@ -57,6 +68,15 @@ mod tests {
     fn fnv1a_is_the_standard_64_bit_one() {
         assert_eq!(fnv1a(*b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a(*b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    #[test]
+    fn identical_lines_in_one_run_get_ids_by_their_place() {
+        let (c, l) = (chan("#test"), said("ok"));
+        assert_eq!(made_up_nth(&c, &l, 0), made_up(&c, &l), "the first keeps the id it always had");
+        let ids = [0, 1, 2].map(|n| made_up_nth(&c, &l, n));
+        assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2], "{ids:?}");
+        assert_eq!(made_up_nth(&c, &l, 1), ids[1]);
     }
 
     #[test]

@@ -627,7 +627,6 @@ fn the_same_words_by_the_same_nick_a_millisecond_apart_are_two_lines() {
 }
 
 #[test]
-#[ignore = "BUG: two lines from one nick with the same text and the same millisecond but different server msgids become one (store.rs `said` dedupe, accepted there)"]
 fn the_same_words_by_the_same_nick_in_one_millisecond_are_two_lines() {
     let mut c = first_connection(50, &[lm("m1", 0, 0, "lol"), lm("m2", 0, 0, "lol")]);
     assert_eq!(c.said(), texts(&["lol", "lol"]));
@@ -742,7 +741,6 @@ fn identical_lines_from_different_nicks_in_one_millisecond_are_both_kept() {
 }
 
 #[test]
-#[ignore = "BUG: identical lines (same nick, text) at the same millisecond, which is all a second-resolution server-time shows, collapse into one on a server with no msgids (made-up ids, accepted in msgid.rs)"]
 fn identical_lines_in_one_second_without_msgids_are_both_kept() {
     let mut c = irccloud(Store::new(["net".to_string()]), Book::default(), "2026-10-22T12:00:00Z");
     loose(&mut c, "2026-10-22T12:00:01Z", "bob", "ok");
@@ -928,7 +926,6 @@ fn a_latest_page_cut_off_by_the_drop_leaves_no_hole_after_the_reconnect() {
 }
 
 #[test]
-#[ignore = "BUG: a multiline message cut off by the drop is kept with its msgid and first line only; the gap fill's whole copy is dropped as a duplicate, so it stays truncated"]
 fn a_multiline_message_cut_off_by_the_drop_is_whole_after_the_gap_fill() {
     let c = first_connection(50, &[l("m1", 0)]);
     let (store, book) = c.drop_conn();

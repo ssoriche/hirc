@@ -391,9 +391,12 @@ fn put_run(db: &Connection, e: &Entry) -> Result<usize, CacheError> {
     };
     let mut heal = db.prepare_cached("UPDATE lines SET brk = 0 WHERE network = ?1 AND target = ?2 AND msgid = ?3")?;
     let mut held = db.prepare_cached("SELECT 1 FROM lines WHERE network = ?1 AND target = ?2 AND msgid = ?3")?;
-    // On the time index: the same line held under another msgid (made up
-    // on a network without chathistory, the server's own on one with).
-    let mut said = db.prepare_cached("SELECT 1 FROM lines WHERE network = ?1 AND target = ?2 AND time = ?3 AND kind = ?4 AND nick IS ?5 AND text = ?6")?;
+    // On the time index: the same line held under the other kind of msgid
+    // (made up on a network without chathistory, the server's own on one
+    // with). Two lines alike with msgids of one kind are two lines.
+    let mut said = db.prepare_cached(
+        "SELECT 1 FROM lines WHERE network = ?1 AND target = ?2 AND time = ?3 AND kind = ?4 AND nick IS ?5 AND text = ?6 AND (substr(msgid, 1, 5) = 'hirc:') != ?7",
+    )?;
     let (mut n, mut newest_is_new, mut skipped) = (0, false, false);
     for (i, l) in lines.iter().enumerate() {
         let ms = l.time.timestamp_millis();
@@ -401,7 +404,9 @@ fn put_run(db: &Connection, e: &Entry) -> Result<usize, CacheError> {
         // not known to be what is around this line (two lines can read the
         // same), so no join is claimed across it: not at the held copy, and
         // not at the next line that goes in.
-        if !held.exists(params![e.network, target, l.msgid])? && said.exists(params![e.network, target, ms, kind_name(l.kind), l.nick, l.text])? {
+        if !held.exists(params![e.network, target, l.msgid])?
+            && said.exists(params![e.network, target, ms, kind_name(l.kind), l.nick, l.text, l.msgid.as_deref().is_some_and(crate::msgid::is_made_up)])?
+        {
             (skipped, newest_is_new) = (true, false);
             continue;
         }
@@ -1132,9 +1137,13 @@ mod tests {
         assert!(brk(&path, &held), "the held copy is not healed");
         assert!(brk(&path, "r3"), "the line after the skip follows on from nothing known");
         // A run whose oldest line is held under another id: no join there.
-        let run = vec![line(Some("q1"), 1, "one"), line(Some("q4"), 4, "four")];
-        c.put(&[Entry { below: Below::Joins("r0".into()), ..entry(a.clone(), run) }]).unwrap();
-        assert!(!brk(&path, "r1") && brk(&path, "q4"));
+        c.put(&[entry(a.clone(), vec![made_up(&a, line(None, 5, "five"))])]).unwrap();
+        let run = vec![line(Some("q5"), 5, "five"), line(Some("q6"), 6, "six")];
+        c.put(&[Entry { below: Below::Joins("r3".into()), ..entry(a.clone(), run) }]).unwrap();
+        assert!(!brk(&path, "r1") && brk(&path, "q6"));
+        // Two lines alike, both with the server's ids, are two lines.
+        let run = vec![line(Some("r1b"), 1, "one")];
+        assert_eq!(c.put(&[entry(a.clone(), run)]).unwrap(), 1);
         // Above: a page before r3 whose newest line is held under another
         // id doesn't heal r3.
         let run = vec![line(Some("p2"), 2, "two")];

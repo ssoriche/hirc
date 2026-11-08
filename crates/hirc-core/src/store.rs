@@ -128,8 +128,9 @@ pub struct Buffer {
     pub history: HistoryState,
     msgids: HashSet<String>,
     /// What each line with a msgid says (`msgid::made_up` of it: its time,
-    /// kind, nick and text), whatever its msgid.
-    said: HashSet<String>,
+    /// kind, nick and text), whatever its msgid, and whether the first
+    /// such line's msgid was made up.
+    said: HashMap<String, bool>,
 }
 
 impl Buffer {
@@ -147,27 +148,41 @@ impl Buffer {
             filled: false,
             history: HistoryState::Idle,
             msgids: HashSet::new(),
-            said: HashSet::new(),
+            said: HashMap::new(),
         }
     }
 
     /// Where the line went, or `None` if we already have it: its msgid,
-    /// or (both with a msgid) a line that says the same at the same
-    /// millisecond. Two such lines from one nick become one (accepted, as
-    /// for made-up ids). A line without a msgid (ours, pending) is never
-    /// matched by what it says.
+    /// or a line that says the same at the same millisecond under the other
+    /// kind of msgid (one made up, the server's on the other: the same line
+    /// seen two ways). Two lines that both have the server's msgids, or
+    /// both made-up ones, are two lines however alike. A line without a
+    /// msgid (ours, pending) is never matched by what it says.
     pub fn insert(&mut self, line: Line) -> Option<usize> {
+        self.place(line).map(|(ix, _)| ix)
+    }
+
+    /// As `insert`, and whether the line is new rather than the whole copy
+    /// of one cut off by a drop (`Session::end` shows it without its msgid),
+    /// which it replaces where it stands.
+    fn place(&mut self, line: Line) -> Option<(usize, bool)> {
         if let Some(id) = &line.msgid {
             let said = crate::msgid::made_up(&self.target, &line);
-            if self.msgids.contains(id) || self.said.contains(&said) {
+            let made = crate::msgid::is_made_up(id);
+            if self.msgids.contains(id) || self.said.get(&said).is_some_and(|held| *held != made) {
                 return None;
             }
             self.msgids.insert(id.clone());
-            self.said.insert(said);
+            self.said.entry(said).or_insert(made);
+            let same_time = self.lines.partition_point(|l| l.time < line.time)..self.lines.partition_point(|l| l.time <= line.time);
+            if let Some(i) = same_time.rev().find(|&i| is_cut_copy(&self.lines[i], &line)) {
+                self.lines[i] = Line { seq: self.lines[i].seq, ..line };
+                return Some((i, false));
+            }
         }
         let ix = self.lines.partition_point(|l| (l.time, l.seq) <= (line.time, line.seq));
         self.lines.insert(ix, line);
-        Some(ix)
+        Some((ix, true))
     }
 
     /// The pending line our echo `line` confirms: our own line of the same
@@ -202,11 +217,11 @@ impl Buffer {
     fn add_counted(&mut self, line: Line, me: Option<&str>) -> Option<usize> {
         let news = is_news(self, &line);
         let mention = news && meant_for(&self.target, &line, me);
-        let ix = self.insert(line)?;
-        if news {
+        let (ix, new) = self.place(line)?;
+        if news && new {
             self.unread += 1;
         }
-        if mention {
+        if mention && new {
             self.mentions += 1;
         }
         Some(ix)
@@ -220,6 +235,18 @@ impl Buffer {
         self.mentions = fresh.iter().filter(|l| meant_for(&self.target, l, me)).count();
         self.unread = fresh.len();
     }
+}
+
+/// Whether `held` is `whole` cut off by a drop: someone's line without a
+/// msgid, at the same millisecond, of the same kind and nick, saying the
+/// start of what `whole` says.
+fn is_cut_copy(held: &Line, whole: &Line) -> bool {
+    held.msgid.is_none()
+        && held.delivery == Delivery::Sent
+        && held.nick.is_some()
+        && (held.time, held.kind, &held.nick) == (whole.time, whole.kind, &whole.nick)
+        && whole.text.len() > held.text.len()
+        && whole.text.starts_with(&held.text)
 }
 
 /// Whether `line` counts toward a window's unread lines: something someone
@@ -655,6 +682,35 @@ mod tests {
         assert_eq!(b.insert(line(1, 1, Some("x"), "one")), Some(0));
         assert_eq!(b.insert(line(2, 1, Some("x"), "again")), None);
         assert_eq!(b.lines.len(), 1);
+    }
+
+    #[test]
+    fn alike_lines_with_the_servers_ids_are_two_lines() {
+        let mut b = Buffer::new(Target::Channel("#a".into()));
+        assert!(b.insert(line(1, 1, Some("x"), "lol")).is_some());
+        assert!(b.insert(line(2, 1, Some("y"), "lol")).is_some());
+        assert_eq!(b.lines.len(), 2);
+    }
+
+    #[test]
+    fn a_line_cut_off_by_a_drop_gives_way_to_its_whole_copy() {
+        let mut s = Store::new(["net".to_string()]);
+        let chan = Target::Channel("#a".into());
+        let said = |line: Line| Event::Line { network: "net".into(), target: chan.clone(), line };
+        s.apply(said(line(1, 1, None, "first")));
+        s.apply(said(line(2, 2, Some("m2"), "after")));
+        let b = s.networks[0].buffers.iter().position(|b| b.target.same(&chan)).unwrap();
+        assert_eq!(s.networks[0].buffers[b].unread, 2);
+        s.apply(said(line(3, 1, Some("ml"), "first\nsecond")));
+        let buf = &s.networks[0].buffers[b];
+        let texts: Vec<_> = buf.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["first\nsecond", "after"]);
+        assert_eq!(buf.unread, 2, "the whole copy is the same line, not news again");
+        // A line of ours, or one that doesn't begin the same, is never taken.
+        let mut b = Buffer::new(chan.clone());
+        b.insert(line(1, 1, None, "other"));
+        b.insert(line(2, 1, Some("ml"), "first\nsecond"));
+        assert_eq!(b.lines.len(), 2);
     }
 
     #[test]
