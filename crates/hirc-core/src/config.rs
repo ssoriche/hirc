@@ -67,6 +67,12 @@ pub struct Server {
     /// hirc's key; Halloy ignores it.
     #[serde(deserialize_with = "client_id")]
     pub bouncer_client_id: Option<String>,
+    /// Seconds without a word from the server before hirc pings it
+    /// (Halloy's key; hirc's default is 120).
+    pub ping_time: Option<u64>,
+    /// Seconds to wait after that ping before the connection counts as
+    /// lost and is retried (Halloy's key; hirc's default is 180).
+    pub ping_timeout: Option<u64>,
 }
 
 /// A `bouncer_client_id` IRCCloud can read back out of the password.
@@ -95,6 +101,8 @@ impl Default for Server {
             sasl: None,
             bridges: Vec::new(),
             bouncer_client_id: None,
+            ping_time: None,
+            ping_timeout: None,
         }
     }
 }

@@ -1,7 +1,8 @@
 //! A TCP relay between hirc and a server that a test can cut on demand,
 //! which is how a network that dies without a QUIT looks to both ends.
 //! It can also hold or cut the connection when the client sends a line
-//! that matches, to land a drop at one exact point of a reconnect.
+//! that matches, to land a drop at one exact point of a reconnect, or go
+//! silent, as a dead link does: nothing gets through, nothing is closed.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,6 +48,8 @@ struct Trap {
 struct Inner {
     upstream: u16,
     blocked: AtomicBool,
+    /// Bytes either way are swallowed; every socket stays open.
+    silent: AtomicBool,
     cut: watch::Sender<u64>,
     trap: Mutex<Option<Trap>>,
 }
@@ -74,7 +77,8 @@ impl Proxy {
     pub async fn start(upstream: u16) -> Proxy {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let inner = Arc::new(Inner { upstream, blocked: AtomicBool::new(false), cut: watch::channel(0).0, trap: Mutex::new(None) });
+        let inner =
+            Arc::new(Inner { upstream, blocked: AtomicBool::new(false), silent: AtomicBool::new(false), cut: watch::channel(0).0, trap: Mutex::new(None) });
         let shared = inner.clone();
         let task = tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
@@ -96,8 +100,17 @@ impl Proxy {
         self.inner.cut.send_modify(|n| *n += 1);
     }
 
+    /// The network is back: new connections get through, and nothing is
+    /// swallowed any more.
     pub fn up(&self) {
         self.inner.blocked.store(false, Ordering::SeqCst);
+        self.inner.silent.store(false, Ordering::SeqCst);
+    }
+
+    /// The link goes dead with nothing closed: no end of file, no reset,
+    /// just no bytes either way (a dropped Wi-Fi, a sleeping NAT) until `up`.
+    pub fn silence(&self) {
+        self.inner.silent.store(true, Ordering::SeqCst);
     }
 
     /// Drops the connection when the client sends its `nth` (1-based) line
@@ -125,6 +138,7 @@ async fn relay(inner: Arc<Inner>, client: TcpStream, mut cut: watch::Receiver<u6
     let Ok(server) = TcpStream::connect(("127.0.0.1", inner.upstream)).await else { return };
     let (cr, mut cw) = client.into_split();
     let (sr, mut sw) = server.into_split();
+    let quiet = inner.clone();
     let mute = Arc::new(AtomicBool::new(false));
     let muted = mute.clone();
     let up = async move {
@@ -134,6 +148,9 @@ async fn relay(inner: Arc<Inner>, client: TcpStream, mut cut: watch::Receiver<u6
             line.clear();
             if r.read_until(b'\n', &mut line).await.unwrap_or(0) == 0 {
                 return;
+            }
+            if inner.silent.load(Ordering::SeqCst) {
+                continue;
             }
             let text = String::from_utf8_lossy(&line).into_owned();
             match inner.spring(&text) {
@@ -159,7 +176,10 @@ async fn relay(inner: Arc<Inner>, client: TcpStream, mut cut: watch::Receiver<u6
         let mut buf = [0u8; 8192];
         loop {
             let n = r.read(&mut buf).await.unwrap_or(0);
-            if n == 0 || muted.load(Ordering::SeqCst) || cw.write_all(&buf[..n]).await.is_err() {
+            if n == 0 || muted.load(Ordering::SeqCst) {
+                return;
+            }
+            if !quiet.silent.load(Ordering::SeqCst) && cw.write_all(&buf[..n]).await.is_err() {
                 return;
             }
         }

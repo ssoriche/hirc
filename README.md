@@ -21,6 +21,7 @@ debug builds, so later builds and `cargo run` stay fast.
 ignored.
 
 - `history_page_size` (hirc only, default 100): lines per page of history, never more than the server allows (its `CHATHISTORY` limit). `chathistory = false` turns server history off for that server.
+- `ping_time` and `ping_timeout` (as Halloy's, but hirc's defaults are 120 and 180): after `ping_time` seconds without a word from the server hirc pings it, and `ping_timeout` seconds after that it counts the connection as lost and reconnects. That's how a link that dies silently (a dropped Wi-Fi) is noticed.
 - `bouncer_client_id` (hirc only): this machine's name to IRCCloud's bouncer (`server = "bnc.irccloud.com"`). Keep `password` as IRCCloud gave it (`bnc:…`); hirc sends it as `bnc@<id>:…`, so IRCCloud replays what this client missed while it was away. That replay shows as history: no unread counts, no notifications. Use a different id on each machine. No spaces, `:` or `@`.
 
 ## History

@@ -28,7 +28,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 const SERVER_LIMIT: usize = 100;
 
 /// hirc as alice, through the relay at `port`.
-fn config(port: u16, channels: &[&str], page: Option<usize>) -> Config {
+fn config(port: u16, channels: &[&str], page: Option<usize>, ping: Option<u64>) -> Config {
     let mut config = Config::default();
     config.servers.insert(
         "test".into(),
@@ -39,6 +39,8 @@ fn config(port: u16, channels: &[&str], page: Option<usize>) -> Config {
             use_tls: false,
             channels: channels.iter().map(|c| c.to_string()).collect(),
             history_page_size: page,
+            ping_time: ping,
+            ping_timeout: ping,
             sasl: Some(Sasl::Plain { username: "alice".into(), password: None, password_file: None, password_command: Some("printf hunter22".into()) }),
             ..Server::default()
         },
@@ -93,6 +95,10 @@ struct T {
     connects: usize,
     joined: usize,
     sentinels: usize,
+    /// `ping_time` and `ping_timeout` for the next hirc, else the defaults.
+    ping: Option<u64>,
+    /// Why each connection went down, as hirc said.
+    drops: Vec<String>,
 }
 
 impl T {
@@ -133,13 +139,15 @@ impl T {
             connects: 0,
             joined: 0,
             sentinels: 0,
+            ping: None,
+            drops: Vec::new(),
         }
     }
 
     /// Starts hirc (a fresh one: nothing shown yet).
     fn spawn_hirc(&mut self, page: Option<usize>, cache: Option<PathBuf>) {
         let channels: Vec<&str> = self.channels.iter().map(String::as_str).collect();
-        let (tx, rx, flush) = hirc_core::conn::spawn(config(self.proxy.port, &channels, page), cache);
+        let (tx, rx, flush) = hirc_core::conn::spawn(config(self.proxy.port, &channels, page, self.ping), cache);
         self.tx = tx;
         self.rx = rx;
         self.flush = Some(flush);
@@ -171,7 +179,11 @@ impl T {
                 self.online = true;
                 self.connects += 1;
             }
-            Event::Status { status: ConnStatus::Disconnected { .. } | ConnStatus::Offline, .. } => self.online = false,
+            Event::Status { status: ConnStatus::Disconnected { reason, .. }, .. } => {
+                self.online = false;
+                self.drops.push(reason.clone());
+            }
+            Event::Status { status: ConnStatus::Offline, .. } => self.online = false,
             Event::Status { status: ConnStatus::Failed { reason }, .. } => panic!("hirc gave up: {reason}"),
             Event::Joined { .. } => self.joined += 1,
             Event::Filled { target, .. } => {
@@ -636,4 +648,29 @@ async fn a_reconnect_command_with_lines_in_flight_loses_nothing() {
     t.bob_sync().await;
     t.until("the reconnect", |t| t.connects >= 2).await;
     t.settle(&["#test"]).await;
+}
+
+// A link that goes dead with nothing closed (a dropped Wi-Fi, a sleeping
+// NAT): no end of file, no reset, just silence. hirc hears nothing, pings,
+// hears nothing back, gives up on its own, and fills the gap once the link
+// is back. One-second `ping_time` and `ping_timeout` keep it short.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_link_is_given_up_on_and_the_gap_filled() {
+    let mut t = T::prepare(&["#test"], false).await;
+    t.ping = Some(1);
+    t.spawn_hirc(None, None);
+    t.ready().await;
+    t.say("#test", "before the silence").await;
+    t.all_seen().await;
+    t.proxy.silence();
+    for i in 0..5 {
+        t.say("#test", &format!("unheard {i}")).await;
+    }
+    t.until("hirc to give up on the quiet link", |t| !t.online).await;
+    assert!(t.drops.iter().any(|r| r.contains("no reply from server")), "dropped for another reason: {:?}", t.drops);
+    // The server sees the connection end only now, as hirc hangs up.
+    t.bob.expect("QUIT").await;
+    t.restore().await;
+    t.settle(&["#test"]).await;
+    assert_eq!(t.connects, 2, "one reconnect, with no /reconnect");
 }

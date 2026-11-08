@@ -32,10 +32,21 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
-/// Send a PING after this long without hearing from the server...
-const IDLE_PING: Duration = Duration::from_secs(120);
-/// ...and give up on the connection after this long.
-const IDLE_DEAD: Duration = Duration::from_secs(300);
+/// Send a PING after this long without hearing from the server
+/// (`ping_time`)...
+const PING_TIME: Duration = Duration::from_secs(120);
+/// ...and give up on the connection this long after that (`ping_timeout`).
+const PING_TIMEOUT: Duration = Duration::from_secs(180);
+/// How often, at most, a quiet connection is looked at.
+const IDLE_CHECK: Duration = Duration::from_secs(30);
+
+/// When a quiet connection is pinged, and when it is given up on, by how
+/// long since the server last said anything; and how often to look.
+fn idle_limits(server: &Server) -> (Duration, Duration, Duration) {
+    let secs = |s: Option<u64>, default| s.filter(|&s| s > 0).map_or(default, Duration::from_secs);
+    let (ping, wait) = (secs(server.ping_time, PING_TIME), secs(server.ping_timeout, PING_TIMEOUT));
+    (ping, ping + wait, IDLE_CHECK.min(ping.min(wait) / 2))
+}
 
 trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
@@ -479,7 +490,8 @@ async fn connect_once(
     let mut outs = session.start();
     let mut last_rx = Instant::now();
     let mut pinged = false;
-    let mut tick = tokio::time::interval(Duration::from_secs(30));
+    let (idle_ping, idle_dead, check) = idle_limits(server);
+    let mut tick = tokio::time::interval(check);
     let end = async {
         loop {
             for out in resolve(&mut session, carry.cache.as_ref(), name, std::mem::take(&mut outs)) {
@@ -547,10 +559,10 @@ async fn connect_once(
                 },
                 _ = tick.tick() => {
                     let idle = last_rx.elapsed();
-                    if idle > IDLE_DEAD {
+                    if idle > idle_dead {
                         return Err("no reply from server".into());
                     }
-                    if idle > IDLE_PING && !pinged {
+                    if idle > idle_ping && !pinged {
                         pinged = true;
                         outs = vec![Output::Send(Message::new("PING", ["hirc"]))];
                     }
@@ -1035,6 +1047,17 @@ mod tests {
         assert!(rt.block_on(wait_reconnect(&mut rx, &mut book, &isupport)).is_some());
         assert_eq!(book.queries(), ["bob"]);
         assert!(book.get("+local").is_some());
+    }
+
+    #[test]
+    fn a_quiet_server_is_pinged_then_given_up_on_as_configured() {
+        let s = |ping_time, ping_timeout| idle_limits(&Server { ping_time, ping_timeout, ..Server::default() });
+        assert_eq!(s(None, None), (PING_TIME, PING_TIME + PING_TIMEOUT, IDLE_CHECK));
+        assert_eq!(s(Some(180), Some(20)), (Duration::from_secs(180), Duration::from_secs(200), Duration::from_secs(10)));
+        // Short ones are looked at often enough to keep to them.
+        assert_eq!(s(Some(1), Some(1)), (Duration::from_secs(1), Duration::from_secs(2), Duration::from_millis(500)));
+        // 0 is no setting.
+        assert_eq!(s(Some(0), Some(0)), s(None, None));
     }
 
     #[test]
