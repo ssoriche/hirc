@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod events;
+pub mod proxy;
 pub mod soju;
 pub mod znc;
 
