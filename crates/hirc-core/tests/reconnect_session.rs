@@ -870,7 +870,6 @@ fn a_cut_gap_page_followed_by_a_second_cut_still_loses_nothing() {
 }
 
 #[test]
-#[ignore = "BUG: a LATEST page cut off by the drop does not move the book, so the reconnect asks LATEST again and the lines between the cut and the new page are never fetched"]
 fn a_latest_page_cut_off_by_the_drop_leaves_no_hole_after_the_reconnect() {
     // Joined for the first time: the server's newest lines are m81..m100
     // (a page is 20). The drop cuts the batch after m82. By the time we are

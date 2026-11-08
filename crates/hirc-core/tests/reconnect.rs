@@ -563,7 +563,6 @@ async fn a_drop_between_the_pages_of_a_gap_resumes_from_the_first_page() {
 // asks for what is after the JOIN and the lines from before are never
 // fetched.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "BUG: a first connection cut before its LATEST page is answered never fetches the history from before its JOIN"]
 async fn a_drop_during_the_first_history_page_shows_each_line_once() {
     let mut t = T::prepare(&["#test"], false).await;
     t.burst("#test", &texts("old ", 6)).await;

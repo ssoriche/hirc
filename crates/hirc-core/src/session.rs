@@ -892,8 +892,10 @@ impl Session {
             self.queued.entry(key).or_insert_with(|| (target.to_owned(), kind));
             return;
         }
-        // Until the gap is filled, the newest held stays where it is.
-        if matches!(kind, Kind::After(_)) && !self.gaps.contains_key(&key) {
+        // Until the gap is filled, the newest held stays where it is. The
+        // latest page is a gap too: a live line (our own JOIN) must not
+        // pass for held history, or a drop before the page leaves a hole.
+        if matches!(kind, Kind::After(_) | Kind::Latest) && !self.gaps.contains_key(&key) {
             self.gaps.insert(key.clone(), None);
             // Live lines from here are past the hole until it is filled.
             self.tail.remove(&key);
@@ -1298,10 +1300,12 @@ impl Session {
         let fresh = page.items.saturating_sub(shown - page.lines.len());
         // Only the end the request moves: a page before can tie in time
         // with the newest held, and must not pull it back. Cut off, a page
-        // after still got the part next to what is held; any other got its
-        // far end only.
+        // after still got the part next to what is held, and the latest
+        // page (nothing held) its oldest run, which the next connection
+        // asks on from; a page before got its far end only.
         let (first, last) = match (&request.kind, cut) {
             (Kind::After(_), _) => (None, page.last.as_ref()),
+            (Kind::Latest, true) => (page.first.as_ref(), page.last.as_ref()),
             (_, true) => (None, None),
             (Kind::Before(_), false) => (page.first.as_ref(), None),
             (Kind::Latest | Kind::Targets { .. }, false) => (page.first.as_ref(), page.last.as_ref()),
@@ -1347,6 +1351,7 @@ impl Session {
             if !partial {
                 self.tail_unless_known(&request.target, newest_kept.clone());
             }
+            self.close_gap(&key, &request.target);
             out.push(self.filled(&request.target));
         }
         if let Kind::After(from) = &request.kind {
@@ -1430,6 +1435,8 @@ impl Session {
         }
         if let Kind::After(from) = &request.kind {
             self.tail_unless_known(&request.target, from.server_msgid().map(str::to_owned));
+        }
+        if matches!(request.kind, Kind::Latest | Kind::After(_)) {
             self.close_gap(&key, &request.target);
         }
         if matches!(request.kind, Kind::Latest | Kind::After(_)) {
