@@ -1256,7 +1256,10 @@ impl Session {
                 self.tail.insert(key, if behind { Tail::Behind(id) } else { Tail::At(id) });
             }
         }
-        out.push(self.history_event(target, lines, false));
+        let lines = self.unseen(target, lines);
+        if !lines.is_empty() {
+            out.push(self.history_event(target, lines, false));
+        }
     }
 
     /// A name from a TARGETS answer that we may open a query for: a nick
@@ -1727,8 +1730,21 @@ impl Session {
     }
 
     /// A page from before every line shown (`Event::History::older`).
+    /// Lines already shown live are left out (`unseen`).
     fn page_event(&self, target: &str, lines: Vec<Line>, start: bool, older: bool) -> Output {
+        let lines = self.unseen(target, lines);
         Output::Event(Event::History { network: self.network.clone(), target: self.dest(target), lines, start, older })
+    }
+
+    /// `lines` of history for `target`, less those already shown live by
+    /// msgid. A page asked for before a line came live (our JOIN's, or a
+    /// gap's), or asked again after a drop cut it off, can hold that line:
+    /// the server stored it before it read the request. ZNC's replay to a
+    /// `PLAY` it reads late does the same, under the same made-up msgid.
+    /// What is held and cached still moves by the whole page.
+    fn unseen(&self, target: &str, mut lines: Vec<Line>) -> Vec<Line> {
+        lines.retain(|l| !l.msgid.as_deref().is_some_and(|id| self.book.was_live(target, id)));
+        lines
     }
 
     /// Every live line shown widens the book, so the next request starts
@@ -1751,6 +1767,9 @@ impl Session {
                     }
                 }
                 None => self.book.note(name, query, std::slice::from_ref(line)),
+            }
+            if let Some(id) = &line.msgid {
+                self.book.shown_live(name, query, id);
             }
             self.keep_live(target, line);
         }
@@ -3058,6 +3077,40 @@ pub(crate) mod tests {
         assert_eq!(l1_kept(&mut s), Below::Breaks);
     }
 
+    /// bob's m2 at 10:02, live.
+    fn m2_live(s: &mut Session) {
+        let out = feed(s, "@time=2026-10-22T10:02:00.000Z;msgid=m2 :bob!b@h PRIVMSG #test :m2");
+        assert_eq!(lines(&out).len(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn a_line_shown_live_while_the_page_is_on_its_way_is_not_shown_again() {
+        // The server answers our JOIN's request after bob's line came live,
+        // and holds it by then: the page brings it again, same msgid.
+        for book in [Book::default(), held()] {
+            let mut s = historied("", 20, book);
+            let (_, label) = asked(&feed(&mut s, OUR_JOIN));
+            m2_live(&mut s);
+            let got = histories(&page(&mut s, Some(&label), "a", &["m1", "m2"]));
+            let [(_, l, _)] = got.as_slice() else { panic!("{got:?}") };
+            assert_eq!(texts(l), ["m1"]);
+        }
+    }
+
+    #[test]
+    fn a_line_shown_live_before_a_drop_is_not_shown_again_by_the_next_connection() {
+        // The drop came before the page did: the next connection asks for
+        // the same gap, and its page holds the line seen live.
+        let mut s = historied("", 20, Book::default());
+        asked(&feed(&mut s, OUR_JOIN));
+        m2_live(&mut s);
+        let mut s = historied("", 20, s.take_book());
+        let (_, label) = asked(&feed(&mut s, OUR_JOIN));
+        let got = histories(&page(&mut s, Some(&label), "b", &["m1", "m2"]));
+        let [(_, l, _)] = got.as_slice() else { panic!("{got:?}") };
+        assert_eq!(texts(l), ["m1"]);
+    }
+
     #[test]
     fn a_hole_while_the_latest_page_comes_is_not_filled_in_by_it() {
         let mut s = historied("", 2, Book::default()).keeping();
@@ -3499,6 +3552,24 @@ pub(crate) mod tests {
         assert_eq!((target, *start), (&Target::Channel("#test".into()), false));
         assert_eq!(texts(l), ["one", "two"]);
         assert!(l.iter().all(|l| l.replayed));
+    }
+
+    #[test]
+    fn a_line_shown_live_before_znc_answers_the_play_is_not_shown_again() {
+        // ZNC buffers bob's line before it gets to our PLAY: the replay
+        // brings it again, and its made-up msgid is the live copy's.
+        let (mut s, _) = zncd(Book::default());
+        let live = feed(&mut s, "@time=2026-10-22T12:00:01.500Z :bob!b@h PRIVMSG #test :before");
+        assert_eq!(lines(&live).len(), 1, "{live:?}");
+        feed(&mut s, ":znc.in BATCH +p znc.in/playback #test");
+        feed(&mut s, "@batch=p;time=2026-10-22T11:00:00.000Z :bob!b@h PRIVMSG #test :old");
+        feed(&mut s, "@batch=p;time=2026-10-22T12:00:01.500Z :bob!b@h PRIVMSG #test :before");
+        // The same words in another millisecond are another line.
+        feed(&mut s, "@batch=p;time=2026-10-22T12:00:01.530Z :bob!b@h PRIVMSG #test :before");
+        let got = histories(&feed(&mut s, ":znc.in BATCH -p"));
+        let [(_, l, _)] = got.as_slice() else { panic!("{got:?}") };
+        assert_eq!(texts(l), ["old", "before"]);
+        assert_eq!(l[1].time, "2026-10-22T12:00:01.530Z".parse::<DateTime<Utc>>().unwrap());
     }
 
     #[test]
@@ -4302,13 +4373,20 @@ pub(crate) mod tests {
         assert_eq!(l.msgid, None);
     }
 
+    /// ZNC's replay of `said` (one buffer, #test) to a session that never
+    /// saw it live: one that did leaves its copy out.
+    fn replayed_elsewhere(said: &str) -> Vec<Output> {
+        let (mut s, _) = zncd(Book::default());
+        feed(&mut s, ":irc.znc.in BATCH +p znc.in/playback #test");
+        feed(&mut s, &format!("@batch=p;{said}"));
+        feed(&mut s, ":irc.znc.in BATCH -p")
+    }
+
     #[test]
     fn a_live_line_and_its_replay_are_one_line() {
         let (mut s, _) = zncd(Book::default());
         let live = feed(&mut s, "@time=2026-10-22T10:01:00.123Z :bob!b@h PRIVMSG #test :same");
-        feed(&mut s, ":irc.znc.in BATCH +p znc.in/playback #test");
-        feed(&mut s, "@batch=p;time=2026-10-22T10:01:00.123Z :bob!b@h PRIVMSG #test :same");
-        let replay = feed(&mut s, ":irc.znc.in BATCH -p");
+        let replay = replayed_elsewhere("time=2026-10-22T10:01:00.123Z :bob!b@h PRIVMSG #test :same");
         assert_eq!(lines(&live)[0].1.msgid, histories(&replay)[0].1[0].msgid);
         let mut store = crate::store::Store::new(["net".to_owned()]);
         for o in live.into_iter().chain(replay) {
@@ -4330,8 +4408,13 @@ pub(crate) mod tests {
         let live: Vec<Output> = recorded(include_str!("../tests/data/znc-1.10.3-live.txt")).flat_map(|l| s.handle(Message::parse(l).unwrap(), at)).collect();
         let id = lines(&live)[0].1.msgid.clone().expect("an id");
         assert!(crate::msgid::is_made_up(&id), "the server's msgid was kept: {id}");
-        let replay: Vec<Output> =
-            recorded(include_str!("../tests/data/znc-1.10.3-play-after-live.txt")).flat_map(|l| s.handle(Message::parse(l).unwrap(), at)).collect();
+        let play = include_str!("../tests/data/znc-1.10.3-play-after-live.txt");
+        // Where it was shown live, its replayed copy is left out.
+        let again: Vec<Output> = recorded(play).flat_map(|l| s.handle(Message::parse(l).unwrap(), at)).collect();
+        assert!(histories(&again).iter().flat_map(|(_, l, _)| l).all(|l| l.text != "fact live"), "{again:?}");
+        // Elsewhere, the replayed copy has the live one's made-up id.
+        let (mut s, _) = zncd_at(&format!("{ZNC} echo-message"), Book::default(), at);
+        let replay: Vec<Output> = recorded(play).flat_map(|l| s.handle(Message::parse(l).unwrap(), at)).collect();
         let replayed: Vec<Line> = histories(&replay).into_iter().flat_map(|(_, l, _)| l).collect();
         assert!(replayed.iter().all(|l| l.msgid.as_deref().is_some_and(crate::msgid::is_made_up)), "{replayed:?}");
         assert_eq!(replayed.iter().find(|l| l.text == "fact live").and_then(|l| l.msgid.clone()), Some(id));
@@ -4366,6 +4449,12 @@ pub(crate) mod tests {
             let live = lines(&feed(&mut s, &format!("@{time} {said}")));
             let [(Target::Channel(_), live)] = live.as_slice() else { panic!("{said}: {live:?}") };
             assert_eq!(live.kind, kind, "{said}");
+            feed(&mut s, ":znc.in BATCH +p znc.in/playback #test");
+            feed(&mut s, &format!("@batch=p;{time} {said}"));
+            assert!(histories(&feed(&mut s, ":znc.in BATCH -p")).is_empty(), "{said}: shown again");
+            let (mut s, _) = zncd(Book::default());
+            feed(&mut s, OUR_JOIN);
+            feed(&mut s, "@time=2026-10-22T10:00:00.000Z :bob!b@h JOIN #test");
             feed(&mut s, ":znc.in BATCH +p znc.in/playback #test");
             feed(&mut s, &format!("@batch=p;{time} {said}"));
             let replay = histories(&feed(&mut s, ":znc.in BATCH -p"));

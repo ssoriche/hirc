@@ -7,7 +7,7 @@
 use crate::proto::Message;
 use crate::store::Line;
 use chrono::{DateTime, SecondsFormat, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// The cap (its group holds the ratified `chathistory` too).
 pub const CAP: &str = "draft/chathistory";
@@ -25,6 +25,9 @@ pub const DISCOVERY_DAYS: i64 = 7;
 /// TARGETS requests per connection at most: a full answer asks on from
 /// its last name, so a server always answering in full can't loop us.
 pub const MAX_TARGETS_PAGES: usize = 10;
+/// Live lines remembered per target (`Known::live`): far more than can
+/// come live while one page is on its way.
+pub const LIVE_KEPT: usize = 500;
 
 /// The page size: the configured one (else `DEFAULT_PAGE`), never more
 /// than the server's `CHATHISTORY` limit, and at least 1.
@@ -130,6 +133,10 @@ pub struct Known {
     pub query: bool,
     pub newest: Option<Anchor>,
     pub oldest: Option<Anchor>,
+    /// The msgids of the newest lines shown live (`LIVE_KEPT` at most).
+    /// A page or replay asked for before one came, or asked again after a
+    /// drop, can bring it once more: that copy is not shown.
+    pub live: VecDeque<String>,
 }
 
 /// Every target's `Known`, by lowercased name (ASCII case-insensitive, as
@@ -182,6 +189,20 @@ impl Book {
                 k.oldest = Some(Anchor::of(l));
             }
         }
+    }
+
+    /// A line with `msgid` was shown live for `name`.
+    pub fn shown_live(&mut self, name: &str, query: bool, msgid: &str) {
+        let k = self.entry(name, query);
+        if k.live.len() >= LIVE_KEPT {
+            k.live.pop_front();
+        }
+        k.live.push_back(msgid.to_owned());
+    }
+
+    /// Whether a line with `msgid` was shown live for `name`.
+    pub fn was_live(&self, name: &str, msgid: &str) -> bool {
+        self.get(name).is_some_and(|k| k.live.iter().any(|id| id == msgid))
     }
 
     /// A page's first item (a page before) or last item (a page after)
