@@ -1,7 +1,7 @@
 //! App state and the event loop. The network thread sends `Event`s; we
 //! apply them to the `Store` and redraw. Input goes back as `Command`s.
 
-use crate::input::{self, Note, Submit, TextInput, VimEvent, WantTab};
+use crate::input::{self, Note, PickerEvent, Submit, TextInput, VimEvent, WantTab};
 use crate::links;
 use crate::metrics::{Columns, Metrics, Shape};
 use crate::scroll::{self, Pos};
@@ -183,6 +183,8 @@ pub struct HircApp {
     replies: HashMap<(usize, usize), Reply>,
     /// The reactions used most, for the picker's quick row.
     recent: Recent,
+    /// The seq of the line the open react picker reacts to.
+    picking: Option<u64>,
     commands: UnboundedSender<Command>,
 }
 
@@ -253,6 +255,7 @@ impl HircApp {
         })
         .detach();
         cx.subscribe(&input, |this, _, ev: &VimEvent, cx| this.vim_effect(&ev.0, cx)).detach();
+        cx.subscribe(&input, |this, _, ev: &PickerEvent, cx| this.picked(ev.0.clone(), cx)).detach();
         let handle = input.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
         // The banner can be dismissed; keep what it said where errors go.
@@ -352,6 +355,7 @@ impl HircApp {
             replies: HashMap::new(),
             // Snapshot runs neither read nor write it, as with the layout.
             recent: if init.no_layout_file { Recent::default() } else { Recent::load(&reactions::path()) },
+            picking: None,
             commands: init.commands,
         }
     }
@@ -380,6 +384,7 @@ impl HircApp {
             self.selection = None;
             self.drag = None;
             self.mark = None;
+            self.close_picker(cx);
             self.flash = None;
             self.seek = None;
             let buf = &self.store.networks[n].buffers[b];
@@ -620,8 +625,12 @@ impl HircApp {
                 }
                 None
             }
-            // Task 9 (react).
-            Pick::React => None,
+            Pick::React => {
+                if let Some(seq) = self.mark {
+                    self.open_picker(seq, cx);
+                }
+                None
+            }
         };
         if let Some(ix) = to {
             self.mark = Some(self.store.networks[n].buffers[b].lines[ix].seq);
@@ -699,6 +708,37 @@ impl HircApp {
 
     fn not_found(&mut self, n: usize, b: usize) {
         self.local_note(n, b, "The line it replies to wasn't found in the history loaded".into());
+    }
+
+    /// Open the react picker over the input for the line `seq` of the
+    /// window on screen, with the most used reactions on its quick row.
+    fn open_picker(&mut self, seq: u64, cx: &mut Context<Self>) {
+        self.picking = Some(seq);
+        let quick = self.recent.top(8);
+        self.input.update(cx, |input, cx| input.open_picker(quick, cx));
+    }
+
+    /// Put the react picker away, if it is open.
+    fn close_picker(&mut self, cx: &mut Context<Self>) {
+        if self.picking.take().is_some() {
+            self.input.update(cx, |input, cx| {
+                input.picker = None;
+                cx.notify();
+            });
+        }
+    }
+
+    /// The picker picked `emoji` (or was closed): react with it to the
+    /// line it was opened for, if that is still in the window on screen.
+    fn picked(&mut self, emoji: Option<String>, cx: &mut Context<Self>) {
+        let seq = self.picking.take();
+        if let (Some(emoji), Some(seq), Some((n, b))) = (emoji, seq, self.selected)
+            && let Some(ix) = self.current().and_then(|(_, buf)| buf.lines.iter().position(|l| l.seq == seq))
+        {
+            self.react_to(n, b, ix, emoji, cx);
+        }
+        self.sync_mark(cx);
+        cx.notify();
     }
 
     /// Write a reply to line `ix` of the window on screen: the bar over the
@@ -1159,6 +1199,12 @@ impl HircApp {
     /// any selection away and may start a drag; two select the word under
     /// it, three its whole line. Focus stays in the input.
     fn press_text(&mut self, e: &MouseDownEvent, cx: &mut Context<Self>) {
+        // With the react picker open, a press only puts it away.
+        if self.picking.is_some() {
+            self.close_picker(cx);
+            cx.notify();
+            return;
+        }
         self.press.set(Some((f32::from(e.position.x), f32::from(e.position.y))));
         self.clicks.set(e.click_count);
         self.selection = None;
@@ -1171,6 +1217,25 @@ impl HircApp {
         if let (Some((seq, emoji)), Some((n, b))) = (chip, self.selected) {
             if let Some(ix) = self.current().and_then(|(_, buf)| buf.lines.iter().position(|l| l.seq == seq)) {
                 self.react_to(n, b, ix, emoji, cx);
+            }
+            cx.notify();
+            return;
+        }
+        // A line's buttons: react opens the picker for it, reply starts a
+        // reply to it.
+        let button = self.hits.borrow().iter().find_map(|(bounds, hit)| match hit {
+            Hit::React { .. } | Hit::Reply { .. } if bounds.contains(&e.position) => Some(hit.clone()),
+            _ => None,
+        });
+        if let Some(button) = button {
+            match button {
+                Hit::React { seq } => self.open_picker(seq, cx),
+                Hit::Reply { seq } => {
+                    if let Some(ix) = self.current().and_then(|(_, buf)| buf.lines.iter().position(|l| l.seq == seq)) {
+                        self.start_reply(ix, cx);
+                    }
+                }
+                _ => {}
             }
             cx.notify();
             return;
@@ -1228,7 +1293,7 @@ impl HircApp {
     /// A line context for copying: our nick, no colours.
     fn copy_context<'a>(&self, me: Option<&'a str>) -> buffer::Context<'a> {
         static EMPTY: std::sync::LazyLock<HashMap<String, usize>> = std::sync::LazyLock::new(HashMap::new);
-        buffer::Context { me, cols: self.cols, slots: &EMPTY, selected: None, parent: None, reactions: vec![], marked: false, flash: false }
+        buffer::Context { me, cols: self.cols, slots: &EMPTY, selected: None, parent: None, reactions: vec![], marked: false, flash: false, tags: false }
     }
 
     /// The selection, resolved against the shown buffer: its first and
@@ -1270,7 +1335,7 @@ impl HircApp {
                 let parent = line.reply_to.as_deref().map(|id| buf.lines.iter().rev().find(|l| l.msgid.as_deref() == Some(id)));
                 let reactions = line.msgid.as_deref().map(|id| buf.reactions(id)).unwrap_or_default();
                 let (marked, flash) = (self.mark == Some(line.seq), self.flash == Some(line.seq));
-                let cx = buffer::Context { me: net.nick.as_deref(), cols: self.cols, slots, selected, parent, reactions, marked, flash };
+                let cx = buffer::Context { me: net.nick.as_deref(), cols: self.cols, slots, selected, parent, reactions, marked, flash, tags: net.tags };
                 let line_el = buffer::line(self, window, line, &cx);
                 let server = buf.target == Target::Server;
                 match self.marker {

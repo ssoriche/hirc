@@ -300,6 +300,9 @@ pub struct Context<'a> {
     /// The line was just gone to (a reply followed to it): its row is
     /// lit for a moment.
     pub flash: bool,
+    /// The network carries message tags, so lines can be reacted and
+    /// replied to: reactable ones show their buttons on hover.
+    pub tags: bool,
 }
 
 /// Something in the message view a click acts on, where it was drawn this
@@ -307,22 +310,10 @@ pub struct Context<'a> {
 /// line's react or reply button.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hit {
-    Chip {
-        seq: u64,
-        emoji: String,
-    },
-    Quote {
-        seq: u64,
-    },
-    // The line's buttons, not drawn yet.
-    #[allow(dead_code)]
-    React {
-        seq: u64,
-    },
-    #[allow(dead_code)]
-    Reply {
-        seq: u64,
-    },
+    Chip { seq: u64, emoji: String },
+    Quote { seq: u64 },
+    React { seq: u64 },
+    Reply { seq: u64 },
 }
 
 /// The hit targets drawn this frame, and where (see `Hit`).
@@ -666,8 +657,10 @@ pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyEle
     // The line cursor's bar sits in the gutter, over nothing, so the row
     // keeps its place; a line just gone to wears the selection's fill.
     let bar = cx.marked.then(|| div().absolute().left_0().top_0().h(px(m.line)).text_color(p.tertiary).child("▌"));
+    let buttons = (cx.tags && hirc_core::store::reactable(line)).then(|| line_buttons(app, line.seq));
     let row = div()
         .relative()
+        .when(buttons.is_some(), |d| d.group(format!("line-{}", line.seq)))
         .flex()
         .w_full()
         .min_w(px(0.))
@@ -677,13 +670,44 @@ pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyEle
         .children(bar)
         .when(cols.time > 0, |d| d.child(div().flex_none().w(px(m.grid(cols.time))).whitespace_nowrap().text_color(time_color).child(time)))
         .child(nick_column(app, cols, prefix, cut.map(|full| (full, line.seq))))
-        .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).on_children_prepainted(move |_, _, _| push_spot(&spots, spot.clone())).child(text));
+        .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).on_children_prepainted(move |_, _, _| push_spot(&spots, spot.clone())).child(text))
+        .children(buttons);
     let quote = cx.parent.map(|parent| quote_row(app, line.seq, parent));
     let chips = (!cx.reactions.is_empty()).then(|| chip_row(app, line.seq, &cx.reactions, cx.me));
     if quote.is_none() && chips.is_none() {
         return row.into_any_element();
     }
     div().flex().flex_col().w_full().children(quote).child(row).children(chips).into_any_element()
+}
+
+/// A line's react and reply buttons, `😀+` and `↩`, on its first row at
+/// the right end, on one strip over the text (so it never moves; the
+/// strip hides what it covers) and shown only while the row is hovered.
+/// Where each was drawn is a `Hit::React` and a `Hit::Reply`.
+fn line_buttons(app: &HircApp, seq: u64) -> gpui::Div {
+    let p = &app.palette;
+    let m = &app.metrics;
+    let button =
+        |label: &'static str| div().flex().items_center().flex_none().h(px(m.line)).px(px(m.cell / 2.)).text_color(p.text_dim).whitespace_nowrap().child(label);
+    let hits = app.hits.clone();
+    div()
+        .absolute()
+        .top_0()
+        .right(px(m.gutter))
+        .h(px(m.line))
+        .flex()
+        .rounded_sm()
+        .bg(p.title_bg)
+        .opacity(0.)
+        .group_hover(format!("line-{seq}"), |s| s.opacity(1.))
+        .on_children_prepainted(move |bounds, _, _| {
+            if let [react, reply] = bounds.as_slice() {
+                push_hit(&hits, *react, Hit::React { seq });
+                push_hit(&hits, *reply, Hit::Reply { seq });
+            }
+        })
+        .child(button("😀+"))
+        .child(button("↩"))
 }
 
 /// A row on the grid under the time and nick columns, which it leaves

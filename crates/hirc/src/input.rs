@@ -21,6 +21,7 @@ use gpui::{
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, deferred, div, fill, point, prelude::*, px, relative, size,
 };
 use hirc_core::command;
+use hirc_core::reactions::{PickKey, Picked, Picker};
 use unicode_segmentation::*;
 
 actions!(text_input, [Backspace, Delete, Left, Right, SelectLeft, SelectRight, SelectAll, Home, End, ShowCharacterPalette, Paste, Cut, Copy, Enter, Newline,]);
@@ -80,10 +81,16 @@ pub struct TextInput {
     /// The `:` of a popup closed with Esc, so it stays closed until that
     /// `:name` is left.
     dismissed: Option<usize>,
+    /// The react picker over the input, while it is open: every key goes
+    /// to it, none to the text.
+    pub picker: Option<Picker>,
 }
 
 impl TextInput {
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);
         } else {
@@ -92,6 +99,9 @@ impl TextInput {
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.next_boundary(self.selected_range.end), cx);
         } else {
@@ -100,27 +110,46 @@ impl TextInput {
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
         self.select_to(self.previous_boundary(self.cursor_offset()), cx);
     }
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx)
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
         self.move_to(0, cx);
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
         self.move_to(self.content.len(), cx);
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            self.pick(PickKey::Backspace, cx);
+            return;
+        }
         // Key bindings run before `capture_key_down`, so route through vim here.
         if self.vim_key(named_key(Named::Backspace), cx) {
             return;
@@ -132,7 +161,7 @@ impl TextInput {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        if self.vim.mode == Mode::Normal {
+        if self.vim.mode == Mode::Normal || self.picker.is_some() {
             return;
         }
         if self.selected_range.is_empty() {
@@ -180,12 +209,18 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
         if !self.selected_range.is_empty() {
             let sel = clamp_range(&self.content, &self.selected_range);
             cx.write_to_clipboard(ClipboardItem::new_string(self.content[sel].to_string()));
         }
     }
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
         if !self.selected_range.is_empty() {
             let sel = clamp_range(&self.content, &self.selected_range);
             cx.write_to_clipboard(ClipboardItem::new_string(self.content[sel].to_string()));
@@ -400,8 +435,9 @@ impl EntityInputHandler for TextInput {
     }
 
     fn replace_text_in_range(&mut self, range_utf16: Option<Range<usize>>, new_text: &str, _: &mut Window, cx: &mut Context<Self>) {
-        // Normal mode never inserts text.
-        if self.vim.mode == Mode::Normal {
+        // Normal mode never inserts text, nor does anything while the
+        // picker has the keys (the IME included).
+        if self.vim.mode == Mode::Normal || self.picker.is_some() {
             return;
         }
         let range =
@@ -424,7 +460,8 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.vim.mode == Mode::Normal {
+        // As `replace_text_in_range`: no composing while the picker has the keys.
+        if self.vim.mode == Mode::Normal || self.picker.is_some() {
             return;
         }
         let range =
@@ -929,6 +966,7 @@ impl Render for TextInput {
             Note::Confirm(text) => (text.clone(), p.map(|p| p.hint)),
         });
         let popup = self.popup.clone().zip(p.cloned());
+        let picker = self.picker.as_ref().zip(p).map(|(picker, p)| self.picker_box(picker, p));
         // The status (a marked line) reads on from the mode label, on the
         // text's row; the text follows it.
         let status = self
@@ -1007,6 +1045,45 @@ impl Render for TextInput {
                     .with_priority(1),
                 )
             })
+            .when_some(picker, |d, picker| d.child(deferred(picker).with_priority(1)))
+    }
+}
+
+impl TextInput {
+    /// The react picker, above the input on the text column as the emoji
+    /// popup is: `react`, the quick row (each emoji over its digit), the
+    /// search line, then what the search found. Every row is a line high.
+    fn picker_box(&self, picker: &Picker, p: &Palette) -> gpui::Div {
+        let cell = self.metrics.map_or(px(8.), |m| px(m.cell));
+        let line = self.metrics.map_or(px(16.), |m| px(m.line));
+        let searching = !picker.query.is_empty();
+        let quick = picker.quick.iter().enumerate().map(|(i, emoji)| {
+            let digit = div().h(line).text_color(p.quiet).child(format!("{}", i + 1));
+            let it = div().flex().flex_col().items_center().min_w(cell * 3.).child(div().h(line).child(emoji.clone())).child(digit);
+            if !searching && i == picker.selected { it.bg(p.selected).text_color(p.selected_text) } else { it.text_color(p.text) }
+        });
+        let query = format!(":{}█", picker.query.trim_start_matches(':'));
+        let rows = picker.rows.iter().enumerate().map(|(i, (emoji, name))| {
+            let row = div().flex().h(line).gap(cell).px(cell).child(*emoji).child(div().text_color(p.text_dim).child(format!(":{name}:")));
+            if searching && i == picker.selected { row.bg(p.selected).text_color(p.selected_text) } else { row.text_color(p.text) }
+        });
+        div()
+            .absolute()
+            .bottom_full()
+            .left(px(self.column))
+            .mb(px(4.))
+            .min_w(px(200.))
+            .bg(p.input_bg)
+            .border_1()
+            .border_color(p.border)
+            .rounded_sm()
+            .py(px(2.))
+            .flex()
+            .flex_col()
+            .child(div().h(line).px(cell).text_color(p.quiet).child("react"))
+            .child(div().flex().px(cell).children(quick))
+            .child(div().h(line).px(cell).text_color(p.text).child(query))
+            .children(rows)
     }
 }
 
@@ -1046,6 +1123,7 @@ impl TextInput {
             cycle: None,
             popup: None,
             dismissed: None,
+            picker: None,
         }
     }
 
@@ -1062,6 +1140,10 @@ impl TextInput {
     }
 
     fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            self.pick(PickKey::Enter, cx);
+            return;
+        }
         // With the popup open, Enter takes the chosen emoji instead.
         if let Some(p) = self.popup.take() {
             let (text, cursor) = p.accept(&self.content, self.cursor_offset());
@@ -1110,6 +1192,31 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Open the react picker over the input with `quick` on its quick row.
+    /// Keys go to it until an emoji is picked or it is closed, which it
+    /// says with a `PickerEvent`.
+    pub fn open_picker(&mut self, quick: Vec<String>, cx: &mut Context<Self>) {
+        self.picker = Some(Picker::new(quick));
+        cx.notify();
+    }
+
+    /// A key for the open picker; a pick or a close puts it away.
+    fn pick(&mut self, key: PickKey, cx: &mut Context<Self>) {
+        let Some(picker) = self.picker.as_mut() else { return };
+        match picker.key(key) {
+            Picked::Stay => {}
+            Picked::Emoji(emoji) => {
+                self.picker = None;
+                cx.emit(PickerEvent(Some(emoji)));
+            }
+            Picked::Close => {
+                self.picker = None;
+                cx.emit(PickerEvent(None));
+            }
+        }
+        cx.notify();
+    }
+
     /// What was submitted went: start a fresh line.
     pub fn sent(&mut self, cx: &mut Context<Self>) {
         self.reset();
@@ -1130,6 +1237,14 @@ impl TextInput {
         let ks = &ev.keystroke;
         // Enter and Backspace arrive as actions; alt/cmd chords are the app's.
         if ks.modifiers.alt || ks.modifiers.platform || ks.modifiers.function || matches!(ks.key.as_str(), "enter" | "backspace") {
+            return;
+        }
+        // With the picker open, every key is its own.
+        if self.picker.is_some() {
+            if let Some(key) = pick_key(ks.key.as_str(), ks.key_char.as_deref(), ks.modifiers.shift, ks.modifiers.control) {
+                self.pick(key, cx);
+            }
+            cx.stop_propagation();
             return;
         }
         // With the popup open, Tab and the arrows choose and Esc closes it.
@@ -1221,6 +1336,24 @@ fn to_key(key: &str, key_char: Option<&str>, shift: bool, ctrl: bool) -> Option<
     Some(Key { ch: Some(ch), named: None, ctrl })
 }
 
+/// A gpui keystroke as the react picker takes it. `None` for keys it
+/// ignores (other ctrl chords, keys that type nothing).
+fn pick_key(key: &str, key_char: Option<&str>, shift: bool, ctrl: bool) -> Option<PickKey> {
+    match (key, ctrl) {
+        ("escape", _) => Some(PickKey::Escape),
+        ("enter", _) => Some(PickKey::Enter),
+        ("backspace", _) => Some(PickKey::Backspace),
+        ("tab", false) if shift => Some(PickKey::Prev),
+        ("tab", false) | ("down", false) | ("n", true) => Some(PickKey::Next),
+        ("up", false) | ("p", true) => Some(PickKey::Prev),
+        (_, true) => None,
+        _ => {
+            let mut it = key_char?.chars();
+            it.next().filter(|_| it.next().is_none()).map(PickKey::Char)
+        }
+    }
+}
+
 fn named_key(n: Named) -> Key {
     Key { ch: None, named: Some(n), ctrl: false }
 }
@@ -1247,6 +1380,11 @@ pub struct Submit {
 }
 
 impl EventEmitter<Submit> for TextInput {}
+
+/// The react picker picked an emoji (`Some`) or was closed (`None`).
+pub struct PickerEvent(pub Option<String>);
+
+impl EventEmitter<PickerEvent> for TextInput {}
 
 /// Keys for every `TextInput`. Call once at startup.
 pub fn bind_keys(cx: &mut App) {
@@ -1401,6 +1539,24 @@ fn scroll_for_cursor(prev: f32, cursor_x: f32, line_width: f32, view: f32, margi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_reach_the_picker_as_its_own() {
+        assert_eq!(pick_key("escape", None, false, false), Some(PickKey::Escape));
+        assert_eq!(pick_key("enter", None, false, false), Some(PickKey::Enter));
+        assert_eq!(pick_key("backspace", None, false, false), Some(PickKey::Backspace));
+        for (key, ctrl) in [("tab", false), ("down", false), ("n", true)] {
+            assert_eq!(pick_key(key, None, false, ctrl), Some(PickKey::Next), "{key}");
+        }
+        for (key, shift, ctrl) in [("tab", true, false), ("up", false, false), ("p", false, true)] {
+            assert_eq!(pick_key(key, None, shift, ctrl), Some(PickKey::Prev), "{key}");
+        }
+        assert_eq!(pick_key("2", Some("2"), false, false), Some(PickKey::Char('2')));
+        assert_eq!(pick_key(";", Some(":"), true, false), Some(PickKey::Char(':')));
+        // Other ctrl chords, and keys that type nothing, do nothing there.
+        assert_eq!(pick_key("a", Some("\u{1}"), false, true), None);
+        assert_eq!(pick_key("left", None, false, false), None);
+    }
 
     #[test]
     fn a_parked_draft_gives_way_from_the_front() {
