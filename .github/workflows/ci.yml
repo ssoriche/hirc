@@ -50,9 +50,12 @@ jobs:
 
   ergo:
     # The bouncer suites need ZNC 1.10.3 with its playback module and soju
-    # 0.11.1, which hirc's flox environment pins for Apple Silicon.
+    # 0.11.1, which hirc's flox environment pins (Apple Silicon and x86_64
+    # Linux). Ubuntu, because hosted Apple Silicon runners are often short.
     name: Ergo and bouncer suites
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
+    env:
+      RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
       - uses: flox/install-flox-action@v2
