@@ -201,7 +201,8 @@ fn seed(name: &str, server: &Server, cache: &Shared, book: &mut Book) -> Vec<Eve
         // apart by order only, and the last is the newest.
         book.reach(&target, query, lines.first().map(Anchor::of).as_ref(), lines.last().map(Anchor::of).as_ref());
         let target = if query { Target::Query(target) } else { Target::Channel(target) };
-        let page = Event::History { network: name.to_owned(), target, lines, start: false, older: false };
+        let sent = lines.len();
+        let page = Event::History { network: name.to_owned(), target, lines, start: false, older: false, sent };
         let reactions = cached_reactions(cache, &page);
         out.push(page);
         out.extend(reactions);
@@ -638,7 +639,7 @@ async fn connect_once(
 mod tests {
     use super::*;
     use crate::cache::{Above, Below, Cache, Entry};
-    use crate::session::tests::{asked, feed, historied, histories, irccloud, now, sent, zncd};
+    use crate::session::tests::{asked, feed, historied, histories, irccloud, now, played, sent, zncd};
 
     fn line(id: &str, secs: i64) -> Line {
         Line {
@@ -1170,7 +1171,8 @@ mod tests {
         rusqlite::Connection::open(dir.path().join("history.db")).unwrap().query_row("SELECT brk FROM lines WHERE text = ?1", [text], |r| r.get(0)).unwrap()
     }
 
-    /// Connected through ZNC and keeping a cache, `book` carried in.
+    /// Connected through ZNC and keeping a cache, `book` carried in. Its
+    /// PLAY is answered by the test: the replay, then `played` (ZNC's PONG).
     fn znc_keeping(book: Book) -> (Session, Vec<Output>) {
         let (s, out) = zncd(book);
         (s.keeping(), out)
@@ -1181,6 +1183,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Shared::open(&dir.path().join("history.db")).unwrap();
         let (mut s, _) = znc_keeping(Book::default());
+        played(&mut s);
         znc_line(&mut s, None, "seen 1", 1);
         znc_line(&mut s, None, "seen 2", 2);
         assert!(written(&mut s, &cache));
@@ -1195,6 +1198,7 @@ mod tests {
         // follows on from the one kept before it.
         znc_replay(&mut s, &[("away 2", 4)]);
         znc_replay(&mut s, &[("away 3", 5)]);
+        played(&mut s);
         assert!(written(&mut s, &cache));
         assert!(!brk_of(&dir, "away 2"));
         assert!(!brk_of(&dir, "away 3"));
@@ -1208,12 +1212,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Shared::open(&dir.path().join("history.db")).unwrap();
         let (mut s, _) = znc_keeping(Book::default());
+        played(&mut s);
         for t in ["seen 1", "seen 2", "seen 3"] {
             znc_line(&mut s, None, t, 1);
         }
         assert!(written(&mut s, &cache));
         let (mut s, _) = znc_keeping(s.take_book());
         znc_replay(&mut s, &[("away 4", 1), ("away 5", 1), ("away 6", 1), ("away 7", 1), ("away 8", 1)]);
+        played(&mut s);
         assert!(written(&mut s, &cache));
         cache.write_history("net", false);
         assert!(cache.flush());
@@ -1224,6 +1230,7 @@ mod tests {
             store.apply(e);
         }
         let (mut s, _) = znc_keeping(book);
+        played(&mut s);
         for _ in 0..4 {
             for o in older_of(&mut s, &cache, "#test") {
                 if let Output::Event(e) = o {
@@ -1241,12 +1248,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Shared::open(&dir.path().join("history.db")).unwrap();
         let (mut s, _) = znc_keeping(Book::default());
+        played(&mut s);
         znc_line(&mut s, None, "seen 1", 1);
         znc_line(&mut s, None, "seen 2", 2);
         assert!(written(&mut s, &cache));
         // ZNC's buffer ran out while we were away: its replay starts later.
         let (mut s, _) = znc_keeping(s.take_book());
         znc_replay(&mut s, &[("away 5", 10), ("away 6", 11)]);
+        played(&mut s);
         assert!(written(&mut s, &cache));
         assert!(brk_of(&dir, "away 5"));
         assert!(!brk_of(&dir, "away 6"));
@@ -1265,6 +1274,7 @@ mod tests {
             .collect();
         assert_eq!(seeded, [vec!["away 5".to_owned(), "away 6".to_owned()]]);
         let (mut s, _) = znc_keeping(book);
+        played(&mut s);
         assert_eq!(got(&older_of(&mut s, &cache, "#test")), [(vec!["seen 1".to_owned(), "seen 2".to_owned()], false), (vec![], true)]);
     }
 

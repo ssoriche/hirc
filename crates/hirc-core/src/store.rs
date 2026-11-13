@@ -698,7 +698,7 @@ impl Store {
                     None => Applied::Nothing,
                 }
             }
-            Event::History { network, target, lines, start, older } => {
+            Event::History { network, target, lines, start, older, .. } => {
                 let n = self.network_ix(&network);
                 let b = self.buffer_ix(n, &target);
                 let net = &mut self.networks[n];
@@ -849,7 +849,7 @@ mod tests {
         let chan = Target::Channel("#a".into());
         let made_up = |l: Line| Line { msgid: Some(crate::msgid::made_up(&chan, &l)), ..l };
         let mut s = Store::new(["net".to_string()]);
-        let page = |lines: Vec<Line>| Event::History { network: "net".into(), target: chan.clone(), lines, start: false, older: false };
+        let page = |lines: Vec<Line>| Event::History { network: "net".into(), target: chan.clone(), lines, start: false, older: false, sent: 0 };
         s.apply(page(vec![made_up(line(0, 1, None, "one")), made_up(line(0, 2, None, "two"))]));
         s.apply(page(vec![line(0, 1, Some("real1"), "one"), line(0, 2, Some("real2"), "two"), line(0, 3, Some("real3"), "three")]));
         s.apply(page(vec![made_up(line(0, 2, None, "two")), made_up(line(0, 3, None, "three")), made_up(line(0, 4, None, "four"))]));
@@ -1065,7 +1065,7 @@ mod tests {
     }
 
     fn page(target: &str, lines: Vec<Line>, start: bool) -> Event {
-        Event::History { network: "net".into(), target: Target::Channel(target.into()), lines, start, older: false }
+        Event::History { network: "net".into(), target: Target::Channel(target.into()), lines, start, older: false, sent: 0 }
     }
 
     #[test]
@@ -1172,7 +1172,7 @@ mod tests {
     }
 
     fn older_page(target: &str, lines: Vec<Line>) -> Event {
-        Event::History { network: "net".into(), target: Target::Channel(target.into()), lines, start: false, older: true }
+        Event::History { network: "net".into(), target: Target::Channel(target.into()), lines, start: false, older: true, sent: 0 }
     }
 
     /// A millisecond can hold many lines (a netsplit's QUITs, a bot, a

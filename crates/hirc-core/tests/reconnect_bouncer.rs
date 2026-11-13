@@ -8,8 +8,10 @@
 //! once, in order, in the store and among the events (live or history),
 //! and nothing seen before a drop came again. One allowance, for ZNC
 //! only: `PLAY` takes whole seconds, so ZNC sends again the lines from
-//! the second of the newest line held (`playback::since`). Those may come
-//! once more as history, and the store collapses them by msgid.
+//! the second of the newest line held (`playback::since`). A re-sent line
+//! that first came live is left out by the core; one that first came as
+//! history (the cut's second) may come once more as history, and the
+//! store collapses it by msgid.
 
 #![cfg(feature = "bouncer-tests")]
 
@@ -17,6 +19,7 @@ mod common;
 
 use chrono::{DateTime, Utc};
 use common::events::{net, next_matching, said_in};
+use common::proxy::Proxy as Relay;
 use common::soju::{self, Soju};
 use common::znc::{self, Znc};
 use common::{Ergo, Raw, register, wait_in_channel};
@@ -578,10 +581,9 @@ async fn upstream_drops(kind: Kind) {
     let back = bob.expect(" JOIN ").await;
     assert!(back.contains(":alice!"), "{back}");
     // hirc sees the rejoin and asks for the channel's latest page. A line
-    // that lands while that page is on its way comes twice as an event
-    // (live, and in the page; the store keeps one by msgid), which is a
-    // race of its own, not the drop's. Let the page come first. No event
-    // marks it, so a short sleep.
+    // that lands while that page is on its way is a race of its own, not
+    // the drop's (test 11). Let the page come first. No event marks it,
+    // so a short sleep.
     run.settle().await;
     // Lines after the upstream is back, while hirc never detached.
     say(&mut bob, "#test", &["after 1", "after 2"]).await;
@@ -805,4 +807,39 @@ async fn znc_a_restart_with_buffers_last_seen_at_different_times_loses_nothing()
 #[tokio::test(flavor = "multi_thread")]
 async fn soju_a_restart_with_buffers_last_seen_at_different_times_loses_nothing() {
     restart_two_buffers(Kind::Soju).await;
+}
+
+// 11. A line that comes live while our first ask for history (soju's
+// LATEST, ZNC's PLAY) is on its way: the bouncer holds the line by the
+// time it reads the ask, so its answer brings the line again. A slow
+// runner meets this unforced; the relay makes it certain.
+
+async fn live_before_the_answer(kind: Kind) {
+    let mut rig = Rig::start(kind).await;
+    let relay = Relay::start(rig.bouncer_port()).await;
+    rig.port = relay.port;
+    let mut bob = join(&rig.ergo, "bob", &["#test"]).await;
+    let hold = relay.hold_on(match kind {
+        Kind::Znc => "PRIVMSG *playback :PLAY",
+        Kind::Soju => "CHATHISTORY LATEST #test",
+    });
+    let mut run = Run::start(&rig);
+    hold.reached().await;
+    say(&mut bob, "#test", &["early"]).await;
+    run.gets("#test", &["early"]).await;
+    rig.holds("#test", "early").await;
+    hold.release();
+    say(&mut bob, "#test", &["after"]).await;
+    run.gets("#test", &["after"]).await;
+    run.check(kind, &chan("#test"), &["early", "after"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn znc_a_line_live_before_the_play_is_answered_comes_once() {
+    live_before_the_answer(Kind::Znc).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn soju_a_line_live_before_the_latest_page_comes_once() {
+    live_before_the_answer(Kind::Soju).await;
 }

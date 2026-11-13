@@ -1,4 +1,3 @@
-# Flox development environment: `flox activate`, then `cargo run --release`.
 schema-version = "1.14.0"
 
 [install]
@@ -25,15 +24,15 @@ openssl.pkg-path = "openssl"
 # Bouncers for the bouncer tests (crates/hirc-core/tests/bouncer.rs).
 znc.pkg-path = "znc"
 znc.version = "1.10.3"
-znc.systems = ["aarch64-darwin"]
+znc.systems = ["aarch64-darwin", "x86_64-linux"]
 znc.pkg-group = "bouncers"
 zncModules-playback.pkg-path = "zncModules.playback"
-zncModules-playback.systems = ["aarch64-darwin"]
+zncModules-playback.systems = ["aarch64-darwin", "x86_64-linux"]
 zncModules-playback.pkg-group = "bouncers"
 soju.pkg-path = "soju"
 soju.version = "0.11.1"
-soju.systems = ["aarch64-darwin"]
+soju.systems = ["aarch64-darwin", "x86_64-linux"]
 soju.pkg-group = "bouncers"
 
 [options]
-systems = ["aarch64-darwin", "x86_64-darwin"]
+systems = ["aarch64-darwin", "x86_64-darwin", "x86_64-linux"]

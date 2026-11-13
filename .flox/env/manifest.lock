@@ -49,7 +49,8 @@
         "pkg-group": "bouncers",
         "version": "0.11.1",
         "systems": [
-          "aarch64-darwin"
+          "aarch64-darwin",
+          "x86_64-linux"
         ]
       },
       "znc": {
@@ -57,25 +58,202 @@
         "pkg-group": "bouncers",
         "version": "1.10.3",
         "systems": [
-          "aarch64-darwin"
+          "aarch64-darwin",
+          "x86_64-linux"
         ]
       },
       "zncModules-playback": {
         "pkg-path": "zncModules.playback",
         "pkg-group": "bouncers",
         "systems": [
-          "aarch64-darwin"
+          "aarch64-darwin",
+          "x86_64-linux"
         ]
       }
     },
     "options": {
       "systems": [
         "aarch64-darwin",
-        "x86_64-darwin"
+        "x86_64-darwin",
+        "x86_64-linux"
       ]
     }
   },
   "packages": [
+    {
+      "attr_path": "soju",
+      "broken": false,
+      "derivation": "/nix/store/2b938fa79dvacw2ndwg95brml7z7b5d4-soju-0.11.1.drv",
+      "description": "User-friendly IRC bouncer",
+      "install_id": "soju",
+      "license": "AGPL-3.0-only",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+      "name": "soju-0.11.1",
+      "pname": "soju",
+      "rev": "f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+      "rev_count": 1108983,
+      "rev_date": "2026-11-05T10:58:29Z",
+      "scrape_date": "2026-11-08T05:45:38.470734Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.11.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/2ik7ifhc4x4p014w24cxb1srff0bf0f1-soju-0.11.1"
+      },
+      "system": "aarch64-darwin",
+      "group": "bouncers",
+      "priority": 5
+    },
+    {
+      "attr_path": "soju",
+      "broken": false,
+      "derivation": "/nix/store/j52cx46zlg8c8l0ikxsz6w0nlwdkvry6-soju-0.11.1.drv",
+      "description": "User-friendly IRC bouncer",
+      "install_id": "soju",
+      "license": "AGPL-3.0-only",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+      "name": "soju-0.11.1",
+      "pname": "soju",
+      "rev": "f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+      "rev_count": 1108983,
+      "rev_date": "2026-11-05T10:58:29Z",
+      "scrape_date": "2026-11-08T06:37:45.637373Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.11.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/05w2wn2423md83k2ry7gxnd0a5va8s4v-soju-0.11.1"
+      },
+      "system": "x86_64-linux",
+      "group": "bouncers",
+      "priority": 5
+    },
+    {
+      "attr_path": "znc",
+      "broken": false,
+      "derivation": "/nix/store/fkvxdvbqnqhg1110ka8paz2jf41yz6x0-znc-1.10.3.drv",
+      "description": "Advanced IRC bouncer",
+      "install_id": "znc",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+      "name": "znc-1.10.3",
+      "pname": "znc",
+      "rev": "f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+      "rev_count": 1108983,
+      "rev_date": "2026-11-05T10:58:29Z",
+      "scrape_date": "2026-11-08T05:45:38.559520Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.10.3",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/a6p28hmnkjj188g33swj7ack3vr2c9wf-znc-1.10.3"
+      },
+      "system": "aarch64-darwin",
+      "group": "bouncers",
+      "priority": 5
+    },
+    {
+      "attr_path": "znc",
+      "broken": false,
+      "derivation": "/nix/store/6c348c5jqyjh5klbllzzdkx6hsiiph5a-znc-1.10.3.drv",
+      "description": "Advanced IRC bouncer",
+      "install_id": "znc",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+      "name": "znc-1.10.3",
+      "pname": "znc",
+      "rev": "f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+      "rev_count": 1108983,
+      "rev_date": "2026-11-05T10:58:29Z",
+      "scrape_date": "2026-11-08T06:37:45.730173Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.10.3",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/zv3am0zjr84m5sba3dlski6fh7lk9xmz-znc-1.10.3"
+      },
+      "system": "x86_64-linux",
+      "group": "bouncers",
+      "priority": 5
+    },
+    {
+      "attr_path": "zncModules.playback",
+      "broken": false,
+      "derivation": "/nix/store/n578hxyqp15916svx7gyccgs4r23c9yy-znc-playback-0-unstable-2020-05-10.drv",
+      "description": "Advanced playback module for ZNC",
+      "install_id": "zncModules-playback",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+      "name": "znc-playback-0-unstable-2020-05-10",
+      "pname": "playback",
+      "rev": "f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+      "rev_count": 1108983,
+      "rev_date": "2026-11-05T10:58:29Z",
+      "scrape_date": "2026-11-08T05:45:38.559542Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2020-05-10",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/zz166cn8zdr851zzyvm9cgxy02hc55xj-znc-playback-0-unstable-2020-05-10"
+      },
+      "system": "aarch64-darwin",
+      "group": "bouncers",
+      "priority": 5
+    },
+    {
+      "attr_path": "zncModules.playback",
+      "broken": false,
+      "derivation": "/nix/store/x1gmmk99dvp0a73krw4zg14hp3idlrrr-znc-playback-0-unstable-2020-05-10.drv",
+      "description": "Advanced playback module for ZNC",
+      "install_id": "zncModules-playback",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+      "name": "znc-playback-0-unstable-2020-05-10",
+      "pname": "playback",
+      "rev": "f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+      "rev_count": 1108983,
+      "rev_date": "2026-11-05T10:58:29Z",
+      "scrape_date": "2026-11-08T06:37:45.730198Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2020-05-10",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/nv10nzl04fqqva32sz15i1971wlmsl7x-znc-playback-0-unstable-2020-05-10"
+      },
+      "system": "x86_64-linux",
+      "group": "bouncers",
+      "priority": 5
+    },
     {
       "attr_path": "rust-analyzer",
       "broken": false,
@@ -133,6 +311,36 @@
         "out": "/nix/store/yif1payz0g0x4r9c1yphwhnyy5av0cyg-rust-analyzer-2026-06-15"
       },
       "system": "x86_64-darwin",
+      "group": "rust-analyzer",
+      "priority": 5
+    },
+    {
+      "attr_path": "rust-analyzer",
+      "broken": false,
+      "derivation": "/nix/store/ig23z7rqacvcvbjfjsg7kggin55an14j-rust-analyzer-2026-06-15.drv",
+      "description": "Language server for the Rust language",
+      "install_id": "rust-analyzer",
+      "license": "[ MIT, Apache-2.0 ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "rust-analyzer-2026-06-15",
+      "pname": "rust-analyzer",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T04:42:43.432988Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2026-06-15",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/01fkgf8bhdkncpi621mfcb51xbqqm5kz-rust-analyzer-2026-06-15"
+      },
+      "system": "x86_64-linux",
       "group": "rust-analyzer",
       "priority": 5
     },
@@ -200,6 +408,38 @@
       "priority": 5
     },
     {
+      "attr_path": "cargo",
+      "broken": false,
+      "derivation": "/nix/store/36gfn3aq76gz94brbxyfw35w3fsv570m-cargo-1.95.0.drv",
+      "description": "Downloads your Rust project's dependencies and builds your project",
+      "install_id": "cargo",
+      "license": "[ MIT, Apache-2.0 ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "cargo-1.95.0",
+      "pname": "cargo",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T04:40:24.174359Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.95.0",
+      "outputs_to_install": [
+        "out",
+        "out",
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/6gcrqjdzbx71bavmmrqpl3hw1ljml7vi-cargo-1.95.0"
+      },
+      "system": "x86_64-linux",
+      "group": "rust-toolchain",
+      "priority": 5
+    },
+    {
       "attr_path": "clippy",
       "broken": false,
       "derivation": "/nix/store/cpk102k3rn5i5lvspq4z5pddfzgq84pb-clippy-1.95.0.drv",
@@ -260,6 +500,37 @@
       "priority": 5
     },
     {
+      "attr_path": "clippy",
+      "broken": false,
+      "derivation": "/nix/store/gyzhc37y760azqsg0jvgr7bcqprgk7dg-clippy-1.95.0.drv",
+      "description": "Bunch of lints to catch common mistakes and improve your Rust code",
+      "install_id": "clippy",
+      "license": "[ MIT, Apache-2.0 ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "clippy-1.95.0",
+      "pname": "clippy",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T04:40:24.439395Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.95.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "debug": "/nix/store/ha0z0bxaxsi7bqnds3zny9sc15rhj06x-clippy-1.95.0-debug",
+        "out": "/nix/store/b7n7djcbwb88vfsg7nc1pwj0s3qd7yp6-clippy-1.95.0"
+      },
+      "system": "x86_64-linux",
+      "group": "rust-toolchain",
+      "priority": 5
+    },
+    {
       "attr_path": "rustPlatform.rustLibSrc",
       "broken": false,
       "derivation": "/nix/store/s1pvmp69c7rixx297zbc5h4s9zzgfyn4-rust-lib-src.drv",
@@ -312,6 +583,34 @@
         "out": "/nix/store/62i55wxwfg4qc0irdd9ikhk3ijg515jp-rust-lib-src"
       },
       "system": "x86_64-darwin",
+      "group": "rust-toolchain",
+      "priority": 5
+    },
+    {
+      "attr_path": "rustPlatform.rustLibSrc",
+      "broken": false,
+      "derivation": "/nix/store/arph7rrh7xcw07c2l238c85l9ymvkx7n-rust-lib-src.drv",
+      "install_id": "rust-lib-src",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "rust-lib-src",
+      "pname": "rustLibSrc",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T04:44:35.101888Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "rust-lib-src",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/wf9lnfvq4x0b1zh22i2q9b1vnrk0i8pj-rust-lib-src"
+      },
+      "system": "x86_64-linux",
       "group": "rust-toolchain",
       "priority": 5
     },
@@ -388,6 +687,43 @@
       "priority": 5
     },
     {
+      "attr_path": "rustc",
+      "broken": false,
+      "derivation": "/nix/store/6ag9phi7nq5kbdb6wyad3gg07ap6pjmr-rustc-wrapper-1.95.0.drv",
+      "description": "Safe, concurrent, practical language (wrapper script)",
+      "install_id": "rustc",
+      "license": "[ MIT, Apache-2.0 ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "rustc-wrapper-1.95.0",
+      "pname": "rustc",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T04:42:43.500521Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.95.0",
+      "outputs_to_install": [
+        "man",
+        "man",
+        "man",
+        "out",
+        "out",
+        "out"
+      ],
+      "outputs": {
+        "doc": "/nix/store/shjz14vp8z0368pyl3y1k9y25k033vdh-rustc-wrapper-1.95.0-doc",
+        "man": "/nix/store/bdimrwi4i9p5wxqzms5s8gh0vjqig9gb-rustc-wrapper-1.95.0-man",
+        "out": "/nix/store/qcpwgd3b95bxxylvb0na4hny75chrkzm-rustc-wrapper-1.95.0"
+      },
+      "system": "x86_64-linux",
+      "group": "rust-toolchain",
+      "priority": 5
+    },
+    {
       "attr_path": "rustfmt",
       "broken": false,
       "derivation": "/nix/store/413r1n97kn892qm27c65kj2pbd5fb4sq-rustfmt-1.95.0.drv",
@@ -444,6 +780,36 @@
         "out": "/nix/store/wqlcilh779m08xc8m0zm0fm1f4p8zw0a-rustfmt-1.95.0"
       },
       "system": "x86_64-darwin",
+      "group": "rust-toolchain",
+      "priority": 5
+    },
+    {
+      "attr_path": "rustfmt",
+      "broken": false,
+      "derivation": "/nix/store/n5y626lz2qvx1i5r95jxxmsgf7ijf181-rustfmt-1.95.0.drv",
+      "description": "Tool for formatting Rust code according to style guidelines",
+      "install_id": "rustfmt",
+      "license": "[ MIT, Apache-2.0 ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "rustfmt-1.95.0",
+      "pname": "rustfmt",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T04:42:43.536550Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.95.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/ywjbx0pbnabhbscywxkmyrmwp0m2086q-rustfmt-1.95.0"
+      },
+      "system": "x86_64-linux",
       "group": "rust-toolchain",
       "priority": 5
     },
@@ -669,90 +1035,46 @@
       "priority": 5
     },
     {
-      "attr_path": "soju",
+      "attr_path": "openssl",
       "broken": false,
-      "derivation": "/nix/store/2b938fa79dvacw2ndwg95brml7z7b5d4-soju-0.11.1.drv",
-      "description": "User-friendly IRC bouncer",
-      "install_id": "soju",
-      "license": "AGPL-3.0-only",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=1c89083e451e891152365b799595cf7790a43325",
-      "name": "soju-0.11.1",
-      "pname": "soju",
-      "rev": "1c89083e451e891152365b799595cf7790a43325",
-      "rev_count": 1105037,
-      "rev_date": "2026-10-30T06:21:25Z",
-      "scrape_date": "2026-10-31T05:47:33.575229Z",
-      "stabilities": [
-        "unstable"
-      ],
-      "unfree": false,
-      "version": "0.11.1",
-      "outputs_to_install": [
-        "out"
-      ],
-      "outputs": {
-        "out": "/nix/store/2ik7ifhc4x4p014w24cxb1srff0bf0f1-soju-0.11.1"
-      },
-      "system": "aarch64-darwin",
-      "group": "bouncers",
-      "priority": 5
-    },
-    {
-      "attr_path": "znc",
-      "broken": false,
-      "derivation": "/nix/store/fkvxdvbqnqhg1110ka8paz2jf41yz6x0-znc-1.10.3.drv",
-      "description": "Advanced IRC bouncer",
-      "install_id": "znc",
+      "derivation": "/nix/store/siijj43syp206hcmiczixh602mrnd3ik-openssl-3.6.2.drv",
+      "description": "Cryptographic library that implements the SSL and TLS protocols",
+      "install_id": "openssl",
       "license": "Apache-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=1c89083e451e891152365b799595cf7790a43325",
-      "name": "znc-1.10.3",
-      "pname": "znc",
-      "rev": "1c89083e451e891152365b799595cf7790a43325",
-      "rev_count": 1105037,
-      "rev_date": "2026-10-30T06:21:25Z",
-      "scrape_date": "2026-10-31T05:47:33.688380Z",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "openssl-3.6.2",
+      "pname": "openssl",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T04:41:13.545320Z",
       "stabilities": [
+        "staging",
         "unstable"
       ],
       "unfree": false,
-      "version": "1.10.3",
+      "version": "3.6.2",
       "outputs_to_install": [
-        "out"
+        "bin",
+        "bin",
+        "bin",
+        "bin",
+        "bin",
+        "man",
+        "man",
+        "man",
+        "man"
       ],
       "outputs": {
-        "out": "/nix/store/a6p28hmnkjj188g33swj7ack3vr2c9wf-znc-1.10.3"
+        "bin": "/nix/store/clvbx203wyqkdnqc5ngyhjlhcqn5s9x9-openssl-3.6.2-bin",
+        "debug": "/nix/store/029b2avw85i19v6vvxvrrx15kmg29kpr-openssl-3.6.2-debug",
+        "dev": "/nix/store/i0jqva96qfgc76g8w7jbyiv6h3si07b9-openssl-3.6.2-dev",
+        "doc": "/nix/store/32xivk30pdrnhhn2774dha3xphwcgb2v-openssl-3.6.2-doc",
+        "man": "/nix/store/0wv0fnqsp138dln7cx229hlf8qm553p5-openssl-3.6.2-man",
+        "out": "/nix/store/l0vl4dali2mvbpi30a8da1f71jl85myg-openssl-3.6.2"
       },
-      "system": "aarch64-darwin",
-      "group": "bouncers",
-      "priority": 5
-    },
-    {
-      "attr_path": "zncModules.playback",
-      "broken": false,
-      "derivation": "/nix/store/n578hxyqp15916svx7gyccgs4r23c9yy-znc-playback-0-unstable-2020-05-10.drv",
-      "description": "Advanced playback module for ZNC",
-      "install_id": "zncModules-playback",
-      "license": "Apache-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=1c89083e451e891152365b799595cf7790a43325",
-      "name": "znc-playback-0-unstable-2020-05-10",
-      "pname": "playback",
-      "rev": "1c89083e451e891152365b799595cf7790a43325",
-      "rev_count": 1105037,
-      "rev_date": "2026-10-30T06:21:25Z",
-      "scrape_date": "2026-10-31T05:47:33.688403Z",
-      "stabilities": [
-        "unstable"
-      ],
-      "unfree": false,
-      "version": "2020-05-10",
-      "outputs_to_install": [
-        "out"
-      ],
-      "outputs": {
-        "out": "/nix/store/zz166cn8zdr851zzyvm9cgxy02hc55xj-znc-playback-0-unstable-2020-05-10"
-      },
-      "system": "aarch64-darwin",
-      "group": "bouncers",
+      "system": "x86_64-linux",
+      "group": "toplevel",
       "priority": 5
     }
   ]

@@ -3,7 +3,9 @@ name = "hirc"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "A native IRC client for Ergo"
+description.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 hirc-core = { path = "../hirc-core" }

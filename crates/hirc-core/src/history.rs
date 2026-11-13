@@ -7,7 +7,7 @@
 use crate::proto::Message;
 use crate::store::Line;
 use chrono::{DateTime, SecondsFormat, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// The cap (its group holds the ratified `chathistory` too).
 pub const CAP: &str = "draft/chathistory";
@@ -25,6 +25,9 @@ pub const DISCOVERY_DAYS: i64 = 7;
 /// TARGETS requests per connection at most: a full answer asks on from
 /// its last name, so a server always answering in full can't loop us.
 pub const MAX_TARGETS_PAGES: usize = 10;
+/// Live lines remembered per target (`Known::live`): far more than can
+/// come live while one page is on its way.
+pub const LIVE_KEPT: usize = 500;
 
 /// The page size: the configured one (else `DEFAULT_PAGE`), never more
 /// than the server's `CHATHISTORY` limit, and at least 1.
@@ -130,6 +133,36 @@ pub struct Known {
     pub query: bool,
     pub newest: Option<Anchor>,
     pub oldest: Option<Anchor>,
+    /// The msgids of the newest lines shown live (`LIVE_KEPT` at most).
+    /// A page or replay asked for before one came, or asked again after a
+    /// drop, can bring it once more: that copy is not shown.
+    pub live: Live,
+}
+
+/// Recent msgids: a set to look them up, and their order to forget the
+/// oldest first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Live {
+    order: VecDeque<String>,
+    ids: HashSet<String>,
+}
+
+impl Live {
+    fn push(&mut self, msgid: &str) {
+        if !self.ids.insert(msgid.to_owned()) {
+            return;
+        }
+        self.order.push_back(msgid.to_owned());
+        if self.order.len() > LIVE_KEPT
+            && let Some(old) = self.order.pop_front()
+        {
+            self.ids.remove(&old);
+        }
+    }
+
+    pub fn contains(&self, msgid: &str) -> bool {
+        self.ids.contains(msgid)
+    }
 }
 
 /// Every target's `Known`, by lowercased name (ASCII case-insensitive, as
@@ -182,6 +215,16 @@ impl Book {
                 k.oldest = Some(Anchor::of(l));
             }
         }
+    }
+
+    /// A line with `msgid` was shown live for `name`.
+    pub fn shown_live(&mut self, name: &str, query: bool, msgid: &str) {
+        self.entry(name, query).live.push(msgid);
+    }
+
+    /// Whether a line with `msgid` was shown live for `name`.
+    pub fn was_live(&self, name: &str, msgid: &str) -> bool {
+        self.get(name).is_some_and(|k| k.live.contains(msgid))
     }
 
     /// A page's first item (a page before) or last item (a page after)
@@ -249,6 +292,19 @@ mod tests {
             via: None,
             reply_to: None,
         }
+    }
+
+    #[test]
+    fn live_msgids_are_forgotten_oldest_first() {
+        let mut book = Book::default();
+        for i in 0..=LIVE_KEPT {
+            book.shown_live("#a", false, &format!("m{i}"));
+        }
+        // Seen twice, kept once: it doesn't push another out.
+        book.shown_live("#a", false, "m5");
+        assert!(!book.was_live("#a", "m0"), "the oldest went");
+        assert!(book.was_live("#A", "m1") && book.was_live("#a", &format!("m{LIVE_KEPT}")));
+        assert!(!book.was_live("#b", "m1"), "per target");
     }
 
     #[test]

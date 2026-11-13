@@ -1726,11 +1726,12 @@ fn divider_after_read(buf: &Buffer, sent: Option<&DateTime<Utc>>) -> Option<Opti
     Some(buf.first_unread().map(|ix| buf.lines[ix].seq))
 }
 
-/// How many lines a history page brought, before any already here were
-/// left out: what says whether the server still has some to give.
+/// How many lines a history page brought as the server sent them (its
+/// `sent`), before the core left out those shown live or the store those
+/// already here: what says whether the server still has some to give.
 fn page_lines(ev: &Event) -> usize {
     match ev {
-        Event::History { lines, .. } => lines.len(),
+        Event::History { sent, .. } => *sent,
         _ => 0,
     }
 }
@@ -1768,8 +1769,9 @@ fn scroll_note(following: bool, at_top: bool, fits: bool, state: HistoryState) -
 /// `Some(true)`, an older page asked for (`loading` before it) came back
 /// with nothing and not at the start, so the server has given up on it
 /// for now; `Some(false)`, lines came, ask freely; `None`, no change.
-/// `sent` counts the page's lines as the server sent them: lines already
-/// here (a latest page repeating what came live) still say it has more.
+/// `sent` counts the page's lines as the server sent them (`page_lines`):
+/// lines already shown (a latest page repeating what came live, which the
+/// core leaves out, so the page may come empty) still say it has more.
 fn page_dry(loading: bool, now: HistoryState, sent: usize) -> Option<bool> {
     if sent > 0 {
         Some(false)
@@ -2091,7 +2093,14 @@ mod tests {
         let chan = Target::Channel("#a".into());
         let (mut s, b) = with_lines(&chan, &[(1, "m1")], None);
         let on = Some((0, b));
-        let page = |lines| Event::History { network: "n".into(), target: chan.clone(), lines, start: false, older: false };
+        let page = |lines: Vec<hirc_core::store::Line>| Event::History {
+            network: "n".into(),
+            target: chan.clone(),
+            sent: lines.len(),
+            lines,
+            start: false,
+            older: false,
+        };
         // Only lines already here: the server still has some.
         s.networks[0].buffers[b].history = HistoryState::Loading;
         let mut dry = None;
@@ -2151,7 +2160,8 @@ mod tests {
         absorb(&mut s, on, &mut sent, &mut None, Event::Line { network: "n".into(), target: chan.clone(), line: join });
         assert_eq!(read_command(&mut s, on, &mut sent, true, true), None, "the fill isn't in");
         let missed = |t, id| Line { replayed: true, ..said(t, Some(id)) };
-        let page = Event::History { network: "n".into(), target: chan.clone(), lines: vec![missed(2, "m2"), missed(3, "m3")], start: false, older: false };
+        let page =
+            Event::History { network: "n".into(), target: chan.clone(), lines: vec![missed(2, "m2"), missed(3, "m3")], start: false, older: false, sent: 2 };
         absorb(&mut s, on, &mut sent, &mut None, page);
         let buf = &s.networks[0].buffers[b];
         let ix = buf.first_unread().expect("m3 is new");
@@ -2185,12 +2195,19 @@ mod tests {
         s.apply(Event::Line { network: "n".into(), target: chan(), line: said(1, Some("m1")) });
         let b = s.buffer_ix(0, &chan());
         s.networks[0].buffers[b].history = HistoryState::Loading;
-        let page = Event::History { network: "n".into(), target: chan(), lines: vec![said(1, Some("m1"))], start: false, older: false };
+        let page = Event::History { network: "n".into(), target: chan(), lines: vec![said(1, Some("m1"))], start: false, older: false, sent: 1 };
         let incoming = page_lines(&page);
         let Applied::History { at, .. } = s.apply(page) else { panic!("not a page") };
         assert!(at.is_empty(), "the line was already here");
         assert_eq!(page_dry(true, s.networks[0].buffers[b].history, incoming), Some(false), "the server sent lines: it hasn't given up");
-        let empty = Event::History { network: "n".into(), target: chan(), lines: vec![], start: false, older: false };
+        // The core leaves out what came live: the page arrives empty, but
+        // the server sent two lines.
+        s.networks[0].buffers[b].history = HistoryState::Loading;
+        let shown = Event::History { network: "n".into(), target: chan(), lines: vec![], start: false, older: false, sent: 2 };
+        let incoming = page_lines(&shown);
+        s.apply(shown);
+        assert_eq!(page_dry(true, s.networks[0].buffers[b].history, incoming), Some(false), "all already shown is not dry");
+        let empty = Event::History { network: "n".into(), target: chan(), lines: vec![], start: false, older: false, sent: 0 };
         assert_eq!(page_lines(&empty), 0);
         assert_eq!(page_lines(&Event::OwnNick { network: "n".into(), nick: "me".into() }), 0);
     }
