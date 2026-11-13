@@ -332,9 +332,7 @@ async fn record_soju_facts() {
     record("soju-0.11.1-after.txt", &after);
     // A burst, sent at once (on loopback, all in one millisecond): AFTER
     // its first line's time, and AFTER a millisecond before it.
-    for i in 1..=3 {
-        bob.send(&format!("PRIVMSG #test :burst {i}")).await;
-    }
+    bob.send_burst(&(1..=3).map(|i| format!("PRIVMSG #test :burst {i}")).collect::<Vec<_>>()).await;
     c.until("burst 3").await;
     soju.holds("#test", &["burst 1", "burst 2", "burst 3"]).await;
     let burst = ask(&mut c, "CHATHISTORY LATEST #test * 3").await;
@@ -732,9 +730,7 @@ async fn soju_scrolling_up_reads_a_burst_in_one_millisecond_whole() {
     bob.send("PRIVMSG #test :before").await;
     synced(&mut bob).await;
     tokio::time::sleep(Duration::from_millis(5)).await;
-    for i in 1..=3 {
-        bob.send(&format!("PRIVMSG #test :burst {i}")).await;
-    }
+    bob.send_burst(&(1..=3).map(|i| format!("PRIVMSG #test :burst {i}")).collect::<Vec<_>>()).await;
     for t in ["after 1", "after 2"] {
         synced(&mut bob).await;
         tokio::time::sleep(Duration::from_millis(5)).await;

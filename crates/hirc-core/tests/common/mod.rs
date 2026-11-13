@@ -101,6 +101,13 @@ impl Raw {
         self.w.write_all(format!("{line}\r\n").as_bytes()).await.unwrap();
     }
 
+    /// Several lines in one write, so the server reads them together (one
+    /// write per line lets a slow machine stamp the first a few ms early).
+    pub async fn send_burst(&mut self, lines: &[String]) {
+        let all: String = lines.iter().map(|l| format!("{l}\r\n")).collect();
+        self.w.write_all(all.as_bytes()).await.unwrap();
+    }
+
     /// The next line, without its CRLF (answering a PING). Panics after 10s.
     pub async fn next(&mut self) -> String {
         tokio::time::timeout(Duration::from_secs(10), async {
