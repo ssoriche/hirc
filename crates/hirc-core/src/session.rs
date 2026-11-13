@@ -174,6 +174,8 @@ pub struct Session {
     batch_seq: u64,
     /// The multiline limits last told to the UI.
     multiline_said: Option<Limits>,
+    /// Whether `Event::Tags` last said message-tags on.
+    tags_said: bool,
     /// Runs of lines for the history cache, each saying how it meets what
     /// the cache holds; `None` when there is no cache.
     keep: Option<Vec<Entry>>,
@@ -241,6 +243,8 @@ struct Page {
     last: Option<Anchor>,
     /// ZNC's buffer playback (`znc.in/playback`), not a CHATHISTORY page.
     playback: bool,
+    /// Reactions in the page, which follow its lines out.
+    reactions: Vec<Event>,
 }
 
 #[derive(Clone, Debug)]
@@ -375,6 +379,7 @@ impl Session {
             targets_pages: 0,
             batch_seq: 0,
             multiline_said: None,
+            tags_said: false,
             keep: None,
             tail: HashMap::new(),
             play: None,
@@ -530,6 +535,7 @@ impl Session {
         self.discovering = None;
         self.targets_pages = 0;
         self.multiline_said = None;
+        self.tags_said = false;
         self.tail.clear();
         self.play = None;
         self.alike.clear();
@@ -560,8 +566,10 @@ impl Session {
             self.finish(batch, false, now, &mut out);
         }
         // Pages cut off by the drop: what came is still history.
-        for (_, page) in std::mem::take(&mut self.pages) {
+        for (_, mut page) in std::mem::take(&mut self.pages) {
+            let reactions = std::mem::take(&mut page.reactions);
             self.finish_page(page, true, &mut out);
+            out.extend(reactions.into_iter().map(Output::Event));
         }
         self.note(&out);
         out
@@ -720,7 +728,7 @@ impl Session {
                     self.members_changed.insert(chan.to_ascii_lowercase(), spelled.clone());
                 }
             }
-            "TAGMSG" => {}
+            "TAGMSG" => out.extend(self.reaction(&msg, now).map(Output::Event)),
             c if c.len() == 3 && c.bytes().all(|b| b.is_ascii_digit()) => {
                 let text = msg.params.get(1..).unwrap_or_default().join(" ");
                 let line = self.line(&msg, now, LineKind::Server, None, text, false);
@@ -741,6 +749,41 @@ impl Session {
         };
         self.alt += 1;
         Some(next)
+    }
+
+    /// A `+draft/react` (or `+draft/unreact`) TAGMSG as the reaction it is,
+    /// in the buffer the sender's PRIVMSG would go to. Anything else a
+    /// TAGMSG carries (typing) is not one. A shortcode value shows as its
+    /// emoji.
+    fn reaction(&self, msg: &Message, now: DateTime<Utc>) -> Option<Event> {
+        let to = msg.params.first()?;
+        let from = msg.nick().filter(|_| msg.source.as_deref().is_some_and(|s| s.contains('!')))?;
+        let parent = msg.tag("+draft/reply").filter(|p| !p.is_empty())?;
+        let (emoji, add) = match (msg.tag("+draft/react"), msg.tag("+draft/unreact")) {
+            (Some(e), _) => (e, true),
+            (None, Some(e)) => (e, false),
+            _ => return None,
+        };
+        if emoji.is_empty() {
+            return None;
+        }
+        let own = self.is_me(from);
+        let target = if self.isupport.is_channel(to) {
+            Target::Channel(to.clone())
+        } else if own {
+            Target::Query(to.clone())
+        } else {
+            Target::Query(from.to_owned())
+        };
+        Some(Event::Reaction {
+            network: self.network.clone(),
+            target,
+            parent: parent.to_owned(),
+            emoji: crate::emoji::render(emoji).into_owned(),
+            nick: from.to_owned(),
+            add,
+            time: server_time(msg).unwrap_or(now),
+        })
     }
 
     fn on_cap(&mut self, msg: &Message, out: &mut Vec<Output>) {
@@ -774,6 +817,11 @@ impl Session {
             self.multiline_said = limits;
             out.push(Output::Event(Event::Multiline { network: self.network.clone(), limits }));
         }
+        let tags = self.caps.is_enabled("message-tags");
+        if tags != self.tags_said {
+            self.tags_said = tags;
+            out.push(Output::Event(Event::Tags { network: self.network.clone(), on: tags }));
+        }
     }
 
     /// `BATCH +ref type ...` / `BATCH -ref`. Every batch is tracked (see
@@ -793,8 +841,10 @@ impl Session {
             self.finish(batch, true, now, out);
         }
         self.batches.close(&r);
-        if let Some(page) = self.pages.remove(&r) {
+        if let Some(mut page) = self.pages.remove(&r) {
+            let reactions = std::mem::take(&mut page.reactions);
             self.finish_page(page, false, out);
+            out.extend(reactions.into_iter().map(Output::Event));
         }
         if let Some(names) = self.found.remove(&r) {
             self.finish_targets(names, out);
@@ -816,13 +866,23 @@ impl Session {
                 let target = msg.params.get(2).cloned().unwrap_or_default();
                 let label = self.batch_label(&r, msg);
                 let cap = self.answers(label.as_deref(), &target).and_then(|k| self.inflight.get(&k)).map_or(0, |i| i.request.limit).max(self.page());
-                self.pages.insert(r, Page { target, label, lines: Vec::new(), items: 0, cap, first: None, last: None, playback: false });
+                self.pages.insert(r, Page { target, label, lines: Vec::new(), items: 0, cap, first: None, last: None, playback: false, reactions: Vec::new() });
             }
             // ZNC's buffer playback: history, whoever asked for it. Its ref
             // comes back on every replay of that buffer (closed above).
             Some(playback::BATCH) if self.pages.len() < batch::MAX_OPEN => {
                 let target = msg.params.get(2).cloned().unwrap_or_default();
-                let page = Page { target, label: None, lines: Vec::new(), items: 0, cap: playback::MAX_LINES, first: None, last: None, playback: true };
+                let page = Page {
+                    target,
+                    label: None,
+                    lines: Vec::new(),
+                    items: 0,
+                    cap: playback::MAX_LINES,
+                    first: None,
+                    last: None,
+                    playback: true,
+                    reactions: Vec::new(),
+                };
                 self.pages.insert(r, page);
             }
             // Only the answer to our TARGETS: anyone else's names open nothing.
@@ -843,7 +903,7 @@ impl Session {
     fn finish(&mut self, batch: Incoming, whole: bool, now: DateTime<Utc>, out: &mut Vec<Output>) {
         let Some(first) = batch.lines.first() else { return };
         let text = multiline::join(batch.lines.iter().map(|m| (m.params.get(1).map_or("", String::as_str), m.tag(multiline::CONCAT).is_some())));
-        let tags = ["time", "msgid"][..if whole { 2 } else { 1 }]
+        let tags = ["time", "msgid", "+draft/reply"][..if whole { 3 } else { 1 }]
             .iter()
             .copied()
             .filter_map(|k| batch.open.tag(k).or_else(|| first.tag(k)).filter(|v| !v.is_empty()).map(|v| (k.to_owned(), Some(v.to_owned()))))
@@ -1224,8 +1284,11 @@ impl Session {
         }
         let target = page.target.clone();
         let mut shown = Vec::new();
+        let mut reacted = None;
         if matches!(msg.command.as_str(), "PRIVMSG" | "NOTICE") {
             self.on_message(msg, now, &mut shown);
+        } else if msg.command == "TAGMSG" {
+            reacted = self.reaction(msg, now);
         } else {
             self.replayed_event(&target, msg, now, &mut shown);
         }
@@ -1235,6 +1298,7 @@ impl Session {
             page.first.get_or_insert_with(|| a.clone());
             page.last = Some(a);
         }
+        page.reactions.extend(reacted);
         page.lines.extend(shown.into_iter().filter_map(|o| match o {
             Output::Event(Event::Line { line, .. }) => Some(Line { replayed: true, ..line }),
             _ => None,
@@ -1592,7 +1656,7 @@ impl Session {
             boundary: false,
             replayed: false,
             via: None,
-            reply_to: None,
+            reply_to: msg.tag("+draft/reply").filter(|m| !m.is_empty()).map(str::to_owned),
         }
     }
 
@@ -2539,6 +2603,84 @@ pub(crate) mod tests {
         // The page is the server's limit when that is smaller.
         let mut s = historied("", 5, Book::default());
         assert_eq!(asked(&feed(&mut s, ":alice!a@h JOIN #test")).0, "CHATHISTORY LATEST #test * 5");
+    }
+
+    fn reactions(out: &[Output]) -> Vec<(Target, String, String, String, bool)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Event(Event::Reaction { target, parent, emoji, nick, add, .. }) => {
+                    Some((target.clone(), parent.clone(), emoji.clone(), nick.clone(), *add))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    const TAGS: &str = "message-tags server-time echo-message batch";
+
+    #[test]
+    fn a_react_tagmsg_is_a_reaction_where_its_privmsg_would_go() {
+        let mut s = registered(TAGS);
+        let chan = feed(&mut s, "@time=2026-01-01T00:00:01.000Z;+draft/react=👍;+draft/reply=m1 :bob!b@h TAGMSG #test");
+        assert_eq!(reactions(&chan), [(Target::Channel("#test".into()), "m1".into(), "👍".into(), "bob".into(), true)]);
+        let dm = feed(&mut s, "@+draft/unreact=👍;+draft/reply=m2 :bob!b@h TAGMSG alice");
+        assert_eq!(reactions(&dm), [(Target::Query("bob".into()), "m2".into(), "👍".into(), "bob".into(), false)]);
+        // A shortcode for a value shows as its emoji.
+        let code = feed(&mut s, "@+draft/react=:tada:;+draft/reply=m1 :bob!b@h TAGMSG #test");
+        assert_eq!(reactions(&code)[0].2, "🎉");
+        // No parent, no emoji, typing: nothing.
+        for line in ["@+draft/react=👍 :bob!b@h TAGMSG #test", "@+draft/react=;+draft/reply=m1 :bob!b@h TAGMSG #test", "@+typing=active :bob!b@h TAGMSG #test"]
+        {
+            assert!(feed(&mut s, line).is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_reply_keeps_what_it_answers() {
+        let mut s = registered(TAGS);
+        let out = feed(&mut s, "@msgid=m2;+draft/reply=m1 :bob!b@h PRIVMSG #test :the usual");
+        assert_eq!(lines(&out)[0].1.reply_to.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn a_multiline_reply_keeps_what_it_answers() {
+        let mut s = registered("message-tags server-time echo-message batch draft/multiline");
+        feed(&mut s, "@msgid=m2;+draft/reply=m1 :bob!b@h BATCH +ml draft/multiline #test");
+        feed(&mut s, "@batch=ml :bob!b@h PRIVMSG #test :one");
+        feed(&mut s, "@batch=ml :bob!b@h PRIVMSG #test :two");
+        let out = feed(&mut s, ":bob!b@h BATCH -ml");
+        assert_eq!(lines(&out)[0].1.reply_to.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn message_tags_on_and_off_is_said() {
+        let mut s = registered("server-time");
+        let new = feed(&mut s, ":srv CAP alice NEW :message-tags");
+        assert!(sent(&new).iter().any(|l| l.contains("message-tags")));
+        let ack = feed(&mut s, ":srv CAP alice ACK :message-tags");
+        assert!(ack.contains(&Output::Event(Event::Tags { network: "net".into(), on: true })), "{ack:?}");
+        let del = feed(&mut s, ":srv CAP alice DEL :message-tags");
+        assert!(del.contains(&Output::Event(Event::Tags { network: "net".into(), on: false })), "{del:?}");
+    }
+
+    #[test]
+    fn reactions_in_a_history_page_follow_the_page() {
+        // A limit of 2: one line and one TAGMSG make a full page, so the
+        // server had more and the page is not the start of history.
+        let mut s = historied("", 2, held());
+        let (_, label) = asked(&older(&mut s, "#test"));
+        feed(&mut s, &format!("@label={label} :srv BATCH +h chathistory #test"));
+        assert!(feed(&mut s, "@batch=h;time=2026-10-22T09:00:00.000Z;msgid=m1 :bob!b@h PRIVMSG #test :hello").is_empty());
+        assert!(feed(&mut s, "@batch=h;time=2026-10-22T09:01:00.000Z;msgid=t1;+draft/react=👍;+draft/reply=m1 :bob!b@h TAGMSG #test").is_empty());
+        let out = feed(&mut s, ":srv BATCH -h");
+        let got = histories(&out);
+        let [(target, page, start)] = got.as_slice() else { panic!("{got:?}") };
+        assert_eq!((target, *start), (&Target::Channel("#test".into()), false));
+        assert_eq!(page.iter().map(|l| l.msgid.as_deref()).collect::<Vec<_>>(), [Some("m1")]);
+        assert_eq!(reactions(&out), [(Target::Channel("#test".into()), "m1".into(), "👍".into(), "bob".into(), true)]);
+        let history_at = out.iter().position(|o| matches!(o, Output::Event(Event::History { .. }))).unwrap();
+        let reaction_at = out.iter().position(|o| matches!(o, Output::Event(Event::Reaction { .. }))).unwrap();
+        assert!(history_at < reaction_at, "{out:?}");
     }
 
     #[test]
