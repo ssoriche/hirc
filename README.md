@@ -63,6 +63,18 @@ The input line is vim-style and starts in Insert mode.
 - `Tab` completes nicks, irssi style: whoever spoke last first, then everyone else by name. Each further `Tab` gives the next match. At the start of the line it adds `: `. At the start of a `/` line it completes commands.
 - People a bridge relays (the server's `bridges`, a Discord bot say) complete like everyone else once they've said something in the window; the bridge itself doesn't.
 
+## Reactions and replies
+
+On servers with `message-tags` (Ergo, soju; not ZNC or IRCCloud's bouncer), and only on lines the server gave an id:
+
+- Hover a line for its react `😀+` and reply `↩` buttons.
+- From the keyboard, `[` in Normal mode marks the newest line; `j`/`k` (or `[`/`]`) move the mark, `r` replies, `+` reacts, `Enter` on a reply goes to the line it answers, `Esc` lets go.
+- The react picker shows your 8 most-used reactions (keys `1`–`8`) and searches shortcodes as you type. Picking one you already used on that line takes it back; so does clicking your own chip. `Esc`, or a click on the messages, closes the picker and leaves the line marked.
+- A reply starts with `nick: `, so it reads right in any client, and shows the line it answers above it. Click that to go there; older history loads until it's found. `Esc` twice drops a reply you're writing (the text stays in the input).
+- `/react :emoji:` and `/reply text` act on the marked line, else the last line someone else said.
+- Reactions show as chips under the line; hover one to see who. They never count as unread.
+- The most-used list is kept in `$XDG_STATE_HOME/hirc/reactions.toml` (else `~/.local/state/hirc/`).
+
 ## Commands
 
 | Command | Effect |
@@ -74,6 +86,8 @@ The input line is vim-style and starts in Insert mode.
 | `/me text` | Send an action |
 | `/nick newnick` | Change nick |
 | `/topic [text]` | Show or set the topic |
+| `/react <emoji>` | React to the marked line, else the last line someone else said |
+| `/reply <text>` | Reply to the marked line, else the last line someone else said |
 | `/raw line` (`/quote`) | Send a raw IRC line |
 | `/window N`, `/window move N` | Switch or move windows |
 | `/quit [reason]` (`/disconnect`) | Disconnect the current network |
