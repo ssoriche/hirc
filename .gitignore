@@ -10,3 +10,5 @@
 /dot_config/
 /docs/superpowers/
 /.superpowers/
+# nix build output
+/result
