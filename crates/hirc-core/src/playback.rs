@@ -26,6 +26,11 @@ pub const MODULE: &str = "*playback";
 /// wrong.
 pub const MAX_LINES: usize = 5000;
 
+/// The token of the `PING` sent right after `PLAY`. ZNC answers a
+/// client's PING itself, in order, so its `PONG` comes once the whole
+/// replay has been sent: the only end mark a replay has.
+pub const DONE: &str = "hirc-played";
+
 /// `PLAY`'s time: the newest line held, in whole epoch seconds, or 0
 /// (everything ZNC has) when nothing is held. Rounding down asks for a
 /// little more than was missed, never less; the copies of lines we hold
