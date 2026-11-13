@@ -1975,8 +1975,8 @@ impl Session {
 
     fn run(&mut self, cmd: Command, now: DateTime<Utc>) -> Vec<Output> {
         match cmd {
-            Command::Say { target, text, .. } => self.say(&target, &text, false, now),
-            Command::Action { target, text, .. } => self.say(&target, &text, true, now),
+            Command::Say { target, text, .. } => self.say(&target, &text, false, None, now),
+            Command::Action { target, text, .. } => self.say(&target, &text, true, None, now),
             Command::Join { channel, key, .. } => vec![send("JOIN", std::iter::once(channel).chain(key))],
             Command::Part { channel, reason, .. } => vec![send("PART", std::iter::once(channel).chain(reason))],
             Command::Nick { nick, .. } => vec![send("NICK", [nick])],
@@ -2000,7 +2000,11 @@ impl Session {
                 self.open(&target, &mut out);
                 out
             }
-            Command::React { .. } | Command::Reply { .. } => Vec::new(),
+            Command::React { target, parent, emoji, add, .. } => self.react(&target, &parent, &emoji, add, now),
+            Command::Reply { target, parent, text, .. } => match self.no_tags(&parent) {
+                Some(why) => vec![self.refused(&target, why, now)],
+                None => self.say(&target, &text, false, Some(&parent), now),
+            },
             Command::MarkRead { target, time, .. } => {
                 if self.caps.is_enabled(READ_MARKER) {
                     vec![send("MARKREAD", [target, history::timestamp(time)])]
@@ -2034,7 +2038,8 @@ impl Session {
     /// With echo-message it is pending until the server's echo, the copy
     /// that stays (right time, msgid, order), takes its place (the store
     /// matches them); without it, ours is the copy and it is sent.
-    fn say(&mut self, target: &str, text: &str, action: bool, now: DateTime<Utc>) -> Vec<Output> {
+    fn say(&mut self, target: &str, text: &str, action: bool, reply: Option<&str>, now: DateTime<Utc>) -> Vec<Output> {
+        let mut reply = reply.map(str::to_owned);
         let echo = self.caps.is_enabled("echo-message");
         let wrap = if action { "\x01ACTION \x01".len() } else { 0 };
         let budget = split::body_budget("PRIVMSG", target, self.nick.len() + 75).saturating_sub(wrap).max(1);
@@ -2061,8 +2066,13 @@ impl Session {
                 if echo {
                     l.delivery = Delivery::Pending;
                 }
+                let mut open = Message::new("BATCH", [format!("+{r}"), multiline::CAP.to_owned(), target.to_owned()]);
+                if let Some(p) = reply.take() {
+                    l.reply_to = Some(p.clone());
+                    open.tags.push(("+draft/reply".into(), Some(p)));
+                }
                 out.push(self.event_line(dest.clone(), l));
-                out.push(send("BATCH", [format!("+{r}"), multiline::CAP.to_owned(), target.to_owned()]));
+                out.push(Output::Send(open));
                 for p in &batch {
                     let mut m = Message::new("PRIVMSG", [target, p.text]);
                     m.tags.push(("batch".into(), Some(r.clone())));
@@ -2083,10 +2093,50 @@ impl Session {
                 if echo {
                     l.delivery = Delivery::Pending;
                 }
+                let tag = reply.take();
+                l.reply_to = tag.clone();
                 // Shown before it goes, so an echo can never beat it.
                 out.push(self.event_line(dest.clone(), l));
-                out.push(send("PRIVMSG", [target.to_owned(), body]));
+                let mut m = Message::new("PRIVMSG", [target.to_owned(), body]);
+                if let Some(p) = tag {
+                    m.tags.push(("+draft/reply".into(), Some(p)));
+                }
+                out.push(Output::Send(m));
             }
+        }
+        out
+    }
+
+    /// Why nothing can be reacted or replied to here: the server takes no
+    /// client tags, or the line's msgid is one hirc made up (never sent).
+    fn no_tags(&self, parent: &str) -> Option<&'static str> {
+        if !self.caps.is_enabled("message-tags") {
+            Some("This server takes no reactions or replies (no message-tags)")
+        } else if crate::msgid::is_made_up(parent) {
+            Some("That line has no id from the server, so it can't be reacted or replied to")
+        } else {
+            None
+        }
+    }
+
+    fn refused(&mut self, target: &str, why: &str, now: DateTime<Utc>) -> Output {
+        let line = self.local(LineKind::Error, why.to_owned(), now);
+        self.event_line(self.dest(target), line)
+    }
+
+    /// A reaction, as a TAGMSG. With echo-message the echo shows it, as
+    /// for lines; without, it shows now.
+    fn react(&mut self, target: &str, parent: &str, emoji: &str, add: bool, now: DateTime<Utc>) -> Vec<Output> {
+        if let Some(why) = self.no_tags(parent) {
+            return vec![self.refused(target, why, now)];
+        }
+        let tag = if add { "+draft/react" } else { "+draft/unreact" };
+        let mut m = Message::new("TAGMSG", [target]);
+        m.tags = vec![(tag.into(), Some(emoji.to_owned())), ("+draft/reply".into(), Some(parent.to_owned()))];
+        let mut out = vec![Output::Send(m)];
+        if !self.caps.is_enabled("echo-message") {
+            let (parent, emoji, nick) = (parent.to_owned(), emoji.to_owned(), self.nick.clone());
+            out.push(Output::Event(Event::Reaction { network: self.network.clone(), target: self.dest(target), parent, emoji, nick, add, time: now }));
         }
         out
     }
@@ -2415,6 +2465,62 @@ pub(crate) mod tests {
 
     fn say(s: &mut Session, text: &str) -> Vec<Output> {
         s.command(Command::Say { network: "net".into(), target: "#test".into(), text: text.into() }, now())
+    }
+
+    fn react_cmd(parent: &str, add: bool) -> Command {
+        Command::React { network: "net".into(), target: "#test".into(), parent: parent.into(), emoji: "🎉".into(), add }
+    }
+
+    #[test]
+    fn a_reaction_goes_as_a_tagmsg_and_shows_on_its_echo() {
+        let mut s = registered(TAGS);
+        let out = s.command(react_cmd("m1", true), now());
+        assert_eq!(sent(&out), ["@+draft/react=🎉;+draft/reply=m1 TAGMSG #test"]);
+        assert!(reactions(&out).is_empty(), "with echo-message the echo shows it");
+        let off = s.command(react_cmd("m1", false), now());
+        assert_eq!(sent(&off), ["@+draft/unreact=🎉;+draft/reply=m1 TAGMSG #test"]);
+    }
+
+    #[test]
+    fn without_echo_a_reaction_shows_at_once() {
+        let mut s = registered("message-tags server-time");
+        let out = s.command(react_cmd("m1", true), now());
+        assert_eq!(reactions(&out), [(Target::Channel("#test".into()), "m1".into(), "🎉".into(), "alice".into(), true)]);
+    }
+
+    #[test]
+    fn reactions_and_replies_are_refused_without_tags_or_to_a_made_up_id() {
+        let mut s = registered("server-time echo-message");
+        let out = s.command(react_cmd("m1", true), now());
+        assert!(sent(&out).is_empty());
+        assert!(lines(&out).iter().any(|(_, l)| l.kind == LineKind::Error && l.text.contains("message-tags")), "{out:?}");
+        let mut s = registered(TAGS);
+        let out = s.command(react_cmd("hirc:0123456789abcdef", true), now());
+        assert!(sent(&out).is_empty());
+        let reply = Command::Reply { network: "net".into(), target: "#test".into(), parent: "hirc:0123456789abcdef".into(), text: "hi".into() };
+        assert!(sent(&s.command(reply, now())).is_empty());
+    }
+
+    #[test]
+    fn a_reply_carries_its_parent_on_the_first_line_only() {
+        let mut s = registered(TAGS);
+        let text = format!("bob:{}", "a".repeat(600));
+        let out = s.command(Command::Reply { network: "net".into(), target: "#test".into(), parent: "m1".into(), text }, now());
+        let sent = sent(&out);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[0].starts_with("@+draft/reply=m1 PRIVMSG #test bob:aaa"), "{}", sent[0]);
+        assert!(sent[1].starts_with("PRIVMSG #test a"), "{}", sent[1]);
+        // The pending copy shows the quote at once.
+        assert_eq!(lines(&out)[0].1.reply_to.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn a_multiline_reply_tags_the_batch() {
+        let mut s = multiline("max-bytes=4096,max-lines=24");
+        let out = s.command(Command::Reply { network: "net".into(), target: "#test".into(), parent: "m1".into(), text: "one\ntwo".into() }, now());
+        let sent = sent(&out);
+        assert!(sent[0].starts_with("@+draft/reply=m1 BATCH +"), "{sent:?}");
+        assert!(sent[1..].iter().all(|l| !l.contains("draft/reply")), "{sent:?}");
     }
 
     #[test]
