@@ -13,15 +13,16 @@ use crate::vim::{self, Effect, Ex, Nav, Pick, Scroll};
 use chrono::{DateTime, Utc};
 use gpui::{
     App, ClipboardItem, Context, Entity, Focusable, KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, ScrollHandle,
-    SharedString, Window, actions, div, list, prelude::*, px,
+    SharedString, TextRun, Window, actions, div, list, prelude::*, px,
 };
 use hirc_core::command::{self, Input, WindowAction};
 use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::layout::{self, Layout};
+use hirc_core::reactions::{self, Recent};
 use hirc_core::services;
-use hirc_core::store::{Applied, Buffer, HistoryState, LineKind, Network, Store, counts, reactable, step_reactable};
+use hirc_core::store::{Applied, Buffer, HistoryState, LineKind, Network, Store, counts, last_theirs, reactable, step_reactable};
 use hirc_core::theme::Theme;
-use hirc_core::{display, multiline, split};
+use hirc_core::{display, msgid, multiline, split};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -176,7 +177,21 @@ pub struct HircApp {
     /// A reply being followed to a line not loaded yet: older pages are
     /// asked for until it shows.
     seek: Option<Seek>,
+    /// The reply being written in the window on screen.
+    reply: Option<Reply>,
+    /// Each other window's reply being written, kept with its draft.
+    replies: HashMap<(usize, usize), Reply>,
+    /// The reactions used most, for the picker's quick row.
+    recent: Recent,
     commands: UnboundedSender<Command>,
+}
+
+/// A reply being written: the line it answers (its msgid), who said that
+/// and what, for the bar over the input.
+struct Reply {
+    parent: String,
+    nick: String,
+    text: String,
 }
 
 /// Following a reply to a line further back than what is loaded: the
@@ -333,6 +348,10 @@ impl HircApp {
             mark: None,
             flash: None,
             seek: None,
+            reply: None,
+            replies: HashMap::new(),
+            // Snapshot runs neither read nor write it, as with the layout.
+            recent: if init.no_layout_file { Recent::default() } else { Recent::load(&reactions::path()) },
             commands: init.commands,
         }
     }
@@ -351,6 +370,10 @@ impl HircApp {
             let draft = self.input.update(cx, |input, cx| input.swap_draft(next, cx));
             if let Some(old) = self.selected.filter(|_| !draft.is_empty()) {
                 self.drafts.insert(old, draft);
+            }
+            let reply = std::mem::replace(&mut self.reply, self.replies.remove(&(n, b)));
+            if let (Some(old), Some(reply)) = (self.selected, reply) {
+                self.replies.insert(old, reply);
             }
         }
         if self.selected != Some((n, b)) {
@@ -561,8 +584,8 @@ impl HircApp {
             },
             Effect::Dismiss => self.banner = None,
             Effect::Pick(p) => self.pick(*p, cx),
-            // Task 8: drop the reply being written (`self.reply = None`).
-            Effect::Cancel => {}
+            // Esc Esc: the reply being written is put away (the text stays).
+            Effect::Cancel => self.reply = None,
             Effect::Pass | Effect::Edit { .. } | Effect::Submit => {}
         }
         cx.notify();
@@ -591,8 +614,14 @@ impl HircApp {
                 }
                 None
             }
-            // Task 8 (reply) and Task 9 (react).
-            Pick::Reply | Pick::React => None,
+            Pick::Reply => {
+                if let Some(ix) = at {
+                    self.start_reply(ix, cx);
+                }
+                None
+            }
+            // Task 9 (react).
+            Pick::React => None,
         };
         if let Some(ix) = to {
             self.mark = Some(self.store.networks[n].buffers[b].lines[ix].seq);
@@ -670,6 +699,60 @@ impl HircApp {
 
     fn not_found(&mut self, n: usize, b: usize) {
         self.local_note(n, b, "The line it replies to wasn't found in the history loaded".into());
+    }
+
+    /// Write a reply to line `ix` of the window on screen: the bar over the
+    /// input says to whom, and the input starts with their nick, in Insert
+    /// mode. The mark goes.
+    fn start_reply(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(line) = self.current().and_then(|(_, buf)| buf.lines.get(ix)) else { return };
+        let Some(parent) = line.msgid.clone() else { return };
+        let nick = line.nick.clone().unwrap_or_default();
+        self.reply = Some(Reply { parent, nick: nick.clone(), text: line.text.clone() });
+        self.input.update(cx, |input, cx| input.begin(&format!("{nick}: "), cx));
+        self.mark = None;
+        self.sync_mark(cx);
+    }
+
+    /// React to line `ix` of `(n, b)` with `emoji`, or take it back if it
+    /// is already ours, and count it among the most used.
+    fn react_to(&mut self, n: usize, b: usize, ix: usize, emoji: String, cx: &mut Context<Self>) {
+        let net = &self.store.networks[n];
+        let buf = &net.buffers[b];
+        let parent = buf.lines.get(ix).and_then(|l| l.msgid.clone()).filter(|m| !msgid::is_made_up(m));
+        let (Some(parent), Some(target)) = (parent, buf.target.name().map(str::to_owned)) else { return };
+        if !matches!(net.status, ConnStatus::Connected { .. }) {
+            let why = not_connected(&net.name, &net.status);
+            self.local_error(n, b, why);
+            cx.notify();
+            return;
+        }
+        let add = !buf.reacted(&parent, &emoji, net.nick.as_deref().unwrap_or_default());
+        let _ = self.commands.send(Command::React { network: net.name.clone(), target, parent, emoji: emoji.clone(), add });
+        if add {
+            self.recent.used(&emoji);
+            if !self.no_layout_file
+                && let Err(e) = self.recent.save(&reactions::path())
+            {
+                tracing::warn!("reactions: {e}");
+            }
+        }
+        self.mark = None;
+        cx.notify();
+    }
+
+    /// The reply being written, one quiet row over the input on its text
+    /// column: `↩ replying to nick: text`, cut to the row, and how to put
+    /// it away when that fits too.
+    fn reply_bar(&self, reply: &Reply, window: &Window, column: f32, width: f32) -> gpui::Div {
+        let m = &self.metrics;
+        let text = hirc_core::emoji::render(&reply.text).replace(['\r', '\n'], " ");
+        let said = format!("↩ replying to {}: {text}", reply.nick);
+        let full = format!("{said}  (Esc Esc cancels)");
+        let run = TextRun { len: full.len(), font: self.font.clone(), color: self.palette.quiet, background_color: None, underline: None, strikethrough: None };
+        let shaped = window.text_system().shape_line(full.clone().into(), px(m.size), &[run], None);
+        let shown = if f32::from(shaped.x_for_index(full.len())) <= width { full } else { said };
+        div().ml(px(column)).h(px(m.line)).whitespace_nowrap().overflow_hidden().text_ellipsis().text_color(self.palette.quiet).child(shown)
     }
 
     /// Reveal line `ix` of the window on screen and light it for a moment.
@@ -919,13 +1002,19 @@ impl HircApp {
             cx.notify();
             return;
         }
-        match command::parse(&text, &name, target.as_deref()) {
+        // Chat (not a command) while a reply is being written answers its line.
+        let replying = self.reply.as_ref().filter(|_| command::after_slash(&text).is_none()).map(|r| r.parent.clone());
+        let parsed = match (command::parse(&text, &name, target.as_deref()), replying) {
+            (Ok(Input::Send(Command::Say { network, target, text })), Some(parent)) => Ok(Input::Send(Command::Reply { network, target, parent, text })),
+            (parsed, _) => parsed,
+        };
+        match parsed {
             Ok(Input::Send(cmd @ Command::Reconnect { .. })) => {
                 let _ = self.commands.send(cmd);
             }
             // Chat sent while offline would vanish without a trace; keep
             // the line so it can be sent once connected.
-            Ok(Input::Send(Command::Say { .. } | Command::Action { .. })) if !connected => {
+            Ok(Input::Send(Command::Say { .. } | Command::Action { .. } | Command::Reply { .. }) | Input::React(_) | Input::Reply(_)) if !connected => {
                 self.local_error(n, b, not_connected(&name, &status));
                 self.input.update(cx, |input, cx| input.swap_draft(text.clone(), cx));
             }
@@ -938,8 +1027,11 @@ impl HircApp {
                 self.select(n, j, cx);
             }
             Ok(Input::Send(cmd)) => {
-                if matches!(cmd, Command::Say { .. } | Command::Action { .. }) {
+                if matches!(cmd, Command::Say { .. } | Command::Action { .. } | Command::Reply { .. }) {
                     self.caught_up();
+                }
+                if matches!(cmd, Command::Reply { .. }) {
+                    self.reply = None;
                 }
                 if let Command::Join { channel, .. } = &cmd
                     && let Some(first) = channel.split(',').next()
@@ -961,8 +1053,30 @@ impl HircApp {
             }
             Ok(Input::Window(WindowAction::Goto(number))) => self.goto_typed(number, cx),
             Ok(Input::Window(WindowAction::Move(number))) => self.move_window(number, cx),
-            // The UI task wires these to the marked line.
-            Ok(Input::React(_) | Input::Reply(_)) => self.local_error(n, b, "Reactions and replies are not wired up yet".to_owned()),
+            // `/reply text`: the marked line, else the newest someone else
+            // said, with their nick in front unless it is there already.
+            Ok(Input::Reply(text)) => match self.current().map(|(net, buf)| act_on(net, buf, self.mark)) {
+                Some(Ok(ix)) => {
+                    let line = &self.store.networks[n].buffers[b].lines[ix];
+                    let (parent, nick) = (line.msgid.clone().unwrap_or_default(), line.nick.clone().unwrap_or_default());
+                    let text = if text.starts_with(&format!("{nick}:")) { text } else { format!("{nick}: {text}") };
+                    match target {
+                        Some(target) => {
+                            self.caught_up();
+                            self.mark = None;
+                            let _ = self.commands.send(Command::Reply { network: name, target, parent, text });
+                        }
+                        None => self.local_error(n, b, "This buffer has no channel or nick. Use /msg or /join.".to_owned()),
+                    }
+                }
+                Some(Err(why)) => self.local_error(n, b, why),
+                None => {}
+            },
+            Ok(Input::React(emoji)) => match self.current().map(|(net, buf)| act_on(net, buf, self.mark)) {
+                Some(Ok(ix)) => self.react_to(n, b, ix, emoji, cx),
+                Some(Err(why)) => self.local_error(n, b, why),
+                None => {}
+            },
             Err(msg) => self.local_error(n, b, msg),
         }
         cx.notify();
@@ -1049,6 +1163,18 @@ impl HircApp {
         self.clicks.set(e.click_count);
         self.selection = None;
         self.drag = None;
+        // A chip takes our reaction back, or adds it.
+        let chip = self.hits.borrow().iter().find_map(|(bounds, hit)| match hit {
+            Hit::Chip { seq, emoji } if bounds.contains(&e.position) => Some((*seq, emoji.clone())),
+            _ => None,
+        });
+        if let (Some((seq, emoji)), Some((n, b))) = (chip, self.selected) {
+            if let Some(ix) = self.current().and_then(|(_, buf)| buf.lines.iter().position(|l| l.seq == seq)) {
+                self.react_to(n, b, ix, emoji, cx);
+            }
+            cx.notify();
+            return;
+        }
         // A reply's quote goes to the line it answers.
         let quote = self.hits.borrow().iter().find_map(|(bounds, hit)| match hit {
             Hit::Quote { seq } if bounds.contains(&e.position) => Some(*seq),
@@ -1196,6 +1322,7 @@ impl Render for HircApp {
         let placeholder = self.placeholder();
         let text_width = pane - 2. * m.gutter - column;
         self.sync_mark(cx);
+        let reply_bar = self.reply.as_ref().map(|r| self.reply_bar(r, window, column, text_width));
         self.input.update(cx, |input, _| {
             input.column = column;
             input.width = text_width;
@@ -1289,6 +1416,9 @@ impl Render for HircApp {
                             .bg(p.input_bg)
                             .border_t_1()
                             .border_color(p.border)
+                            // The reply being written: one line over the
+                            // input, so the message view gives up one.
+                            .children(reply_bar)
                             .child(self.input.clone())
                     }),
             )
@@ -1353,6 +1483,16 @@ pub fn older_ready(buf: &Buffer, up: bool, status: &ConnStatus) -> bool {
         Target::Server => false,
     };
     up && place && buf.history == HistoryState::Idle && matches!(status, ConnStatus::Connected { .. })
+}
+
+/// The line `/react` or `/reply` act on: the marked one, else the newest
+/// reactable one someone else said. `Err` says why there is none.
+fn act_on(net: &Network, buf: &Buffer, mark: Option<u64>) -> Result<usize, String> {
+    if !net.tags {
+        return Err("This server takes no reactions or replies (no message-tags)".into());
+    }
+    let marked = mark.and_then(|seq| buf.lines.iter().position(|l| l.seq == seq));
+    marked.or_else(|| last_theirs(buf, net.nick.as_deref())).ok_or_else(|| "Nothing here to react or reply to".into())
 }
 
 /// How far to tell the server a window on screen at its end is read: its
@@ -1981,6 +2121,26 @@ mod tests {
         let empty = Event::History { network: "n".into(), target: chan(), lines: vec![], start: false, older: false };
         assert_eq!(page_lines(&empty), 0);
         assert_eq!(page_lines(&Event::OwnNick { network: "n".into(), nick: "me".into() }), 0);
+    }
+
+    #[test]
+    fn react_and_reply_act_on_the_mark_else_the_newest_line_not_ours() {
+        let mut s = Store::new(["n".to_string()]);
+        let chan = || Target::Channel("#a".into());
+        let b = s.buffer_ix(0, &chan());
+        s.networks[0].nick = Some("me".into());
+        assert_eq!(act_on(&s.networks[0], &s.networks[0].buffers[b], None), Err("This server takes no reactions or replies (no message-tags)".into()));
+        s.networks[0].tags = true;
+        assert_eq!(act_on(&s.networks[0], &s.networks[0].buffers[b], None), Err("Nothing here to react or reply to".into()));
+        let mine = hirc_core::store::Line { nick: Some("me".into()), ..said(3, Some("m3")) };
+        for line in [said(1, Some("m1")), said(2, Some("m2")), mine] {
+            s.apply(Event::Line { network: "n".into(), target: chan(), line });
+        }
+        let (net, buf) = (&s.networks[0], &s.networks[0].buffers[b]);
+        assert_eq!(act_on(net, buf, None), Ok(1), "the newest line someone else said, not ours");
+        assert_eq!(act_on(net, buf, Some(buf.lines[0].seq)), Ok(0), "the mark wins");
+        assert_eq!(act_on(net, buf, Some(buf.lines[2].seq)), Ok(2), "even on a line of ours");
+        assert_eq!(act_on(net, buf, Some(9999)), Ok(1), "a mark on a line gone is no mark");
     }
 
     #[test]

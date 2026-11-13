@@ -1094,6 +1094,22 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Start a line with `prefix` (a reply's `nick: `), unless it starts
+    /// with it already, and type on after it in Insert mode.
+    pub fn begin(&mut self, prefix: &str, cx: &mut Context<Self>) {
+        if !self.content.starts_with(prefix) {
+            self.content = format!("{prefix}{}", self.content).into();
+        }
+        self.vim.reset();
+        let end = self.content.len();
+        self.selected_range = end..end;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.edited();
+        self.refresh_popup();
+        cx.notify();
+    }
+
     /// What was submitted went: start a fresh line.
     pub fn sent(&mut self, cx: &mut Context<Self>) {
         self.reset();
