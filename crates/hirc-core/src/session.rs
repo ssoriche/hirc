@@ -764,7 +764,8 @@ impl Session {
             (None, Some(e)) => (e, false),
             _ => return None,
         };
-        if emoji.is_empty() {
+        // An emoji, not a message: bounded, one word, nothing unprintable.
+        if emoji.is_empty() || emoji.len() > 64 || emoji.chars().any(|c| c.is_whitespace() || c.is_control()) {
             return None;
         }
         let own = self.is_me(from);
@@ -2739,6 +2740,21 @@ pub(crate) mod tests {
         {
             assert!(feed(&mut s, line).is_empty(), "{line}");
         }
+    }
+
+    #[test]
+    fn a_reaction_too_long_or_with_spaces_or_controls_goes_nowhere() {
+        let mut s = registered(TAGS);
+        let long = "x".repeat(65);
+        for value in [long.as_str(), "a\\sb", "a\tb", "a\u{7}b", "a\u{85}b", "a\u{2003}b"] {
+            for tag in ["+draft/react", "+draft/unreact"] {
+                let line = format!("@{tag}={value};+draft/reply=m1 :bob!b@h TAGMSG #test");
+                assert!(feed(&mut s, &line).is_empty(), "{line}");
+            }
+        }
+        // 64 bytes is still one.
+        let most = "x".repeat(64);
+        assert_eq!(reactions(&feed(&mut s, &format!("@+draft/react={most};+draft/reply=m1 :bob!b@h TAGMSG #test"))).len(), 1);
     }
 
     #[test]

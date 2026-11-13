@@ -7,6 +7,7 @@
 
 use crate::event::{ConnStatus, Event, PeerChange, Target};
 use crate::multiline::Limits;
+use crate::services;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
@@ -156,7 +157,9 @@ impl Buffer {
     pub fn react(&mut self, parent: &str, emoji: &str, nick: &str, add: bool, time: DateTime<Utc>) -> bool {
         let list = self.reactions.entry(parent.to_owned()).or_default();
         match list.iter_mut().find(|r| r.emoji == emoji && r.nick.eq_ignore_ascii_case(nick)) {
-            Some(r) if time < r.time => false,
+            // At one time (Ergo stamps a react and its unreact alike), taken
+            // back wins, whichever came first.
+            Some(r) if time < r.time || (time == r.time && add && !r.on) => false,
             Some(r) => {
                 let changed = r.on != add;
                 (r.on, r.time) = (add, time);
@@ -621,7 +624,18 @@ impl Store {
             }
             Event::Reaction { network, target, parent, emoji, nick, add, time } => {
                 let n = self.network_ix(&network);
-                let b = self.buffer_ix(n, &target);
+                // A reaction never opens a query (a stranger's would make an
+                // empty window, and then their first message wouldn't open
+                // it), and none shows with services. A query's history page
+                // comes before its reactions, so the query is there for them.
+                let b = match &target {
+                    Target::Query(nick) if services::is_service(nick) => return Applied::Nothing,
+                    Target::Query(_) => match self.networks[n].buffers.iter().position(|b| b.target.same(&target)) {
+                        Some(b) => b,
+                        None => return Applied::Nothing,
+                    },
+                    _ => self.buffer_ix(n, &target),
+                };
                 let buf = &mut self.networks[n].buffers[b];
                 if !buf.react(&parent, &emoji, &nick, add, time) {
                     return Applied::Nothing;
@@ -1227,6 +1241,55 @@ mod tests {
         s.apply(react("#a", "m1", "🎉", "bob", true, 30));
         s.apply(react("#a", "m1", "🎉", "bob", false, 25));
         assert_eq!(shown(&s, "m1"), [("🎉".into(), vec!["bob".to_owned()])]);
+    }
+
+    #[test]
+    fn at_one_millisecond_taken_back_wins() {
+        // Ergo stamps a react and its unreact alike: whichever comes first,
+        // the reaction ends taken back.
+        let mut s = Store::new(["net".to_owned()]);
+        s.apply(react("#a", "m1", "👍", "bob", false, 20));
+        assert_eq!(s.apply(react("#a", "m1", "👍", "bob", true, 20)), Applied::Nothing);
+        assert!(shown(&s, "m1").is_empty());
+        s.apply(react("#a", "m1", "🎉", "bob", true, 30));
+        s.apply(react("#a", "m1", "🎉", "bob", false, 30));
+        assert!(shown(&s, "m1").is_empty());
+    }
+
+    fn react_dm(nick: &str, from: &str, secs: i64) -> Event {
+        Event::Reaction {
+            network: "net".into(),
+            target: Target::Query(nick.into()),
+            parent: "m1".into(),
+            emoji: "👍".into(),
+            nick: from.into(),
+            add: true,
+            time: at(secs),
+        }
+    }
+
+    #[test]
+    fn a_reaction_never_opens_a_query() {
+        let mut s = Store::new(["net".to_owned()]);
+        assert_eq!(s.apply(react_dm("stranger", "stranger", 11)), Applied::Nothing);
+        assert_eq!(s.networks[0].buffers.len(), 1, "no window for a stranger's reaction");
+        // A query that is open takes it.
+        s.apply(Event::Line { network: "net".into(), target: Target::Query("bob".into()), line: line(1, 10, Some("m1"), "lunch?") });
+        assert_eq!(s.apply(react_dm("BOB", "bob", 12)), Applied::Reacted { network: 0, buffer: 1, index: Some(0) });
+        assert_eq!(shown(&s, "m1"), [("👍".into(), vec!["bob".to_owned()])]);
+    }
+
+    #[test]
+    fn a_reaction_with_services_opens_nothing() {
+        let mut s = Store::new(["net".to_owned()]);
+        // From NickServ, or ours to it (the echo goes to its query).
+        assert_eq!(s.apply(react_dm("NickServ", "NickServ", 11)), Applied::Nothing);
+        assert_eq!(s.apply(react_dm("nickserv", "me", 12)), Applied::Nothing);
+        assert_eq!(s.networks[0].buffers.len(), 1);
+        // Not even into a services query the user opened.
+        s.apply(Event::Line { network: "net".into(), target: Target::Query("NickServ".into()), line: line(1, 10, Some("m1"), "hi") });
+        assert_eq!(s.apply(react_dm("NickServ", "NickServ", 13)), Applied::Nothing);
+        assert!(shown(&s, "m1").is_empty());
     }
 
     #[test]

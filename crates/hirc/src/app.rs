@@ -746,7 +746,7 @@ impl HircApp {
     /// mode. The mark goes.
     fn start_reply(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(line) = self.current().and_then(|(_, buf)| buf.lines.get(ix)) else { return };
-        let Some(parent) = line.msgid.clone() else { return };
+        let Some(parent) = reply_parent(line) else { return };
         let nick = line.nick.clone().unwrap_or_default();
         self.reply = Some(Reply { parent, nick: nick.clone(), text: line.text.clone() });
         self.input.update(cx, |input, cx| input.begin(&format!("{nick}: "), cx));
@@ -1098,15 +1098,16 @@ impl HircApp {
             Ok(Input::Reply(text)) => match self.current().map(|(net, buf)| act_on(net, buf, self.mark)) {
                 Some(Ok(ix)) => {
                     let line = &self.store.networks[n].buffers[b].lines[ix];
-                    let (parent, nick) = (line.msgid.clone().unwrap_or_default(), line.nick.clone().unwrap_or_default());
+                    let (parent, nick) = (reply_parent(line), line.nick.clone().unwrap_or_default());
                     let text = if text.starts_with(&format!("{nick}:")) { text } else { format!("{nick}: {text}") };
-                    match target {
-                        Some(target) => {
+                    match (target, parent) {
+                        (_, None) => self.local_error(n, b, "That line can't be replied to".to_owned()),
+                        (Some(target), Some(parent)) => {
                             self.caught_up();
                             self.mark = None;
                             let _ = self.commands.send(Command::Reply { network: name, target, parent, text });
                         }
-                        None => self.local_error(n, b, "This buffer has no channel or nick. Use /msg or /join.".to_owned()),
+                        (None, _) => self.local_error(n, b, "This buffer has no channel or nick. Use /msg or /join.".to_owned()),
                     }
                 }
                 Some(Err(why)) => self.local_error(n, b, why),
@@ -1548,6 +1549,12 @@ pub fn older_ready(buf: &Buffer, up: bool, status: &ConnStatus) -> bool {
         Target::Server => false,
     };
     up && place && buf.history == HistoryState::Idle && matches!(status, ConnStatus::Connected { .. })
+}
+
+/// The msgid a reply to `line` names: only a message the server gave one
+/// (`reactable`), so a made-up msgid never goes out.
+fn reply_parent(line: &hirc_core::store::Line) -> Option<String> {
+    line.msgid.clone().filter(|_| reactable(line))
 }
 
 /// The line `/react` or `/reply` act on: the marked one, else the newest
@@ -2206,6 +2213,15 @@ mod tests {
         assert_eq!(act_on(net, buf, Some(buf.lines[0].seq)), Ok(0), "the mark wins");
         assert_eq!(act_on(net, buf, Some(buf.lines[2].seq)), Ok(2), "even on a line of ours");
         assert_eq!(act_on(net, buf, Some(9999)), Ok(1), "a mark on a line gone is no mark");
+    }
+
+    #[test]
+    fn a_reply_answers_only_a_line_the_server_ided() {
+        assert_eq!(reply_parent(&said(1, Some("m1"))).as_deref(), Some("m1"));
+        assert_eq!(reply_parent(&said(1, Some("hirc:0123456789abcdef"))), None, "a made-up msgid never goes out");
+        assert_eq!(reply_parent(&said(1, None)), None);
+        let join = hirc_core::store::Line { kind: LineKind::Join, ..said(1, Some("m1")) };
+        assert_eq!(reply_parent(&join), None);
     }
 
     #[test]

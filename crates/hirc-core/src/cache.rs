@@ -314,7 +314,8 @@ impl Cache {
     }
 
     /// Keep a reaction (or its taking back), unless what is held of it is
-    /// newer. Never one in a services query, or to a made-up msgid.
+    /// newer. At one millisecond, taken back wins, as in the store. Never
+    /// one in a services query, or to a made-up msgid.
     pub fn react(&self, network: &str, target: &Target, r: &Reacted) -> Result<(), CacheError> {
         let Some(name) = target.name().filter(|n| !is_service(n)) else { return Ok(()) };
         if crate::msgid::is_made_up(&r.parent) {
@@ -324,7 +325,7 @@ impl Cache {
             .prepare_cached(
                 "INSERT INTO reactions (network, target, parent, emoji, who, nick, shown, time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT (network, target, parent, emoji, who) DO UPDATE SET nick = excluded.nick, shown = excluded.shown, time = excluded.time
-                 WHERE excluded.time >= reactions.time",
+                 WHERE excluded.time > reactions.time OR (excluded.time = reactions.time AND excluded.shown = 0)",
             )?
             .execute(params![network, name.to_ascii_lowercase(), r.parent, r.emoji, r.nick.to_ascii_lowercase(), r.nick, r.on, r.time.timestamp_millis()])?;
         Ok(())
@@ -1140,6 +1141,20 @@ mod tests {
         c.react("net", &chan("#a"), &reacted("m1", "👍", "bob", true, 9)).unwrap();
         let got = c.reactions("net", "#A", &["m1", "m2"]).unwrap();
         assert_eq!(got, [reacted("m1", "🎉", "carol", true, 11), reacted("m1", "👍", "Bob", false, 12)]);
+    }
+
+    #[test]
+    fn at_one_millisecond_taken_back_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Cache::open(&dir.path().join(FILE)).unwrap();
+        // The unreact from a newer page first, then the react from an older one.
+        c.react("net", &chan("#a"), &reacted("m1", "👍", "bob", false, 10)).unwrap();
+        c.react("net", &chan("#a"), &reacted("m1", "👍", "bob", true, 10)).unwrap();
+        // And in the order they were made.
+        c.react("net", &chan("#a"), &reacted("m1", "🎉", "bob", true, 11)).unwrap();
+        c.react("net", &chan("#a"), &reacted("m1", "🎉", "bob", false, 11)).unwrap();
+        let got = c.reactions("net", "#a", &["m1"]).unwrap();
+        assert_eq!(got, [reacted("m1", "👍", "bob", false, 10), reacted("m1", "🎉", "bob", false, 11)]);
     }
 
     #[test]
