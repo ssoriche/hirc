@@ -74,6 +74,25 @@ pub enum Effect {
     /// Escape, out of Insert or in Normal: put away a notice (the config
     /// banner), so one Esc does it whatever the mode.
     Dismiss,
+    /// A key for the line cursor.
+    Pick(Pick),
+    /// Escape in Normal with nothing pending: drop a reply being written.
+    Cancel,
+}
+
+/// A key for the line cursor (a line marked in the buffer, to react or
+/// reply to).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// Mark the newest line that can be reacted to.
+    Start,
+    /// Move the mark this many reactable lines (positive is newer).
+    Move(i32),
+    Clear,
+    Reply,
+    React,
+    /// Go to the line the marked one replies to.
+    Follow,
 }
 
 /// What an ex line means. See [`ex`].
@@ -121,6 +140,8 @@ enum Pending {
 #[derive(Debug, Default)]
 pub struct Vim {
     pub mode: Mode,
+    /// A line is marked in the buffer (the app says): the line keys go to it.
+    pub marked: bool,
     pending: Pending,
     register: String,
     undo: Option<(String, usize)>,
@@ -197,13 +218,28 @@ impl Vim {
     fn normal(&mut self, key: &Key, text: &str, cursor: usize) -> Vec<Effect> {
         let pending = std::mem::take(&mut self.pending);
         let cursor = clamp_normal(text, cursor);
+        if self.marked && pending == Pending::None && !key.ctrl {
+            let pick = match (key.ch, key.named) {
+                (_, Some(Named::Enter)) => Some(Pick::Follow),
+                (_, Some(Named::Escape)) => Some(Pick::Clear),
+                (Some('[' | 'k'), _) => Some(Pick::Move(-1)),
+                (Some(']' | 'j'), _) => Some(Pick::Move(1)),
+                (Some('r'), _) => Some(Pick::Reply),
+                (Some('+'), _) => Some(Pick::React),
+                _ => None,
+            };
+            if let Some(p) = pick {
+                return vec![Effect::Pick(p)];
+            }
+        }
         if key.named == Some(Named::Enter) {
             self.reset();
             return vec![Effect::Submit];
         }
-        // Escape cancels a pending prefix; with none, it puts a notice away.
+        // Escape cancels a pending prefix; with none, it puts a notice away
+        // and drops a reply being written.
         if key.named == Some(Named::Escape) {
-            return if pending == Pending::None { vec![Effect::Dismiss] } else { vec![] };
+            return if pending == Pending::None { vec![Effect::Dismiss, Effect::Cancel] } else { vec![] };
         }
         if key.ctrl {
             return match key.ch {
@@ -291,6 +327,7 @@ impl Vim {
             'j' => vec![Effect::Scroll(Scroll::Lines(1))],
             'k' => vec![Effect::Scroll(Scroll::Lines(-1))],
             'G' => vec![Effect::Scroll(Scroll::Bottom)],
+            '[' => vec![Effect::Pick(Pick::Start)],
             ':' => {
                 self.saved = Some((text.to_owned(), cursor));
                 self.mode = Mode::Ex;
@@ -468,6 +505,9 @@ mod tests {
     fn esc() -> Key {
         named(Named::Escape)
     }
+    fn ch(c: char) -> Key {
+        k(c)
+    }
 
     /// A tiny stand-in for the input box: applies `Edit`s, collects effects.
     struct Sim {
@@ -527,13 +567,28 @@ mod tests {
     fn escape_in_normal_dismisses_a_notice() {
         let mut s = Sim::normal("ab", 1);
         s.feed(esc());
-        assert_eq!(s.effects, vec![Effect::Dismiss]);
+        assert_eq!(s.effects, vec![Effect::Dismiss, Effect::Cancel]);
         assert_eq!(s.state(), ("ab", 1, Mode::Normal));
         // Out of Insert, the same one Esc puts it away.
         let mut s = Sim::new("ab", 2);
         s.feed(esc());
         assert_eq!(s.effects.last(), Some(&Effect::Dismiss));
         assert_eq!(s.state(), ("ab", 1, Mode::Normal));
+    }
+
+    #[test]
+    fn bracket_starts_the_line_cursor_and_it_takes_the_line_keys() {
+        let mut v = Vim { mode: Mode::Normal, ..Vim::default() };
+        assert_eq!(v.key(&ch('['), "", 0), vec![Effect::Pick(Pick::Start)]);
+        v.marked = true;
+        for (c, pick) in [('[', Pick::Move(-1)), ('k', Pick::Move(-1)), (']', Pick::Move(1)), ('j', Pick::Move(1)), ('r', Pick::Reply), ('+', Pick::React)] {
+            assert_eq!(v.key(&ch(c), "", 0), vec![Effect::Pick(pick)], "{c}");
+        }
+        assert_eq!(v.key(&named(Named::Enter), "", 0), vec![Effect::Pick(Pick::Follow)]);
+        assert_eq!(v.key(&named(Named::Escape), "", 0), vec![Effect::Pick(Pick::Clear)]);
+        v.marked = false;
+        assert_eq!(v.key(&ch('j'), "", 0), vec![Effect::Scroll(Scroll::Lines(1))], "unmarked, j scrolls as before");
+        assert_eq!(v.key(&named(Named::Escape), "", 0), vec![Effect::Dismiss, Effect::Cancel]);
     }
 
     #[test]

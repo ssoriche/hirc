@@ -295,6 +295,11 @@ pub struct Context<'a> {
     /// The line's reactions: each emoji, in the order it was first used,
     /// and who reacted with it.
     pub reactions: Vec<(&'a str, Vec<&'a str>)>,
+    /// The line cursor is on this line: a bar in the gutter beside it.
+    pub marked: bool,
+    /// The line was just gone to (a reply followed to it): its row is
+    /// lit for a moment.
+    pub flash: bool,
 }
 
 /// Something in the message view a click acts on, where it was drawn this
@@ -512,7 +517,7 @@ struct Composed {
 }
 
 /// The time a line shows (`HH:MM`, local).
-fn clock(line: &Line) -> String {
+pub(crate) fn clock(line: &Line) -> String {
     line.time.with_timezone(&chrono::Local).format("%H:%M").to_string()
 }
 
@@ -658,12 +663,18 @@ pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyEle
     // Once placed, the text says where it is, for a press or a drag.
     let spot = Spot { seq: line.seq, layout, inserted, len };
     let spots = app.spots.clone();
+    // The line cursor's bar sits in the gutter, over nothing, so the row
+    // keeps its place; a line just gone to wears the selection's fill.
+    let bar = cx.marked.then(|| div().absolute().left_0().top_0().h(px(m.line)).text_color(p.tertiary).child("▌"));
     let row = div()
+        .relative()
         .flex()
         .w_full()
         .min_w(px(0.))
         .px(px(m.gutter))
         .when(mention, |d| d.bg(p.highlight))
+        .when(cx.flash, |d| d.bg(p.selection))
+        .children(bar)
         .when(cols.time > 0, |d| d.child(div().flex_none().w(px(m.grid(cols.time))).whitespace_nowrap().text_color(time_color).child(time)))
         .child(nick_column(app, cols, prefix, cut.map(|full| (full, line.seq))))
         .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).on_children_prepainted(move |_, _, _| push_spot(&spots, spot.clone())).child(text));

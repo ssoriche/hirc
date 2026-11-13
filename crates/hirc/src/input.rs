@@ -70,6 +70,9 @@ pub struct TextInput {
     pub width: f32,
     /// Shown under the text until the next edit (see `Note`).
     pub note: Option<Note>,
+    /// Shown after the mode label, in the quiet role, while the app has
+    /// something to say about Normal mode (a marked line); set by the app.
+    pub status: Option<SharedString>,
     /// The Tab completion in progress, so another Tab offers the next match.
     cycle: Option<hirc_core::complete::Cycle>,
     /// The emoji popup over the input, while a `:name` is being typed.
@@ -321,9 +324,22 @@ impl TextInput {
         (rows.len() > 1).then_some(rows)
     }
 
+    /// Whether a line is marked in the buffer, so vim gives the line keys
+    /// to it (see `Vim::marked`).
+    pub fn set_marked(&mut self, on: bool) {
+        self.vim.marked = on;
+    }
+
     /// The width rows wrap against: the app's, else what was drawn last.
+    /// While a status sits before the text, the text has only what is
+    /// left of the row.
     fn wrap_width(&self, bounds: Option<Bounds<Pixels>>) -> f32 {
-        if self.width > 0. { self.width } else { bounds.map_or(0., |b| f32::from(b.size.width)) }
+        let drawn = bounds.map(|b| f32::from(b.size.width));
+        match (self.width > 0., self.status.is_some(), drawn) {
+            (true, true, Some(d)) => self.width.min(d),
+            (true, _, _) => self.width,
+            (false, _, d) => d.unwrap_or(0.),
+        }
     }
 
     /// Tab: complete the word before the cursor from `nicks` (or the
@@ -913,6 +929,13 @@ impl Render for TextInput {
             Note::Confirm(text) => (text.clone(), p.map(|p| p.hint)),
         });
         let popup = self.popup.clone().zip(p.cloned());
+        // The status (a marked line) reads on from the mode label, on the
+        // text's row; the text follows it.
+        let status = self
+            .status
+            .clone()
+            .map(|text| div().flex_none().whitespace_nowrap().mr(cell * 2.).when_some(p.map(|p| p.text_dim), |d, c| d.text_color(c)).child(text));
+        let text = div().flex().min_w(px(0.)).children(status).child(div().flex_1().min_w(px(0.)).child(TextElement { input: cx.entity() }));
         div()
             .relative()
             .flex()
@@ -954,7 +977,7 @@ impl Render for TextInput {
                     .min_w(px(0.))
                     .flex()
                     .flex_col()
-                    .child(TextElement { input: cx.entity() })
+                    .child(text)
                     .when_some(note, |d, (text, color)| d.child(div().when_some(color, |d, c| d.text_color(c)).truncate().child(text))),
             )
             // The popup sits above the input, over the message view; `deferred`
@@ -1019,6 +1042,7 @@ impl TextInput {
             column: 0.,
             width: 0.,
             note: None,
+            status: None,
             cycle: None,
             popup: None,
             dismissed: None,
@@ -1151,7 +1175,7 @@ impl TextInput {
                     self.marked_range = None;
                 }
                 Effect::Submit => self.submit(cx),
-                Effect::Scroll(_) | Effect::Nav(_) | Effect::Ex(_) | Effect::Dismiss => cx.emit(VimEvent(effect)),
+                Effect::Scroll(_) | Effect::Nav(_) | Effect::Ex(_) | Effect::Dismiss | Effect::Pick(_) | Effect::Cancel => cx.emit(VimEvent(effect)),
             }
         }
         self.refresh_popup();

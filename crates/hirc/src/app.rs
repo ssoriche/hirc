@@ -6,9 +6,10 @@ use crate::links;
 use crate::metrics::{Columns, Metrics, Shape};
 use crate::scroll::{self, Pos};
 use crate::theme::{self, Palette, palette};
+use crate::views::buffer::{self, Hit};
 use crate::views::selection::{self, Mark, Selection};
-use crate::views::{buffer, sidebar, viewport};
-use crate::vim::{self, Effect, Ex, Nav, Scroll};
+use crate::views::{sidebar, viewport};
+use crate::vim::{self, Effect, Ex, Nav, Pick, Scroll};
 use chrono::{DateTime, Utc};
 use gpui::{
     App, ClipboardItem, Context, Entity, Focusable, KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, ScrollHandle,
@@ -18,7 +19,7 @@ use hirc_core::command::{self, Input, WindowAction};
 use hirc_core::event::{Command, ConnStatus, Event, Target};
 use hirc_core::layout::{self, Layout};
 use hirc_core::services;
-use hirc_core::store::{Applied, Buffer, HistoryState, LineKind, Network, Store, counts};
+use hirc_core::store::{Applied, Buffer, HistoryState, LineKind, Network, Store, counts, reactable, step_reactable};
 use hirc_core::theme::Theme;
 use hirc_core::{display, multiline, split};
 use std::cell::{Cell, RefCell};
@@ -167,7 +168,24 @@ pub struct HircApp {
     /// URLs), for the `link:` snapshot step.
     #[cfg(feature = "snapshot")]
     pub link_spots: std::cell::RefCell<Vec<LinkSpot>>,
+    /// The line cursor: the seq of the line marked in the window on
+    /// screen, to react or reply to.
+    mark: Option<u64>,
+    /// The line just gone to (a reply followed to it), lit for a moment.
+    flash: Option<u64>,
+    /// A reply being followed to a line not loaded yet: older pages are
+    /// asked for until it shows.
+    seek: Option<Seek>,
     commands: UnboundedSender<Command>,
+}
+
+/// Following a reply to a line further back than what is loaded: the
+/// window, the line's msgid and how many more pages to ask for.
+struct Seek {
+    n: usize,
+    b: usize,
+    parent: String,
+    pages: u8,
 }
 
 impl HircApp {
@@ -312,6 +330,9 @@ impl HircApp {
             dry_open: init.dry_open,
             #[cfg(feature = "snapshot")]
             link_spots: Default::default(),
+            mark: None,
+            flash: None,
+            seek: None,
             commands: init.commands,
         }
     }
@@ -335,6 +356,9 @@ impl HircApp {
         if self.selected != Some((n, b)) {
             self.selection = None;
             self.drag = None;
+            self.mark = None;
+            self.flash = None;
+            self.seek = None;
             let buf = &self.store.networks[n].buffers[b];
             self.marker = buf.first_unread().map(|ix| (n, b, buf.lines[ix].seq));
         }
@@ -536,8 +560,133 @@ impl HircApp {
                 Ex::Slash(s) => self.submit(s, cx),
             },
             Effect::Dismiss => self.banner = None,
+            Effect::Pick(p) => self.pick(*p, cx),
+            // Task 8: drop the reply being written (`self.reply = None`).
+            Effect::Cancel => {}
             Effect::Pass | Effect::Edit { .. } | Effect::Submit => {}
         }
+        cx.notify();
+    }
+
+    /// A line cursor key: mark a line, move the mark over the lines that
+    /// can be reacted to, put it away, or go to the line the marked one
+    /// replies to.
+    fn pick(&mut self, p: Pick, cx: &mut Context<Self>) {
+        let Some((n, b)) = self.selected else { return };
+        let net = &self.store.networks[n];
+        let buf = &net.buffers[b];
+        let at = self.mark.and_then(|seq| buf.lines.iter().position(|l| l.seq == seq));
+        let to = match p {
+            // Only where the server carries tags: elsewhere nothing can be
+            // reacted or replied to.
+            Pick::Start => buf.lines.iter().rposition(reactable).filter(|_| net.tags),
+            Pick::Move(by) => at.map(|from| (0..by.unsigned_abs()).fold(from, |ix, _| step_reactable(buf, ix, by > 0).unwrap_or(ix))),
+            Pick::Clear => {
+                self.mark = None;
+                None
+            }
+            Pick::Follow => {
+                if let Some(parent) = at.and_then(|ix| buf.lines[ix].reply_to.clone()) {
+                    self.follow(n, b, parent, cx);
+                }
+                None
+            }
+            // Task 8 (reply) and Task 9 (react).
+            Pick::Reply | Pick::React => None,
+        };
+        if let Some(ix) = to {
+            self.mark = Some(self.store.networks[n].buffers[b].lines[ix].seq);
+            self.reveal(ix);
+        }
+        self.sync_mark(cx);
+    }
+
+    /// What the input says about the line cursor, after the mode label:
+    /// whose line is marked and when, and the keys for it. `None` when no
+    /// line is marked, or the marked one has gone (an echo replaced it).
+    fn mark_status(&self) -> Option<String> {
+        let seq = self.mark?;
+        let (_, buf) = self.current()?;
+        let line = buf.lines.iter().find(|l| l.seq == seq)?;
+        Some(format!("line: {} {}  (r reply, + react, Esc)", line.nick.as_deref().unwrap_or(""), buffer::clock(line)))
+    }
+
+    /// Tell the input whether a line is marked (so vim gives it the line
+    /// keys) and what to say about it; a mark on a line that has gone is
+    /// dropped.
+    fn sync_mark(&mut self, cx: &mut Context<Self>) {
+        let status = self.mark_status();
+        if status.is_none() {
+            self.mark = None;
+        }
+        self.input.update(cx, |input, _| {
+            input.set_marked(status.is_some());
+            input.status = status.map(Into::into);
+        });
+    }
+
+    /// Scroll the message view so line `ix` shows whole, if it doesn't.
+    /// Revealing the newest line follows new lines again.
+    fn reveal(&self, ix: usize) {
+        let top = self.lines.logical_scroll_top();
+        let above = ix < top.item_ix || (ix == top.item_ix && f32::from(top.offset_in_item) > 0.);
+        let view = self.lines.viewport_bounds();
+        let below = !above && self.lines.bounds_for_item(ix).is_none_or(|item| item.bottom() > view.bottom() + px(0.5));
+        if below && ix + 1 == self.lines.item_count() {
+            scroll::set(&self.lines, scroll::Pos::Tail);
+        } else if above || below {
+            self.lines.scroll_to_reveal_item(ix);
+        }
+    }
+
+    /// Go to the line with msgid `parent` in `(n, b)` (the line a reply
+    /// answers): reveal it and light it for a moment. Not loaded yet,
+    /// older pages are asked for until it is (see `history_arrived`).
+    fn follow(&mut self, n: usize, b: usize, parent: String, cx: &mut Context<Self>) {
+        self.seek = None;
+        let buf = &self.store.networks[n].buffers[b];
+        if let Some(ix) = buf.lines.iter().rposition(|l| l.msgid.as_deref() == Some(parent.as_str())) {
+            self.flash_line(ix, cx);
+        } else if buf.history == HistoryState::Start {
+            self.not_found(n, b);
+        } else {
+            self.seek = Some(Seek { n, b, parent, pages: 10 });
+            self.seek_page(n, b);
+        }
+    }
+
+    /// Ask for the page before `(n, b)`'s oldest line for a seek, unless
+    /// one is on its way already; when none can be asked for, the seek
+    /// ends there.
+    fn seek_page(&mut self, n: usize, b: usize) {
+        if self.store.networks[n].buffers[b].history == HistoryState::Loading {
+            return;
+        }
+        if !self.ask_older(n, b) {
+            self.seek = None;
+            self.not_found(n, b);
+        }
+    }
+
+    fn not_found(&mut self, n: usize, b: usize) {
+        self.local_note(n, b, "The line it replies to wasn't found in the history loaded".into());
+    }
+
+    /// Reveal line `ix` of the window on screen and light it for a moment.
+    fn flash_line(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(seq) = self.current().and_then(|(_, buf)| buf.lines.get(ix)).map(|l| l.seq) else { return };
+        self.flash = Some(seq);
+        self.reveal(ix);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+            _ = this.update(cx, |app, cx| {
+                if app.flash == Some(seq) {
+                    app.flash = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -580,7 +729,7 @@ impl HircApp {
                     self.arrived(network, buffer, index);
                 }
             }
-            Applied::History { network, buffer, at } => self.history_arrived(network, buffer, at),
+            Applied::History { network, buffer, at } => self.history_arrived(network, buffer, at, cx),
             Applied::Read { network, buffer } => {
                 if let Some(seq) = got.divider {
                     self.set_marker(network, buffer, seq);
@@ -616,7 +765,7 @@ impl HircApp {
     /// `at` (in the order they went in). On screen each is spliced in
     /// where it went. Lines above the view keep it where it was: the list
     /// moves its top item down with them, so nothing jumps.
-    fn history_arrived(&mut self, n: usize, b: usize, at: Vec<usize>) {
+    fn history_arrived(&mut self, n: usize, b: usize, at: Vec<usize>, cx: &mut Context<Self>) {
         if self.selected != Some((n, b)) {
             return;
         }
@@ -636,21 +785,41 @@ impl HircApp {
         let buf = &mut self.store.networks[n].buffers[b];
         buf.unread = 0;
         buf.mentions = 0;
+        // A reply being followed back: is its line here now? If not, the
+        // next page, while there are pages and tries left.
+        if let Some(seek) = self.seek.take_if(|s| (s.n, s.b) == (n, b)) {
+            let buf = &self.store.networks[n].buffers[b];
+            if let Some(ix) = buf.lines.iter().rposition(|l| l.msgid.as_deref() == Some(seek.parent.as_str())) {
+                self.flash_line(ix, cx);
+            } else if seek.pages > 1 && buf.history != HistoryState::Start && self.dry != Some((n, b)) {
+                self.seek = Some(Seek { pages: seek.pages - 1, ..seek });
+                self.seek_page(n, b);
+            } else {
+                self.not_found(n, b);
+            }
+        }
     }
 
     /// The top of the window on screen is showing: ask for the page
     /// before it, unless one is on its way or there is none.
     fn want_older(&mut self, up: bool) {
-        let Some((n, b)) = self.selected else { return };
-        let net = &mut self.store.networks[n];
-        let status = &net.status;
-        let buf = &mut net.buffers[b];
-        if !older_ready(buf, up, status) {
-            return;
+        if let Some((n, b)) = self.selected.filter(|_| up) {
+            self.ask_older(n, b);
         }
-        let Some(target) = buf.target.name().map(str::to_owned) else { return };
+    }
+
+    /// Send for the page before `(n, b)`'s oldest line, if one can be
+    /// asked for now (see `older_ready`). True if it went.
+    fn ask_older(&mut self, n: usize, b: usize) -> bool {
+        let net = &mut self.store.networks[n];
+        let buf = &mut net.buffers[b];
+        if !older_ready(buf, true, &net.status) {
+            return false;
+        }
+        let Some(target) = buf.target.name().map(str::to_owned) else { return false };
         buf.history = HistoryState::Loading;
         let _ = self.commands.send(Command::Older { network: net.name.clone(), target });
+        true
     }
 
     /// Put the "new" divider of the window on screen above the line with
@@ -880,6 +1049,19 @@ impl HircApp {
         self.clicks.set(e.click_count);
         self.selection = None;
         self.drag = None;
+        // A reply's quote goes to the line it answers.
+        let quote = self.hits.borrow().iter().find_map(|(bounds, hit)| match hit {
+            Hit::Quote { seq } if bounds.contains(&e.position) => Some(*seq),
+            _ => None,
+        });
+        if let (Some(seq), Some((n, b))) = (quote, self.selected) {
+            let parent = self.current().and_then(|(_, buf)| buf.lines.iter().find(|l| l.seq == seq)?.reply_to.clone());
+            if let Some(parent) = parent {
+                self.follow(n, b, parent, cx);
+            }
+            cx.notify();
+            return;
+        }
         let (Some(buffer), Some(at)) = (self.selected, self.hit(e.position)) else {
             cx.notify();
             return;
@@ -920,7 +1102,7 @@ impl HircApp {
     /// A line context for copying: our nick, no colours.
     fn copy_context<'a>(&self, me: Option<&'a str>) -> buffer::Context<'a> {
         static EMPTY: std::sync::LazyLock<HashMap<String, usize>> = std::sync::LazyLock::new(HashMap::new);
-        buffer::Context { me, cols: self.cols, slots: &EMPTY, selected: None, parent: None, reactions: vec![] }
+        buffer::Context { me, cols: self.cols, slots: &EMPTY, selected: None, parent: None, reactions: vec![], marked: false, flash: false }
     }
 
     /// The selection, resolved against the shown buffer: its first and
@@ -961,7 +1143,8 @@ impl HircApp {
                 let selected = self.selected_span.and_then(|(start, end)| selection::span(ix, usize::MAX, start, end));
                 let parent = line.reply_to.as_deref().map(|id| buf.lines.iter().rev().find(|l| l.msgid.as_deref() == Some(id)));
                 let reactions = line.msgid.as_deref().map(|id| buf.reactions(id)).unwrap_or_default();
-                let cx = buffer::Context { me: net.nick.as_deref(), cols: self.cols, slots, selected, parent, reactions };
+                let (marked, flash) = (self.mark == Some(line.seq), self.flash == Some(line.seq));
+                let cx = buffer::Context { me: net.nick.as_deref(), cols: self.cols, slots, selected, parent, reactions, marked, flash };
                 let line_el = buffer::line(self, window, line, &cx);
                 let server = buf.target == Target::Server;
                 match self.marker {
@@ -1012,6 +1195,7 @@ impl Render for HircApp {
         let column = m.text_column(cols);
         let placeholder = self.placeholder();
         let text_width = pane - 2. * m.gutter - column;
+        self.sync_mark(cx);
         self.input.update(cx, |input, _| {
             input.column = column;
             input.width = text_width;
