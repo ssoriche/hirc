@@ -6,6 +6,9 @@ members = ["crates/hirc-core", "crates/hirc"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+description = "A keyboard-first IRC client with IRCv3 history, reactions and replies"
+license = "MIT"
+repository = "https://github.com/ssoriche/hirc"
 
 [workspace.dependencies]
 base64 = "0.23"
