@@ -18,7 +18,7 @@
 //!
 //! | Variable | Effect |
 //! |---|---|
-//! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` never leaves the process; a faked server answers some sends through the session: a JOIN comes back as our JOIN plus a NAMES of just us (no topic), a PART as our PART, and on an `echo_message` server a PRIVMSG/NOTICE as its echo, a `draft/multiline` batch (a server with `multiline`) as the whole batch. Everything else is dropped. Connection status follows conn.rs: an `Output::Quit` (`/quit`) is `Offline`, an `Output::Stop` (e.g. a SASL failure) is `Failed { reason }`, and a server `ERROR` line closes the connection as `Disconnected { reason: <the ERROR text>, retry }`, with conn.rs's first retry delay. Either way that network reads no more fixture lines and later commands to it go nowhere (no reconnect is faked). On a `chathistory` server it also answers the session's `CHATHISTORY` from the fixture's `history` (LATEST, BEFORE and AFTER pages; TARGETS finds nothing). |
+//! | `HIRC_FIXTURE=<file.toml>` | No `conn::spawn`. Canned server lines go through a real `Session` per server; UI commands go to `session.command`, and only its `Event`s return. `Output::Send` never leaves the process; a faked server answers some sends through the session: a JOIN comes back as our JOIN plus a NAMES of just us (no topic), a PART as our PART, and on an `echo_message` server a PRIVMSG/NOTICE/TAGMSG as its echo (keeping its client tags), a `draft/multiline` batch (a server with `multiline`) as the whole batch. Everything else is dropped. Connection status follows conn.rs: an `Output::Quit` (`/quit`) is `Offline`, an `Output::Stop` (e.g. a SASL failure) is `Failed { reason }`, and a server `ERROR` line closes the connection as `Disconnected { reason: <the ERROR text>, retry }`, with conn.rs's first retry delay. Either way that network reads no more fixture lines and later commands to it go nowhere (no reconnect is faked). On a `chathistory` server it also answers the session's `CHATHISTORY` from the fixture's `history` (LATEST, BEFORE and AFTER pages; TARGETS finds nothing). |
 //! | `HIRC_SCREENSHOT=<out.png>` | Final image, taken after the script. Window mode waits 300 ms for layout, captures, quits. |
 //! | `HIRC_OFFSCREEN=1` | Offscreen mode (above). Exits 0 when done; on failure prints `snapshot: <reason>` and exits 1. |
 //! | `HIRC_SIZE=WxH` | Logical size (default `1200x800`). |
@@ -127,6 +127,9 @@ pub struct FixtureServer {
     /// And draft/read-marker (a `MARKREAD` line in `lines` places it).
     #[serde(default)]
     pub read_marker: bool,
+    /// Pretend the server ACKed message-tags: reactions and replies.
+    #[serde(default)]
+    pub message_tags: bool,
     /// As the config's `history_page_size`.
     #[serde(default)]
     pub history_page_size: Option<usize>,
@@ -214,7 +217,7 @@ pub fn parse_script(script: &str) -> Vec<Step> {
             match s.split_once(':') {
                 Some(("window", n)) => n.trim().parse().map_or_else(|_| unknown(), Step::Window),
                 // github-rs writes `cmd+k`; gpui writes `cmd-k`.
-                Some(("key", k)) => Step::Key(k.trim().replace('+', "-")),
+                Some(("key", k)) => Step::Key(if k.trim() == "+" { "+".into() } else { k.trim().replace('+', "-") }),
                 Some(("type", t)) => Step::Type(t.to_owned()),
                 Some(("paste", t)) => Step::Paste(unescape(t)),
                 Some(("wait", ms)) => ms.trim().parse().map_or_else(|_| unknown(), Step::Wait),
@@ -444,6 +447,7 @@ pub fn feed(fx: &Fixture) -> Result<(Vec<Event>, HashMap<String, Fake>), String>
             .chain(srv.multiline.iter().map(|v| format!("batch message-tags draft/multiline={v}")))
             .chain(srv.chathistory.then(|| "batch message-tags server-time labeled-response draft/chathistory draft/event-playback".to_owned()))
             .chain(srv.read_marker.then(|| "draft/read-marker".to_owned()))
+            .chain(srv.message_tags.then(|| "message-tags".to_owned()))
             .collect();
         if !caps.is_empty() {
             let ls = caps.join(" ");
@@ -466,7 +470,7 @@ pub fn feed(fx: &Fixture) -> Result<(Vec<Event>, HashMap<String, Fake>), String>
 
 /// What a server sends back for `sent`. It always confirms our JOIN (with a
 /// minimal NAMES, just us, and no topic) and PART; on an `echo-message`
-/// server our PRIVMSG/NOTICE also comes back, with a server time and msgid.
+/// server our PRIVMSG/NOTICE/TAGMSG also comes back, with a server time and msgid.
 /// Anything else gets no reply.
 fn fake_replies(sent: &Message, nick: &str, echo_message: bool, now: DateTime<Utc>, n: u64) -> Vec<Message> {
     let from = |source: String, command: &str, params: Vec<String>| {
@@ -490,12 +494,17 @@ fn fake_replies(sent: &Message, nick: &str, echo_message: bool, now: DateTime<Ut
             .collect(),
         "PART" => channels().map(|chan| from(us(), "PART", std::iter::once(chan).chain(sent.params.get(1).cloned()).collect())).collect(),
         // A line of a batch keeps its batch tags; the batch's opening
-        // carries the time and msgid, as Ergo's does.
-        "PRIVMSG" | "NOTICE" | "BATCH" if echo_message => {
+        // carries the time and msgid, as Ergo's does, and keeps our client
+        // tags (a reaction, a reply).
+        "PRIVMSG" | "NOTICE" | "BATCH" | "TAGMSG" if echo_message => {
             let mut echo = sent.clone();
             let opens = sent.command == "BATCH" && sent.params.first().is_some_and(|r| r.starts_with('+'));
             if sent.tag("batch").is_none() && (sent.command != "BATCH" || opens) {
-                echo.tags = vec![("time".into(), Some(now.to_rfc3339_opts(SecondsFormat::Millis, true))), ("msgid".into(), Some(format!("echo-{n}")))];
+                let client = sent.tags.iter().filter(|(k, _)| k.starts_with('+')).cloned();
+                echo.tags = [("time".into(), Some(now.to_rfc3339_opts(SecondsFormat::Millis, true))), ("msgid".into(), Some(format!("echo-{n}")))]
+                    .into_iter()
+                    .chain(client)
+                    .collect();
             }
             echo.source = Some(us());
             vec![echo]
@@ -1257,11 +1266,23 @@ mod tests {
     #[test]
     fn fake_server_ignores_everything_else() {
         let now: DateTime<Utc> = DEFAULT_BASE.parse().unwrap();
-        for line in ["NICK x", "PING :x", "TAGMSG #a", "QUIT :bye", "TOPIC #a :x"] {
+        for line in ["NICK x", "PING :x", "QUIT :bye", "TOPIC #a :x"] {
             for echo in [true, false] {
                 assert!(fake_replies(&Message::parse(line).unwrap(), "me", echo, now, 0).is_empty(), "{line}");
             }
         }
+        assert!(fake_replies(&Message::parse("TAGMSG #a").unwrap(), "me", false, now, 0).is_empty());
+    }
+
+    #[test]
+    fn an_echoed_tagmsg_keeps_its_client_tags() {
+        let now: DateTime<Utc> = DEFAULT_BASE.parse().unwrap();
+        let sent = Message::parse("@+draft/react=👍;+draft/reply=a1 TAGMSG #a").unwrap();
+        let echo = fake_replies(&sent, "me", true, now, 3);
+        assert_eq!(echo.len(), 1);
+        assert_eq!(echo[0].tag("+draft/react"), Some("👍"));
+        assert_eq!(echo[0].tag("+draft/reply"), Some("a1"));
+        assert_eq!(echo[0].tag("msgid"), Some("echo-3"));
     }
 
     #[test]

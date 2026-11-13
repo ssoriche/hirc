@@ -151,6 +151,9 @@ pub struct HircApp {
     /// Where each line's text was drawn this frame, top to bottom: what a
     /// press or drag hit-tests (see `buffer::hit`).
     pub spots: Rc<RefCell<Vec<buffer::Spot>>>,
+    /// Where each thing a click acts on (a reaction chip, a reply's
+    /// quote) was drawn this frame.
+    pub hits: buffer::Hits,
     /// The selected message text, if any (see `selection`).
     selection: Option<Selection>,
     /// Where a drag that may select began, while the button is down.
@@ -302,6 +305,7 @@ impl HircApp {
             press: Rc::default(),
             clicks: Rc::default(),
             spots: Rc::default(),
+            hits: Rc::default(),
             selection: None,
             drag: None,
             selected_span: None,
@@ -582,6 +586,9 @@ impl HircApp {
                     self.set_marker(network, buffer, seq);
                 }
             }
+            // A line's reactions changed: measure it again (its chips may
+            // take a row, or give one back).
+            Applied::Reacted { network, buffer, index: Some(ix) } if self.selected == Some((network, buffer)) => self.lines.splice(ix..ix + 1, 1),
             Applied::Reacted { .. } | Applied::Changed | Applied::Nothing => {}
         }
         self.sync_layout();
@@ -913,7 +920,7 @@ impl HircApp {
     /// A line context for copying: our nick, no colours.
     fn copy_context<'a>(&self, me: Option<&'a str>) -> buffer::Context<'a> {
         static EMPTY: std::sync::LazyLock<HashMap<String, usize>> = std::sync::LazyLock::new(HashMap::new);
-        buffer::Context { me, cols: self.cols, slots: &EMPTY, selected: None }
+        buffer::Context { me, cols: self.cols, slots: &EMPTY, selected: None, parent: None, reactions: vec![] }
     }
 
     /// The selection, resolved against the shown buffer: its first and
@@ -949,11 +956,14 @@ impl HircApp {
         let slots = self.selected.and_then(|key| self.nick_slots.get(&key)).map(|(_, s)| s);
         let empty = HashMap::new();
         let slots = slots.unwrap_or(&empty);
-        match self.current().and_then(|(net, buf)| Some((net, buf.lines.get(ix)?))) {
-            Some((net, line)) => {
+        match self.current().and_then(|(net, buf)| Some((net, buf, buf.lines.get(ix)?))) {
+            Some((net, buf, line)) => {
                 let selected = self.selected_span.and_then(|(start, end)| selection::span(ix, usize::MAX, start, end));
-                let line_el = buffer::line(self, window, line, &buffer::Context { me: net.nick.as_deref(), cols: self.cols, slots, selected });
-                let server = self.current().is_some_and(|(_, buf)| buf.target == Target::Server);
+                let parent = line.reply_to.as_deref().map(|id| buf.lines.iter().rev().find(|l| l.msgid.as_deref() == Some(id)));
+                let reactions = line.msgid.as_deref().map(|id| buf.reactions(id)).unwrap_or_default();
+                let cx = buffer::Context { me: net.nick.as_deref(), cols: self.cols, slots, selected, parent, reactions };
+                let line_el = buffer::line(self, window, line, &cx);
+                let server = buf.target == Target::Server;
                 match self.marker {
                     Some((n, b, seq)) if self.selected == Some((n, b)) && line.seq == seq => buffer::with_marker(self, line_el),
                     // In a server buffer, a quiet rule where one
@@ -974,6 +984,7 @@ impl Render for HircApp {
         #[cfg(feature = "snapshot")]
         self.link_spots.borrow_mut().clear();
         self.spots.borrow_mut().clear();
+        self.hits.borrow_mut().clear();
         self.selected_span = self.resolve_selection();
         let width = f32::from(window.viewport_size().width);
         self.sidebar_width = m.sidebar_width(width);

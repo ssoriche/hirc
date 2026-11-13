@@ -31,8 +31,8 @@ use crate::theme::Palette;
 use crate::views::selection::{self, Log, Mark};
 use crate::wrap;
 use gpui::{
-    AnyElement, FontWeight, HighlightStyle, Hsla, InteractiveText, IntoElement, Pixels, Point, SharedString, StyledText, TextLayout, TextRun, UnderlineStyle,
-    Window, div, prelude::*, px,
+    AnyElement, Bounds, FontWeight, HighlightStyle, Hsla, InteractiveText, IntoElement, Pixels, Point, SharedString, StyledText, TextLayout, TextRun,
+    UnderlineStyle, Window, div, prelude::*, px,
 };
 use hirc_core::display::{self, Part};
 use hirc_core::event::{ConnStatus, Target};
@@ -289,6 +289,46 @@ pub struct Context<'a> {
     pub slots: &'a HashMap<String, usize>,
     /// What of the line's text is selected (bytes of it unwrapped).
     pub selected: Option<std::ops::Range<usize>>,
+    /// The message the line answers: `None` when it is no reply,
+    /// `Some(None)` when it is one but its parent isn't loaded.
+    pub parent: Option<Option<&'a Line>>,
+    /// The line's reactions: each emoji, in the order it was first used,
+    /// and who reacted with it.
+    pub reactions: Vec<(&'a str, Vec<&'a str>)>,
+}
+
+/// Something in the message view a click acts on, where it was drawn this
+/// frame (see `HircApp::hits`): a reaction chip, a reply's quote, a
+/// line's react or reply button.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Hit {
+    Chip {
+        seq: u64,
+        emoji: String,
+    },
+    Quote {
+        seq: u64,
+    },
+    // The line's buttons, not drawn yet.
+    #[allow(dead_code)]
+    React {
+        seq: u64,
+    },
+    #[allow(dead_code)]
+    Reply {
+        seq: u64,
+    },
+}
+
+/// The hit targets drawn this frame, and where (see `Hit`).
+pub type Hits = std::rc::Rc<std::cell::RefCell<Vec<(Bounds<Pixels>, Hit)>>>;
+
+/// Register where a hit target was drawn, once per frame (one laid out
+/// twice keeps its last place).
+fn push_hit(hits: &std::cell::RefCell<Vec<(Bounds<Pixels>, Hit)>>, bounds: Bounds<Pixels>, hit: Hit) {
+    let mut hits = hits.borrow_mut();
+    hits.retain(|(_, h)| *h != hit);
+    hits.push((bounds, hit));
 }
 
 /// A line's text as drawn this frame: its layout (laid out and placed),
@@ -618,7 +658,7 @@ pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyEle
     // Once placed, the text says where it is, for a press or a drag.
     let spot = Spot { seq: line.seq, layout, inserted, len };
     let spots = app.spots.clone();
-    div()
+    let row = div()
         .flex()
         .w_full()
         .min_w(px(0.))
@@ -626,8 +666,95 @@ pub fn line(app: &HircApp, window: &Window, line: &Line, cx: &Context) -> AnyEle
         .when(mention, |d| d.bg(p.highlight))
         .when(cols.time > 0, |d| d.child(div().flex_none().w(px(m.grid(cols.time))).whitespace_nowrap().text_color(time_color).child(time)))
         .child(nick_column(app, cols, prefix, cut.map(|full| (full, line.seq))))
-        .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).on_children_prepainted(move |_, _, _| push_spot(&spots, spot.clone())).child(text))
-        .into_any_element()
+        .child(div().flex_1().min_w(px(0.)).ml(px(m.cell)).on_children_prepainted(move |_, _, _| push_spot(&spots, spot.clone())).child(text));
+    let quote = cx.parent.map(|parent| quote_row(app, line.seq, parent));
+    let chips = (!cx.reactions.is_empty()).then(|| chip_row(app, line.seq, &cx.reactions, cx.me));
+    if quote.is_none() && chips.is_none() {
+        return row.into_any_element();
+    }
+    div().flex().flex_col().w_full().children(quote).child(row).children(chips).into_any_element()
+}
+
+/// A row on the grid under the time and nick columns, which it leaves
+/// empty (as `with_rule` lays out its marker row), holding `text` in the
+/// text column.
+fn text_row(app: &HircApp, text: gpui::Div) -> gpui::Div {
+    let m = &app.metrics;
+    let cols = app.cols();
+    div()
+        .flex()
+        .w_full()
+        .min_w(px(0.))
+        .px(px(m.gutter))
+        .when(cols.time > 0, |d| d.child(div().flex_none().w(px(m.grid(cols.time)))))
+        .child(div().flex_none().w(px(m.grid(cols.nick))).when(cols.time > 0, |d| d.ml(px(m.cell))))
+        .child(text.flex_1().min_w(px(0.)).ml(px(m.cell)))
+}
+
+/// What a reply answers, one quiet row above it: `↩ nick: text` (cut to
+/// the text column with `…`), or `↩ an earlier message` when the parent
+/// isn't loaded. Where it was drawn is a `Hit::Quote`.
+fn quote_row(app: &HircApp, seq: u64, parent: Option<&Line>) -> AnyElement {
+    let m = &app.metrics;
+    let said = match parent {
+        Some(parent) => {
+            let nick = parent.nick.as_deref().map_or_else(|| who(parent), str::to_owned);
+            let text = hirc_core::emoji::render(&parent.text).replace(['\r', '\n'], " ");
+            format!("↩ {nick}: {text}")
+        }
+        None => "↩ an earlier message".to_owned(),
+    };
+    let hits = app.hits.clone();
+    let text = div().h(px(m.line)).whitespace_nowrap().overflow_hidden().text_ellipsis().text_color(app.palette.quiet).child(said);
+    let column = div()
+        .on_children_prepainted(move |bounds, _, _| {
+            if let Some(b) = bounds.first() {
+                push_hit(&hits, *b, Hit::Quote { seq });
+            }
+        })
+        .child(text);
+    text_row(app, column).into_any_element()
+}
+
+/// A line's reactions, one row under it (more when they wrap): a chip
+/// per emoji, `{emoji} {count}`, ours outlined, each a whole line high
+/// (the outline is inside it), so the view stays on its grid. Hovering a
+/// chip shows who reacted; where each was drawn is a `Hit::Chip`.
+fn chip_row(app: &HircApp, seq: u64, reactions: &[(&str, Vec<&str>)], me: Option<&str>) -> AnyElement {
+    let p = &app.palette;
+    let m = &app.metrics;
+    let emojis: Vec<String> = reactions.iter().map(|(e, _)| (*e).to_owned()).collect();
+    let chips = reactions.iter().map(|(emoji, who)| {
+        let ours = me.is_some_and(|me| who.iter().any(|w| w.eq_ignore_ascii_case(me)));
+        let tip = Tip { text: who.join(", ").into(), palette: p.clone(), metrics: *m, font: app.font.family.clone() };
+        div()
+            .id(SharedString::from(format!("chip-{seq}-{emoji}")))
+            .flex()
+            .items_center()
+            .flex_none()
+            .h(px(m.line))
+            .px(px(m.cell / 2.))
+            .rounded_sm()
+            .bg(p.title_bg)
+            .border_1()
+            .border_color(if ours { p.unread } else { gpui::transparent_black() })
+            .text_color(p.text_dim)
+            .whitespace_nowrap()
+            .child(format!("{emoji} {}", who.len()))
+            .tooltip(move |_, cx| cx.new(|_| tip.clone()).into())
+    });
+    let hits = app.hits.clone();
+    let row = div()
+        .flex()
+        .flex_wrap()
+        .gap_x(px(m.cell))
+        .on_children_prepainted(move |bounds, _, _| {
+            for (b, emoji) in bounds.iter().zip(&emojis) {
+                push_hit(&hits, *b, Hit::Chip { seq, emoji: emoji.clone() });
+            }
+        })
+        .children(chips);
+    text_row(app, row).into_any_element()
 }
 
 /// Register where a line's text was drawn, once per frame (a line laid

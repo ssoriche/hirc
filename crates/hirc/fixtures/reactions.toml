@@ -1,0 +1,24 @@
+# Invented content for `snapshot` runs of reactions and replies (see
+# src/snapshot.rs). No real nicks, servers or channels belong here.
+base_time = "2026-03-02T12:00:00Z"
+
+[[server]]
+name = "demo"
+nick = "me"
+echo_message = true
+message_tags = true
+lines = [
+  ":irc.example 001 me :Welcome",
+  ":me!u@h JOIN #lunch",
+  ":irc.example 353 me = #lunch :me alice bob carol dave",
+  ":irc.example 366 me #lunch :End of /NAMES list.",
+  "@time=2026-03-02T12:01:00.000Z;msgid=a1 :alice!a@h PRIVMSG #lunch :lunch?",
+  "@time=2026-03-02T12:02:00.000Z;msgid=b1 :bob!b@h PRIVMSG #lunch :sure, where?",
+  "@time=2026-03-02T12:02:30.000Z;+draft/react=👍;+draft/reply=a1 :bob!b@h TAGMSG #lunch",
+  "@time=2026-03-02T12:02:31.000Z;+draft/react=👍;+draft/reply=a1 :me!u@h TAGMSG #lunch",
+  "@time=2026-03-02T12:02:32.000Z;+draft/react=🎉;+draft/reply=a1 :carol!c@h TAGMSG #lunch",
+  "@time=2026-03-02T12:03:00.000Z;msgid=a2;+draft/reply=b1 :alice!a@h PRIVMSG #lunch :bob: the usual",
+  "@time=2026-03-02T12:04:00.000Z;msgid=c1;+draft/reply=zz9 :carol!c@h PRIVMSG #lunch :carol: still on for friday?",
+  "@time=2026-03-02T12:05:00.000Z;msgid=d1 :dave!d@h PRIVMSG #lunch :a long line to check that chips under a wrapped line sit under its last row, not the first, and the next line starts on the grid",
+  "@time=2026-03-02T12:05:30.000Z;+draft/react=😂;+draft/reply=d1 :alice!a@h TAGMSG #lunch",
+]
