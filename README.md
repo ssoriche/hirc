@@ -3,6 +3,31 @@
 A native macOS IRC client for [Ergo](https://ergo.chat), written in Rust
 with Zed's [gpui](https://gpui.rs). It reads Halloy's config and themes.
 
+## Install
+
+**macOS (Apple Silicon):** download `hirc-<version>-macos.zip` from the
+[latest release](https://github.com/ssoriche/hirc/releases/latest), unzip it,
+and move `hirc.app` to `/Applications`. The app is signed ad hoc, not by a
+registered developer, so clear the quarantine flag once:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/hirc.app
+```
+
+**Linux (x86_64):** download `hirc-<version>-linux-x86_64.tar.gz`, then put
+`hirc` on your `PATH`. It needs Wayland or X11, Vulkan, xkbcommon and
+fontconfig.
+
+**Nix:** `nix run github:ssoriche/hirc`, or add the flake's
+`packages.<system>.default` to your profile. It builds for aarch64-darwin,
+x86_64-linux and aarch64-linux. On macOS the package holds
+`Applications/hirc.app`, which needs macOS 14 or later.
+
+**From source:** `cargo build --release -p hirc`. On macOS,
+`scripts/bundle-macos.sh` builds `hirc.app` and installs it into
+`/Applications`. On Debian or Ubuntu, first install
+`libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libx11-dev libx11-xcb-dev libxcb1-dev libxi-dev libxcursor-dev libxrandr-dev libfontconfig-dev libfreetype-dev libzstd-dev clang pkg-config`.
+
 ## Develop
 
 ```sh
@@ -186,7 +211,24 @@ The offscreen smoke test needs a Metal device and runs the real binary (AppKit
 wants the process main thread), so it is ignored by default:
 `cargo test -p hirc --features snapshot --test offscreen -- --ignored`
 
-## macOS app
+## Releases
 
-`scripts/bundle-macos.sh [dir]` builds `hirc.app` into `/Applications` (or
-`dir`).
+Every push to `main` runs CI, and a green run on `main` may cut a release.
+semantic-release reads the Conventional Commits since the last tag:
+- `fix:` is a patch;
+- `feat:` is a minor;
+- `!` or a `BREAKING CHANGE` footer is a major.
+
+The rest (`chore:`, `docs:`, `ci:`, `build:` and so on) release nothing.
+
+A release:
+1. stamps the version (`scripts/set-version.sh`);
+2. tags `vX.Y.Z`;
+3. builds the macOS app and the Linux binary;
+4. publishes both, with SHA-256 sums.
+
+To run it by hand, use Actions → Release → Run workflow.
+
+`scripts/bundle-macos.sh [--no-install] [dir]` builds `hirc.app`. With no
+flag it installs into `/Applications` (or `dir`); `--no-install` leaves it in
+`target/release`.
