@@ -785,6 +785,8 @@ impl HircApp {
             }
             Ok(Input::Window(WindowAction::Goto(number))) => self.goto_typed(number, cx),
             Ok(Input::Window(WindowAction::Move(number))) => self.move_window(number, cx),
+            // The UI task wires these to the marked line.
+            Ok(Input::React(_) | Input::Reply(_)) => self.local_error(n, b, "Reactions and replies are not wired up yet".to_owned()),
             Err(msg) => self.local_error(n, b, msg),
         }
         cx.notify();

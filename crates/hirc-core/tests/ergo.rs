@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::events::{line_in, net, next_matching, page, said};
+use common::events::{applied_until, line_in, net, next_matching, page, said};
 use common::{Ergo, Raw, register_account, register_always_on};
 use hirc_core::config::{Config, Sasl, Server};
 use hirc_core::event::{Command, ConnStatus, Event, Target};
@@ -427,4 +427,64 @@ async fn a_restart_shows_the_cache_first_and_fetches_only_the_gap() {
         gap.extend(said(&lines));
     }
     assert_eq!(gap, ["m4"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reactions_and_replies_go_both_ways_and_come_back_in_history() {
+    let ergo = Ergo::start();
+    register_account(ergo.plain_port, "alice", "hunter22").await;
+    let mut bob = Raw::connect(ergo.plain_port, "bob").await;
+    bob.send("CAP REQ :message-tags").await;
+    bob.expect("ACK").await;
+    bob.send("JOIN #test").await;
+    bob.expect("JOIN").await;
+    let (tx, mut rx) = net(alice(&ergo, "printf hunter22"));
+    next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
+    bob.send("PRIVMSG #test :lunch?").await;
+    let m1 = next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "lunch?").and_then(|l| l.msgid)).await;
+    let react = |emoji: &str, add: bool| Command::React { network: "test".into(), target: "#test".into(), parent: m1.clone(), emoji: emoji.into(), add };
+    let reaction = |nick: &'static str, emoji: &'static str, add: bool| {
+        let m1 = m1.clone();
+        move |e: &Event| {
+            matches!(e, Event::Reaction { parent, nick: n, emoji: em, add: a, .. } if *parent == m1 && n == nick && em == emoji && *a == add).then_some(())
+        }
+    };
+
+    // Ours goes out and comes back on its echo.
+    tx.send(react("🎉", true)).unwrap();
+    let got = bob.expect("TAGMSG #test").await;
+    assert!(got.contains("+draft/react=🎉") && got.contains(&format!("+draft/reply={m1}")), "{got}");
+    next_matching(&mut rx, reaction("alice", "🎉", true)).await;
+
+    // Theirs comes in, and goes again.
+    bob.send(&format!("@+draft/react=👍;+draft/reply={m1} TAGMSG #test")).await;
+    next_matching(&mut rx, reaction("bob", "👍", true)).await;
+    bob.send(&format!("@+draft/unreact=👍;+draft/reply={m1} TAGMSG #test")).await;
+    next_matching(&mut rx, reaction("bob", "👍", false)).await;
+
+    // A reply.
+    tx.send(Command::Reply { network: "test".into(), target: "#test".into(), parent: m1.clone(), text: "bob: the usual".into() }).unwrap();
+    let got = bob.expect("PRIVMSG #test :bob: the usual").await;
+    assert!(got.contains(&format!("+draft/reply={m1}")), "{got}");
+    let echo = next_matching(&mut rx, |e| line_in(e, "#test").filter(|l| l.text == "bob: the usual")).await;
+    assert_eq!(echo.reply_to.as_deref(), Some(m1.as_str()));
+
+    // A new hirc (no cache) gets it all back from history: the reply
+    // with its parent, and the reactions as they stand.
+    tx.send(Command::Disconnect { network: "test".into(), reason: None }).unwrap();
+    next_matching(&mut rx, |e| matches!(e, Event::Status { status: ConnStatus::Offline, .. }).then_some(())).await;
+    bob.expect("QUIT").await;
+    drop(tx);
+    let (_tx, mut rx) = net(alice(&ergo, "printf hunter22"));
+    let mut store = hirc_core::store::Store::new(["test".to_owned()]);
+    // The page goes into the store too, so the parent line is there; then
+    // what follows it, until the window is filled.
+    applied_until(&mut rx, &mut store, |e| matches!(e, Event::History { target, .. } if target.name().is_some_and(|n| n.eq_ignore_ascii_case("#test")))).await;
+    applied_until(&mut rx, &mut store, |e| matches!(e, Event::Filled { target, .. } if target.name().is_some_and(|n| n.eq_ignore_ascii_case("#test")))).await;
+    // The page's reactions follow its lines and `Filled`, in the order they
+    // were made: the last is bob taking his back.
+    applied_until(&mut rx, &mut store, |e| matches!(e, Event::Reaction { nick, add: false, .. } if nick == "bob")).await;
+    let buf = store.networks[0].buffers.iter().find(|b| b.target.name() == Some("#test")).unwrap();
+    assert!(buf.lines.iter().any(|l| l.reply_to.as_deref() == Some(m1.as_str())), "{:?}", buf.lines);
+    assert_eq!(buf.reactions(&m1), [("🎉", vec!["alice"])]);
 }

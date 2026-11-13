@@ -18,12 +18,37 @@ pub enum Input {
         text: Option<String>,
     },
     Window(WindowAction),
+    /// /react: react to the marked line, else the last one someone else
+    /// said, with this emoji (the app knows which line).
+    React(String),
+    /// /reply: reply to that line with this text.
+    Reply(String),
 }
 
 /// Every command `parse` knows (case-insensitive), for the input line to
 /// show a recognised command as one.
-pub const COMMANDS: &[&str] =
-    &["window", "win", "me", "join", "j", "part", "leave", "msg", "privmsg", "query", "q", "nick", "raw", "quote", "topic", "quit", "disconnect", "reconnect"];
+pub const COMMANDS: &[&str] = &[
+    "window",
+    "win",
+    "me",
+    "join",
+    "j",
+    "part",
+    "leave",
+    "msg",
+    "privmsg",
+    "query",
+    "q",
+    "nick",
+    "raw",
+    "quote",
+    "topic",
+    "react",
+    "reply",
+    "quit",
+    "disconnect",
+    "reconnect",
+];
 
 /// The command a line starts with (`/me waves` is `me`), if it is one.
 pub fn leading(input: &str) -> Option<&str> {
@@ -97,6 +122,13 @@ pub fn parse(input: &str, network: &str, target: Option<&str>) -> Result<Input, 
         };
         return action.map(Input::Window).ok_or_else(|| "Usage: /window <number> | /window move <number>".to_owned());
     }
+    match cmd.to_ascii_lowercase().as_str() {
+        "react" if !first.is_empty() => return Ok(Input::React(first.to_owned())),
+        "reply" if !args.is_empty() => return Ok(Input::Reply(args.to_owned())),
+        "react" => return Err("Usage: /react <emoji>".into()),
+        "reply" => return Err("Usage: /reply <text>".into()),
+        _ => {}
+    }
     let cmd = match cmd.to_ascii_lowercase().as_str() {
         "me" if args.is_empty() => return Err("Usage: /me <text>".into()),
         "me" => Command::Action { network: net, target: here()?, text: args.to_owned() },
@@ -129,6 +161,14 @@ mod tests {
 
     fn p(s: &str) -> Result<Input, String> {
         parse(s, "net", Some("#chan"))
+    }
+
+    #[test]
+    fn react_and_reply_take_what_follows() {
+        assert_eq!(p("/react 🎉"), Ok(Input::React("🎉".into())));
+        assert_eq!(p("/reply the usual"), Ok(Input::Reply("the usual".into())));
+        assert!(p("/react").is_err());
+        assert!(p("/reply").is_err());
     }
 
     #[test]

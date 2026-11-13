@@ -21,6 +21,7 @@ pub mod msgid;
 pub mod multiline;
 pub mod playback;
 pub mod proto;
+pub mod reactions;
 pub mod sasl;
 pub mod services;
 pub mod session;
