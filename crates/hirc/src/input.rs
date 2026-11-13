@@ -968,11 +968,17 @@ impl Render for TextInput {
         let popup = self.popup.clone().zip(p.cloned());
         let picker = self.picker.as_ref().zip(p).map(|(picker, p)| self.picker_box(picker, p));
         // The status (a marked line) reads on from the mode label, on the
-        // text's row; the text follows it.
-        let status = self
-            .status
-            .clone()
-            .map(|text| div().flex_none().whitespace_nowrap().mr(cell * 2.).when_some(p.map(|p| p.text_dim), |d, c| d.text_color(c)).child(text));
+        // text's row; the text follows it. In a narrow window it is cut
+        // with `…` to most of the row, so it never runs past the input.
+        let status = self.status.clone().map(|text| {
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .when(self.width > 0., |d| d.max_w(px(self.width * 0.75)).overflow_hidden().text_ellipsis())
+                .mr(cell * 2.)
+                .when_some(p.map(|p| p.text_dim), |d, c| d.text_color(c))
+                .child(text)
+        });
         let text = div().flex().min_w(px(0.)).children(status).child(div().flex_1().min_w(px(0.)).child(TextElement { input: cx.entity() }));
         div()
             .relative()
@@ -1067,10 +1073,15 @@ impl TextInput {
             let row = div().flex().h(line).gap(cell).px(cell).child(*emoji).child(div().text_color(p.text_dim).child(format!(":{name}:")));
             if searching && i == picker.selected { row.bg(p.selected).text_color(p.selected_text) } else { row.text_color(p.text) }
         });
+        // The quick row is 26 cells wide (8 of 3, and its padding); where
+        // the text column has less room than that, the box sits against
+        // the input's right edge instead, so none of it is cut off.
+        let fits = self.width <= 0. || px(self.width) >= cell * 26. + px(2.);
         div()
             .absolute()
             .bottom_full()
-            .left(px(self.column))
+            .when(fits, |d| d.left(px(self.column)))
+            .when(!fits, |d| d.right_0())
             .mb(px(4.))
             .min_w(px(200.))
             .bg(p.input_bg)
