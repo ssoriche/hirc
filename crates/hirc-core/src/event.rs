@@ -82,12 +82,16 @@ pub enum Event {
     /// `start`: the server has nothing older. `older`: every line is
     /// older than any shown (a page before them, from the server or the
     /// cache), so on a tie in time it goes before them; else after.
+    /// `sent`: how many lines the server (or cache) gave, before those
+    /// already shown live were left out, so a page can come empty and
+    /// still say there was more.
     History {
         network: String,
         target: Target,
         lines: Vec<Line>,
         start: bool,
         older: bool,
+        sent: usize,
     },
     /// Where the user has read up to in `target` (draft/read-marker), as
     /// the server says; `None` is its `*`, no marker yet.

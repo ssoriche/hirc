@@ -976,7 +976,7 @@ fn line(sec: u32, ms: u32, id: Option<&str>, text: &str) -> Line {
 }
 
 fn history(lines: Vec<Line>, older: bool) -> Event {
-    Event::History { network: "net".into(), target: Target::Channel(CHAN.into()), lines, start: false, older }
+    Event::History { network: "net".into(), target: Target::Channel(CHAN.into()), sent: lines.len(), lines, start: false, older }
 }
 
 fn live_line(line: Line) -> Event {
@@ -1119,7 +1119,7 @@ fn lines_cached_before_the_drop_merge_with_the_gap_fill_once() {
     let mut book = Book::default();
     book.reach(CHAN, false, cached.first().map(Anchor::of).as_ref(), cached.last().map(Anchor::of).as_ref());
     let mut store = Store::new(["net".to_string()]);
-    store.apply(Event::History { network: "net".into(), target: Target::Channel(CHAN.into()), lines: cached, start: false, older: false });
+    store.apply(Event::History { network: "net".into(), target: Target::Channel(CHAN.into()), sent: cached.len(), lines: cached, start: false, older: false });
     assert_eq!(said(&store), texts(&["m3", "m4"]));
 
     let mut c = Client::connect(store, book, 50, "", true);

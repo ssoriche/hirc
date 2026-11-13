@@ -8,8 +8,10 @@
 //! once, in order, in the store and among the events (live or history),
 //! and nothing seen before a drop came again. One allowance, for ZNC
 //! only: `PLAY` takes whole seconds, so ZNC sends again the lines from
-//! the second of the newest line held (`playback::since`). Those may come
-//! once more as history, and the store collapses them by msgid.
+//! the second of the newest line held (`playback::since`). A re-sent line
+//! that first came live is left out by the core; one that first came as
+//! history (the cut's second) may come once more as history, and the
+//! store collapses it by msgid.
 
 #![cfg(feature = "bouncer-tests")]
 

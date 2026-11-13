@@ -1256,10 +1256,7 @@ impl Session {
                 self.tail.insert(key, if behind { Tail::Behind(id) } else { Tail::At(id) });
             }
         }
-        let lines = self.unseen(target, lines);
-        if !lines.is_empty() {
-            out.push(self.history_event(target, lines, false));
-        }
+        out.push(self.history_event(target, lines, false));
     }
 
     /// A name from a TARGETS answer that we may open a query for: a nick
@@ -1732,8 +1729,9 @@ impl Session {
     /// A page from before every line shown (`Event::History::older`).
     /// Lines already shown live are left out (`unseen`).
     fn page_event(&self, target: &str, lines: Vec<Line>, start: bool, older: bool) -> Output {
+        let sent = lines.len();
         let lines = self.unseen(target, lines);
-        Output::Event(Event::History { network: self.network.clone(), target: self.dest(target), lines, start, older })
+        Output::Event(Event::History { network: self.network.clone(), target: self.dest(target), lines, start, older, sent })
     }
 
     /// `lines` of history for `target`, less those already shown live by
@@ -3098,6 +3096,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_page_of_lines_all_shown_live_comes_empty_but_says_what_was_sent() {
+        let mut s = historied("", 20, held());
+        let (_, label) = asked(&feed(&mut s, OUR_JOIN));
+        m2_live(&mut s);
+        let out = page(&mut s, Some(&label), "a", &["m2"]);
+        let sent: Vec<(usize, usize)> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::Event(Event::History { lines, sent, .. }) => Some((lines.len(), *sent)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, [(0, 1)], "{out:?}");
+    }
+
+    #[test]
     fn a_line_shown_live_before_a_drop_is_not_shown_again_by_the_next_connection() {
         // The drop came before the page did: the next connection asks for
         // the same gap, and its page holds the line seen live.
@@ -4411,6 +4425,7 @@ pub(crate) mod tests {
         let play = include_str!("../tests/data/znc-1.10.3-play-after-live.txt");
         // Where it was shown live, its replayed copy is left out.
         let again: Vec<Output> = recorded(play).flat_map(|l| s.handle(Message::parse(l).unwrap(), at)).collect();
+        assert!(histories(&again).iter().any(|(_, l, _)| !l.is_empty()), "the replay showed nothing at all: {again:?}");
         assert!(histories(&again).iter().flat_map(|(_, l, _)| l).all(|l| l.text != "fact live"), "{again:?}");
         // Elsewhere, the replayed copy has the live one's made-up id.
         let (mut s, _) = zncd_at(&format!("{ZNC} echo-message"), Book::default(), at);
@@ -4451,7 +4466,8 @@ pub(crate) mod tests {
             assert_eq!(live.kind, kind, "{said}");
             feed(&mut s, ":znc.in BATCH +p znc.in/playback #test");
             feed(&mut s, &format!("@batch=p;{time} {said}"));
-            assert!(histories(&feed(&mut s, ":znc.in BATCH -p")).is_empty(), "{said}: shown again");
+            let again = histories(&feed(&mut s, ":znc.in BATCH -p"));
+            assert!(matches!(again.as_slice(), [(_, l, _)] if l.is_empty()), "{said}: shown again: {again:?}");
             let (mut s, _) = zncd(Book::default());
             feed(&mut s, OUR_JOIN);
             feed(&mut s, "@time=2026-10-22T10:00:00.000Z :bob!b@h JOIN #test");

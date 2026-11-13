@@ -201,7 +201,8 @@ fn seed(name: &str, server: &Server, cache: &Shared, book: &mut Book) -> Vec<Eve
         // apart by order only, and the last is the newest.
         book.reach(&target, query, lines.first().map(Anchor::of).as_ref(), lines.last().map(Anchor::of).as_ref());
         let target = if query { Target::Query(target) } else { Target::Channel(target) };
-        let page = Event::History { network: name.to_owned(), target, lines, start: false, older: false };
+        let sent = lines.len();
+        let page = Event::History { network: name.to_owned(), target, lines, start: false, older: false, sent };
         let reactions = cached_reactions(cache, &page);
         out.push(page);
         out.extend(reactions);
