@@ -124,6 +124,25 @@ pub enum Event {
         channel: String,
         nicks: Vec<String>,
     },
+    /// `nick`'s reaction to the line with msgid `parent` in `target`
+    /// (`+draft/react`), or with `add` false its taking back
+    /// (`+draft/unreact`), at `time`. From history and the cache too:
+    /// whatever order they come in, the newest change stands.
+    Reaction {
+        network: String,
+        target: Target,
+        parent: String,
+        emoji: String,
+        nick: String,
+        add: bool,
+        time: DateTime<Utc>,
+    },
+    /// Whether the server takes client tags (`message-tags`) now: without
+    /// them nothing can be reacted or replied to.
+    Tags {
+        network: String,
+        on: bool,
+    },
     OwnNick {
         network: String,
         nick: String,
@@ -213,6 +232,22 @@ pub enum Command {
         target: String,
         time: DateTime<Utc>,
     },
+    /// React to the line with msgid `parent` in `target`, or with `add`
+    /// false take that reaction back.
+    React {
+        network: String,
+        target: String,
+        parent: String,
+        emoji: String,
+        add: bool,
+    },
+    /// Say `text` in `target` as a reply to the line with msgid `parent`.
+    Reply {
+        network: String,
+        target: String,
+        parent: String,
+        text: String,
+    },
 }
 
 impl Command {
@@ -228,7 +263,9 @@ impl Command {
             | Command::Reconnect { network }
             | Command::Older { network, .. }
             | Command::Open { network, .. }
-            | Command::MarkRead { network, .. } => network,
+            | Command::MarkRead { network, .. }
+            | Command::React { network, .. }
+            | Command::Reply { network, .. } => network,
         }
     }
 }

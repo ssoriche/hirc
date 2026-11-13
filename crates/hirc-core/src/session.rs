@@ -1592,6 +1592,7 @@ impl Session {
             boundary: false,
             replayed: false,
             via: None,
+            reply_to: None,
         }
     }
 
@@ -1935,6 +1936,7 @@ impl Session {
                 self.open(&target, &mut out);
                 out
             }
+            Command::React { .. } | Command::Reply { .. } => Vec::new(),
             Command::MarkRead { target, time, .. } => {
                 if self.caps.is_enabled(READ_MARKER) {
                     vec![send("MARKREAD", [target, history::timestamp(time)])]
@@ -1948,7 +1950,20 @@ impl Session {
 
     fn local(&mut self, kind: LineKind, text: String, now: DateTime<Utc>) -> Line {
         self.seq += 1;
-        Line { seq: self.seq, time: now, msgid: None, kind, nick: None, text, own: true, delivery: Delivery::Sent, boundary: false, replayed: false, via: None }
+        Line {
+            seq: self.seq,
+            time: now,
+            msgid: None,
+            kind,
+            nick: None,
+            text,
+            own: true,
+            delivery: Delivery::Sent,
+            boundary: false,
+            replayed: false,
+            via: None,
+            reply_to: None,
+        }
     }
 
     /// PRIVMSG, split to fit. Each piece shows at once as our own line.
@@ -3132,6 +3147,7 @@ pub(crate) mod tests {
             boundary: false,
             replayed: false,
             via: None,
+            reply_to: None,
         }
     }
 

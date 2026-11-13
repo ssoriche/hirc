@@ -160,6 +160,7 @@ fn note(text: String) -> Line {
         boundary: false,
         replayed: false,
         via: None,
+        reply_to: None,
     }
 }
 
@@ -607,6 +608,7 @@ mod tests {
             boundary: false,
             replayed: false,
             via: None,
+            reply_to: None,
         }
     }
 

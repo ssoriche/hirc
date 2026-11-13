@@ -247,6 +247,7 @@ mod tests {
             boundary: false,
             replayed: false,
             via: None,
+            reply_to: None,
         }
     }
 

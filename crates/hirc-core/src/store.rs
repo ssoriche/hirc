@@ -53,6 +53,8 @@ pub struct Line {
     /// The bridge (`bridge`) that relayed it: `nick` is someone on the
     /// other side, not on IRC.
     pub via: Option<String>,
+    /// The msgid of the line this one answers (`+draft/reply`).
+    pub reply_to: Option<String>,
 }
 
 /// Where a line we sent stands. Everything else is `Sent`.
@@ -101,6 +103,17 @@ pub enum Presence {
     Renamed(String),
 }
 
+/// One person's reaction with one emoji to one line, as it last stood:
+/// `on` while it stands, off once taken back (kept, so an older copy of
+/// it from history can't bring it back).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reaction {
+    pub emoji: String,
+    pub nick: String,
+    pub on: bool,
+    pub time: DateTime<Utc>,
+}
+
 #[derive(Debug)]
 pub struct Buffer {
     pub target: Target,
@@ -109,6 +122,9 @@ pub struct Buffer {
     /// For channels: who is in it, as the server last said
     /// (`Event::Members`).
     pub members: Vec<String>,
+    /// Reactions by the msgid of the line they are to, which may not be
+    /// here yet (an older page brings it), in the order they came.
+    pub reactions: HashMap<String, Vec<Reaction>>,
     /// For channels: are we in it right now.
     pub joined: bool,
     pub unread: usize,
@@ -134,12 +150,50 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// Apply `nick`'s reaction (or with `add` false, its taking back) to
+    /// the line with msgid `parent`, unless what is held of it is newer.
+    /// True when what shows changed.
+    pub fn react(&mut self, parent: &str, emoji: &str, nick: &str, add: bool, time: DateTime<Utc>) -> bool {
+        let list = self.reactions.entry(parent.to_owned()).or_default();
+        match list.iter_mut().find(|r| r.emoji == emoji && r.nick.eq_ignore_ascii_case(nick)) {
+            Some(r) if time < r.time => false,
+            Some(r) => {
+                let changed = r.on != add;
+                (r.on, r.time) = (add, time);
+                changed
+            }
+            None => {
+                list.push(Reaction { emoji: emoji.to_owned(), nick: nick.to_owned(), on: add, time });
+                add
+            }
+        }
+    }
+
+    /// The reactions shown under the line with msgid `msgid`: each emoji,
+    /// in the order first used, and who reacted with it, in order.
+    pub fn reactions(&self, msgid: &str) -> Vec<(&str, Vec<&str>)> {
+        let mut out: Vec<(&str, Vec<&str>)> = Vec::new();
+        for r in self.reactions.get(msgid).into_iter().flatten().filter(|r| r.on) {
+            match out.iter_mut().find(|(e, _)| *e == r.emoji) {
+                Some((_, who)) => who.push(&r.nick),
+                None => out.push((&r.emoji, vec![&r.nick])),
+            }
+        }
+        out
+    }
+
+    /// Whether `me` stands among those who reacted to `msgid` with `emoji`.
+    pub fn reacted(&self, msgid: &str, emoji: &str, me: &str) -> bool {
+        self.reactions.get(msgid).is_some_and(|l| l.iter().any(|r| r.on && r.emoji == emoji && r.nick.eq_ignore_ascii_case(me)))
+    }
+
     pub fn new(target: Target) -> Buffer {
         Buffer {
             target,
             lines: Vec::new(),
             topic: None,
             members: Vec::new(),
+            reactions: HashMap::new(),
             joined: false,
             unread: 0,
             mentions: 0,
@@ -249,6 +303,32 @@ fn is_cut_copy(held: &Line, whole: &Line) -> bool {
         && whole.text.starts_with(&held.text)
 }
 
+/// A line that can be reacted or replied to: a message the server gave
+/// its own msgid (never one hirc made up, which can't be sent), and that
+/// has reached it.
+pub fn reactable(line: &Line) -> bool {
+    matches!(line.kind, LineKind::Privmsg | LineKind::Notice | LineKind::Action)
+        && line.delivery == Delivery::Sent
+        && line.msgid.as_deref().is_some_and(|m| !crate::msgid::is_made_up(m))
+}
+
+/// The line `/react` and `/reply` act on when none is marked: the newest
+/// reactable one someone else said.
+pub fn last_theirs(buf: &Buffer, me: Option<&str>) -> Option<usize> {
+    let mine = |l: &Line| l.own || me.is_some_and(|m| l.nick.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(m)));
+    buf.lines.iter().rposition(|l| reactable(l) && !mine(l))
+}
+
+/// The next reactable line after `from`, down (newer) or up; `None` at
+/// the end.
+pub fn step_reactable(buf: &Buffer, from: usize, down: bool) -> Option<usize> {
+    if down {
+        buf.lines.iter().enumerate().skip(from + 1).find(|(_, l)| reactable(l)).map(|(i, _)| i)
+    } else {
+        buf.lines[..from.min(buf.lines.len())].iter().rposition(reactable)
+    }
+}
+
 /// Whether `line` counts toward a window's unread lines: something someone
 /// else said.
 pub fn counts(line: &Line) -> bool {
@@ -285,6 +365,8 @@ pub struct Network {
     /// What one `draft/multiline` batch may hold on this connection;
     /// `None` when the server takes none.
     pub multiline: Option<Limits>,
+    /// The server takes client tags (`message-tags`) on this connection: reactions and replies can go.
+    pub tags: bool,
 }
 
 impl Network {
@@ -355,6 +437,13 @@ pub enum Applied {
         removed: usize,
         index: Option<usize>,
     },
+    /// A reaction changed what shows under a line: the line's index, when
+    /// it is here.
+    Reacted {
+        network: usize,
+        buffer: usize,
+        index: Option<usize>,
+    },
     /// A page of history went into one buffer: each line's index as it
     /// went in, in order (duplicates of lines already here are left out).
     History {
@@ -411,6 +500,7 @@ impl Store {
             buffers: vec![Buffer::new(Target::Server)],
             peers: HashMap::new(),
             multiline: None,
+            tags: false,
         });
         self.networks.len() - 1
     }
@@ -439,6 +529,7 @@ impl Store {
             boundary: false,
             replayed: false,
             via: None,
+            reply_to: None,
         };
         self.networks[network].buffers[buffer].insert(line).unwrap_or(0)
     }
@@ -487,6 +578,7 @@ impl Store {
                     let net = &mut self.networks[n];
                     net.peers.clear();
                     net.multiline = None;
+                    net.tags = false;
                     for b in &mut net.buffers {
                         b.joined = false;
                         b.members.clear();
@@ -527,8 +619,30 @@ impl Store {
                 self.networks[n].multiline = limits;
                 Applied::Changed
             }
+            Event::Reaction { network, target, parent, emoji, nick, add, time } => {
+                let n = self.network_ix(&network);
+                let b = self.buffer_ix(n, &target);
+                let buf = &mut self.networks[n].buffers[b];
+                if !buf.react(&parent, &emoji, &nick, add, time) {
+                    return Applied::Nothing;
+                }
+                let index = buf.lines.iter().position(|l| l.msgid.as_deref() == Some(parent.as_str()));
+                Applied::Reacted { network: n, buffer: b, index }
+            }
+            Event::Tags { network, on } => {
+                let n = self.network_ix(&network);
+                self.networks[n].tags = on;
+                Applied::Changed
+            }
             Event::Peer { network, nick, change } => {
                 let n = self.network_ix(&network);
+                if let PeerChange::Renamed(new) = &change {
+                    for r in self.networks[n].buffers.iter_mut().flat_map(|b| b.reactions.values_mut().flatten()) {
+                        if r.nick.eq_ignore_ascii_case(&nick) {
+                            r.nick = new.clone();
+                        }
+                    }
+                }
                 self.networks[n].see(&nick, change);
                 Applied::Changed
             }
@@ -663,6 +777,7 @@ mod tests {
             boundary: false,
             replayed: false,
             via: None,
+            reply_to: None,
         }
     }
 
@@ -1062,5 +1177,96 @@ mod tests {
         let b = s.buffer_ix(0, &chan());
         let texts: Vec<_> = s.networks[0].buffers[b].lines.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(texts, ["p1", "p2", "o1", "o2", "n1", "n2", "x", "y"]);
+    }
+
+    fn react(target: &str, parent: &str, emoji: &str, nick: &str, add: bool, secs: i64) -> Event {
+        Event::Reaction {
+            network: "net".into(),
+            target: Target::Channel(target.into()),
+            parent: parent.into(),
+            emoji: emoji.into(),
+            nick: nick.into(),
+            add,
+            time: at(secs),
+        }
+    }
+
+    fn shown(s: &Store, parent: &str) -> Vec<(String, Vec<String>)> {
+        let buf = &s.networks[0].buffers[1];
+        buf.reactions(parent).into_iter().map(|(e, who)| (e.to_owned(), who.into_iter().map(str::to_owned).collect())).collect()
+    }
+
+    #[test]
+    fn reactions_gather_by_emoji_in_first_use_order() {
+        let mut s = Store::new(["net".to_owned()]);
+        s.apply(Event::Line { network: "net".into(), target: Target::Channel("#a".into()), line: line(1, 10, Some("m1"), "lunch?") });
+        assert_eq!(s.apply(react("#a", "m1", "👍", "bob", true, 11)), Applied::Reacted { network: 0, buffer: 1, index: Some(0) });
+        s.apply(react("#a", "m1", "🎉", "carol", true, 12));
+        s.apply(react("#a", "m1", "👍", "carol", true, 13));
+        // The same person twice with one emoji is one reaction, whatever the case of their nick.
+        assert_eq!(s.apply(react("#a", "m1", "👍", "BOB", true, 14)), Applied::Nothing);
+        assert_eq!(shown(&s, "m1"), [("👍".into(), vec!["bob".to_owned(), "carol".into()]), ("🎉".into(), vec!["carol".to_owned()])]);
+        assert_eq!(s.networks[0].buffers[1].unread, 1, "a reaction is never unread");
+    }
+
+    #[test]
+    fn taking_a_reaction_back_drops_it_and_its_emoji_once_empty() {
+        let mut s = Store::new(["net".to_owned()]);
+        s.apply(react("#a", "m1", "👍", "bob", true, 11));
+        s.apply(react("#a", "m1", "👍", "bob", false, 12));
+        assert!(shown(&s, "m1").is_empty());
+    }
+
+    #[test]
+    fn an_older_change_never_undoes_a_newer_one() {
+        let mut s = Store::new(["net".to_owned()]);
+        // A newer unreact, then an old react from a history page.
+        s.apply(react("#a", "m1", "👍", "bob", false, 20));
+        assert_eq!(s.apply(react("#a", "m1", "👍", "bob", true, 10)), Applied::Nothing);
+        assert!(shown(&s, "m1").is_empty());
+        s.apply(react("#a", "m1", "🎉", "bob", true, 30));
+        s.apply(react("#a", "m1", "🎉", "bob", false, 25));
+        assert_eq!(shown(&s, "m1"), [("🎉".into(), vec!["bob".to_owned()])]);
+    }
+
+    #[test]
+    fn reactions_wait_for_their_line() {
+        let mut s = Store::new(["net".to_owned()]);
+        assert_eq!(s.apply(react("#a", "m1", "👍", "bob", true, 11)), Applied::Reacted { network: 0, buffer: 1, index: None });
+        s.apply(page("#a", vec![old(1, 10, "m1", "lunch?")], false));
+        assert_eq!(shown(&s, "m1"), [("👍".into(), vec!["bob".to_owned()])]);
+    }
+
+    #[test]
+    fn a_nick_change_carries_its_reactions() {
+        let mut s = Store::new(["net".to_owned()]);
+        s.apply(react("#a", "m1", "👍", "bob", true, 11));
+        s.apply(Event::Peer { network: "net".into(), nick: "bob".into(), change: PeerChange::Renamed("robert".into()) });
+        assert_eq!(shown(&s, "m1"), [("👍".into(), vec!["robert".to_owned()])]);
+        assert!(s.networks[0].buffers[1].reacted("m1", "👍", "Robert"));
+    }
+
+    #[test]
+    fn only_server_ided_messages_take_reactions() {
+        let said = line(1, 10, Some("m1"), "hi");
+        assert!(reactable(&said));
+        assert!(!reactable(&Line { msgid: Some("hirc:0123456789abcdef".into()), ..said.clone() }));
+        assert!(!reactable(&Line { msgid: None, ..said.clone() }));
+        assert!(!reactable(&Line { kind: LineKind::Join, ..said.clone() }));
+        assert!(!reactable(&Line { delivery: Delivery::Pending, ..said }));
+    }
+
+    #[test]
+    fn the_line_to_act_on_is_the_newest_reactable_one_not_ours() {
+        let mut buf = Buffer::new(Target::Channel("#a".into()));
+        for (seq, id, nick) in [(1, Some("m1"), "bob"), (2, None, "carol"), (3, Some("m3"), "me"), (4, Some("m4"), "dave")] {
+            buf.insert(Line { nick: Some(nick.into()), ..line(seq, seq as i64, id, "x") });
+        }
+        buf.insert(Line { kind: LineKind::Join, ..line(5, 5, Some("m5"), "x") });
+        assert_eq!(last_theirs(&buf, Some("ME")), Some(3));
+        assert_eq!(step_reactable(&buf, 3, false), Some(2), "up from dave's line is mine");
+        assert_eq!(step_reactable(&buf, 2, false), Some(0), "past carol's line, which has no msgid");
+        assert_eq!(step_reactable(&buf, 0, false), None);
+        assert_eq!(step_reactable(&buf, 3, true), None, "the join below is not a message");
     }
 }

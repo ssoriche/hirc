@@ -971,6 +971,7 @@ fn line(sec: u32, ms: u32, id: Option<&str>, text: &str) -> Line {
         boundary: false,
         replayed: false,
         via: None,
+        reply_to: None,
     }
 }
 

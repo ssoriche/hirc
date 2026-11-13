@@ -582,7 +582,7 @@ impl HircApp {
                     self.set_marker(network, buffer, seq);
                 }
             }
-            Applied::Changed | Applied::Nothing => {}
+            Applied::Reacted { .. } | Applied::Changed | Applied::Nothing => {}
         }
         self.sync_layout();
         if let Some((network, channel)) = focus {
@@ -1562,6 +1562,7 @@ mod tests {
             boundary: false,
             replayed: false,
             via: None,
+            reply_to: None,
         }
     }
 

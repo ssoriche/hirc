@@ -316,6 +316,7 @@ impl Cache {
                     boundary: false,
                     replayed: true,
                     via,
+                    reply_to: None,
                 });
             }
             if brk && reach == Reach::ToBreak {
@@ -687,6 +688,7 @@ mod tests {
             boundary: false,
             replayed: false,
             via: None,
+            reply_to: None,
         }
     }
 
