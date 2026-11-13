@@ -34,7 +34,9 @@ rustPlatform.buildRustPackage {
   postInstall = lib.optionalString stdenv.hostPlatform.isDarwin ''
     app="$out/Applications/hirc.app"
     mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-    substitute macos/Info.plist "$app/Contents/Info.plist" --replace-fail @version@ ${manifest.version}
+    # nixpkgs' SDK sets the binary's own minimum macOS, above the plist's.
+    substitute macos/Info.plist "$app/Contents/Info.plist" --replace-fail @version@ ${manifest.version} \
+      --replace-fail '<string>11.0</string>' '<string>${stdenv.hostPlatform.darwinMinVersion}</string>'
     cp macos/AppIcon.icns "$app/Contents/Resources/"
     mv $out/bin/hirc "$app/Contents/MacOS/hirc"
     ln -s "$app/Contents/MacOS/hirc" $out/bin/hirc
