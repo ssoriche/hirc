@@ -18,8 +18,9 @@ pub const FILE: &str = "history.db";
 
 /// The schema's version, kept in `PRAGMA user_version`. A file with another
 /// version is not ours to read, so it is moved aside. Versions 1 (no `brk`)
-/// and 2 (no `via`) are brought up to date in place.
-const VERSION: i64 = 3;
+/// and 2 (no `via`) and 3 (no `reply_to`, no reactions) are brought up to
+/// date in place.
+const VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS lines (
@@ -38,6 +39,8 @@ CREATE TABLE IF NOT EXISTS lines (
     brk     INTEGER NOT NULL DEFAULT 0,
     -- The bridge that relayed the line, when one did.
     via     TEXT,
+    -- The msgid of the line it answers, when it is a reply.
+    reply_to TEXT,
     PRIMARY KEY (network, target, msgid)
 );
 CREATE INDEX IF NOT EXISTS lines_by_time ON lines (network, target, time);
@@ -49,6 +52,20 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS networks (
     network TEXT PRIMARY KEY,
     history INTEGER NOT NULL
+);
+-- Who reacted to which line with what, as it last stood: `shown` is 0
+-- once taken back, kept so an older copy from history can't bring it
+-- back. `who` is the nick lowercased; `nick` as shown.
+CREATE TABLE IF NOT EXISTS reactions (
+    network TEXT NOT NULL,
+    target  TEXT NOT NULL,
+    parent  TEXT NOT NULL,
+    emoji   TEXT NOT NULL,
+    who     TEXT NOT NULL,
+    nick    TEXT NOT NULL,
+    shown   INTEGER NOT NULL,
+    time    INTEGER NOT NULL,
+    PRIMARY KEY (network, target, parent, emoji, who)
 );
 ";
 
@@ -224,10 +241,15 @@ impl Cache {
         }
         if (1..=2).contains(&version) {
             // Lines held from before kept no bridge: they read as said on IRC.
-            db.execute_batch(&format!("BEGIN; ALTER TABLE lines ADD COLUMN via TEXT; PRAGMA user_version = {VERSION}; COMMIT;"))?;
+            db.execute_batch("BEGIN; ALTER TABLE lines ADD COLUMN via TEXT; PRAGMA user_version = 3; COMMIT;")?;
+        }
+        if (1..=3).contains(&version) {
+            // Lines held from before answered nothing that was said.
+            db.execute_batch(&format!("BEGIN; ALTER TABLE lines ADD COLUMN reply_to TEXT; PRAGMA user_version = {VERSION}; COMMIT;"))?;
         }
         db.execute_batch(SCHEMA)?;
-        db.query_row("SELECT count(brk), count(via) FROM lines", [], |_| Ok(()))?;
+        db.query_row("SELECT count(brk), count(via), count(reply_to) FROM lines", [], |_| Ok(()))?;
+        db.query_row("SELECT count(*) FROM reactions", [], |_| Ok(()))?;
         if version == 0 {
             db.execute_batch(&format!("PRAGMA user_version = {VERSION}"))?;
         }
@@ -291,9 +313,46 @@ impl Cache {
         self.query(network, &target.to_ascii_lowercase(), time.timestamp_millis(), i64::MIN, limit, Reach::All)
     }
 
+    /// Keep a reaction (or its taking back), unless what is held of it is
+    /// newer. Never one in a services query, or to a made-up msgid.
+    pub fn react(&self, network: &str, target: &Target, r: &Reacted) -> Result<(), CacheError> {
+        let Some(name) = target.name().filter(|n| !is_service(n)) else { return Ok(()) };
+        if crate::msgid::is_made_up(&r.parent) {
+            return Ok(());
+        }
+        self.db
+            .prepare_cached(
+                "INSERT INTO reactions (network, target, parent, emoji, who, nick, shown, time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (network, target, parent, emoji, who) DO UPDATE SET nick = excluded.nick, shown = excluded.shown, time = excluded.time
+                 WHERE excluded.time >= reactions.time",
+            )?
+            .execute(params![network, name.to_ascii_lowercase(), r.parent, r.emoji, r.nick.to_ascii_lowercase(), r.nick, r.on, r.time.timestamp_millis()])?;
+        Ok(())
+    }
+
+    /// What is held of the reactions to the lines with these msgids in
+    /// `target`, taken-back ones too, oldest change first.
+    pub fn reactions(&self, network: &str, target: &str, parents: &[&str]) -> Result<Vec<Reacted>, CacheError> {
+        let mut st = self.db.prepare_cached("SELECT parent, emoji, nick, shown, time FROM reactions WHERE network = ?1 AND target = ?2 AND parent = ?3")?;
+        let mut out = Vec::new();
+        for p in parents {
+            let rows = st.query_map(params![network, target.to_ascii_lowercase(), p], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, bool>(3)?, r.get::<_, i64>(4)?))
+            })?;
+            for row in rows {
+                let (parent, emoji, nick, on, ms) = row?;
+                if let Some(time) = DateTime::from_timestamp_millis(ms) {
+                    out.push(Reacted { parent, emoji, nick, on, time });
+                }
+            }
+        }
+        out.sort_by_key(|r| r.time);
+        Ok(out)
+    }
+
     fn query(&self, network: &str, target: &str, time: i64, rowid: i64, limit: usize, reach: Reach) -> Result<Older, CacheError> {
         let mut st = self.db.prepare_cached(
-            "SELECT msgid, time, kind, nick, text, own, brk, via FROM lines WHERE network = ?1 AND target = ?2 AND (time < ?3 OR (time = ?3 AND rowid < ?4)) ORDER BY time DESC, rowid DESC LIMIT ?5",
+            "SELECT msgid, time, kind, nick, text, own, brk, via, reply_to FROM lines WHERE network = ?1 AND target = ?2 AND (time < ?3 OR (time = ?3 AND rowid < ?4)) ORDER BY time DESC, rowid DESC LIMIT ?5",
         )?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut rows = st.query(params![network, target, time, rowid, limit])?;
@@ -301,7 +360,7 @@ impl Cache {
         while let Some(r) = rows.next()? {
             let (msgid, ms, kind) = (r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?);
             let (nick, text, own, brk) = (r.get::<_, Option<String>>(3)?, r.get::<_, String>(4)?, r.get::<_, bool>(5)?, r.get::<_, bool>(6)?);
-            let via = r.get::<_, Option<String>>(7)?;
+            let (via, reply_to) = (r.get::<_, Option<String>>(7)?, r.get::<_, Option<String>>(8)?);
             // A row this hirc can't read (a later version's kind) is skipped.
             if let (Some(time), Some(kind)) = (DateTime::from_timestamp_millis(ms), kind_of(&kind)) {
                 out.lines.push(Line {
@@ -316,7 +375,7 @@ impl Cache {
                     boundary: false,
                     replayed: true,
                     via,
-                    reply_to: None,
+                    reply_to,
                 });
             }
             if brk && reach == Reach::ToBreak {
@@ -368,6 +427,16 @@ impl Cache {
     }
 }
 
+/// One reaction as the cache holds it (see `Event::Reaction`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reacted {
+    pub parent: String,
+    pub emoji: String,
+    pub nick: String,
+    pub on: bool,
+    pub time: DateTime<Utc>,
+}
+
 /// One run, inside `put`'s transaction.
 fn put_run(db: &Connection, e: &Entry) -> Result<usize, CacheError> {
     let Some(name) = e.target.name() else { return Ok(0) };
@@ -377,8 +446,8 @@ fn put_run(db: &Connection, e: &Entry) -> Result<usize, CacheError> {
     lines.sort_by_key(|l| l.time);
     let (Some(oldest), Some(newest)) = (lines.first().and_then(|l| l.msgid.clone()), lines.last().and_then(|l| l.msgid.clone())) else { return Ok(0) };
     let mut insert = db.prepare_cached(
-        "INSERT OR IGNORE INTO lines (network, target, name, query, msgid, time, kind, nick, text, own, brk, rowid, via)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT OR IGNORE INTO lines (network, target, name, query, msgid, time, kind, nick, text, own, brk, rowid, via, reply_to)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?;
     // Lines tied in time are ordered by rowid. A run from before what is
     // held is stored after it, so it takes rowids below every row's (in
@@ -412,7 +481,7 @@ fn put_run(db: &Connection, e: &Entry) -> Result<usize, CacheError> {
             continue;
         }
         let rowid = below.map(|b| b + i64::try_from(i).unwrap_or(0));
-        let row = params![e.network, target, name, query, l.msgid, ms, kind_name(l.kind), l.nick, l.text, l.own, i == 0 || skipped, rowid, l.via];
+        let row = params![e.network, target, name, query, l.msgid, ms, kind_name(l.kind), l.nick, l.text, l.own, i == 0 || skipped, rowid, l.via, l.reply_to];
         let new = insert.execute(row)? == 1;
         if !new && i > 0 && !skipped {
             heal.execute(params![e.network, target, l.msgid])?;
@@ -539,6 +608,7 @@ fn kind_of(name: &str) -> Option<LineKind> {
 
 enum Job {
     Put(Entry),
+    React(String, Target, Reacted),
     Discovered(String, DateTime<Utc>),
     History(String, bool),
     /// Answered once every job before it is written.
@@ -568,11 +638,13 @@ impl Shared {
                 // Everything queued so far goes in one transaction.
                 let mut puts = Vec::new();
                 let mut marks = Vec::new();
+                let mut reactions = Vec::new();
                 let mut histories = Vec::new();
                 let mut done = Vec::new();
                 for job in std::iter::once(job).chain(rx.try_iter()) {
                     match job {
                         Job::Put(e) => puts.push(e),
+                        Job::React(n, t, r) => reactions.push((n, t, r)),
                         Job::Discovered(n, t) => marks.push((n, t)),
                         Job::History(n, h) => histories.push((n, h)),
                         Job::Flush(tx) => done.push(tx),
@@ -599,6 +671,12 @@ impl Shared {
                                 tracing::warn!("history cache: {e}");
                                 (ok, lost) = (false, true);
                             }
+                        }
+                    }
+                    for (network, target, r) in reactions {
+                        if let Err(e) = c.react(&network, &target, &r) {
+                            tracing::warn!("history cache: {e}");
+                            ok = false;
                         }
                     }
                     for (network, time) in marks {
@@ -637,6 +715,12 @@ impl Shared {
     /// Queue the time up to which discovery is complete for `network`.
     pub fn write_discovered(&self, network: &str, time: DateTime<Utc>) {
         let _ = self.jobs.send(Job::Discovered(network.to_owned(), time));
+    }
+
+    /// Queue a reaction (or its taking back) to be written. Like `write`,
+    /// it never waits on the disk.
+    pub fn write_reaction(&self, network: &str, target: &Target, r: Reacted) {
+        let _ = self.jobs.send(Job::React(network.to_owned(), target.clone(), r));
     }
 
     /// Queue whether `network` can serve history now.
@@ -1039,6 +1123,70 @@ mod tests {
         assert_eq!((texts(&got).as_slice(), got[0].via.as_deref()), (["one"].as_slice(), None));
         let v: i64 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, VERSION);
+    }
+
+    fn reacted(parent: &str, emoji: &str, nick: &str, on: bool, secs: i64) -> Reacted {
+        Reacted { parent: parent.into(), emoji: emoji.into(), nick: nick.into(), on, time: at(secs) }
+    }
+
+    #[test]
+    fn reactions_are_kept_newest_change_winning() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Cache::open(&dir.path().join(FILE)).unwrap();
+        c.react("net", &chan("#a"), &reacted("m1", "👍", "bob", true, 10)).unwrap();
+        c.react("net", &chan("#a"), &reacted("m1", "🎉", "carol", true, 11)).unwrap();
+        c.react("net", &chan("#a"), &reacted("m1", "👍", "Bob", false, 12)).unwrap();
+        // An older copy from history doesn't bring it back.
+        c.react("net", &chan("#a"), &reacted("m1", "👍", "bob", true, 9)).unwrap();
+        let got = c.reactions("net", "#A", &["m1", "m2"]).unwrap();
+        assert_eq!(got, [reacted("m1", "🎉", "carol", true, 11), reacted("m1", "👍", "Bob", false, 12)]);
+    }
+
+    #[test]
+    fn nothing_from_a_services_query_and_nothing_to_a_made_up_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Cache::open(&dir.path().join(FILE)).unwrap();
+        c.react("net", &Target::Query("NickServ".into()), &reacted("m1", "👍", "bob", true, 10)).unwrap();
+        c.react("net", &chan("#a"), &reacted("hirc:0123456789abcdef", "👍", "bob", true, 10)).unwrap();
+        assert!(c.reactions("net", "nickserv", &["m1"]).unwrap().is_empty());
+        assert!(c.reactions("net", "#a", &["hirc:0123456789abcdef"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_reply_keeps_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Cache::open(&dir.path().join(FILE)).unwrap();
+        let reply = Line { reply_to: Some("m1".into()), ..line(Some("m2"), 2, "the usual") };
+        c.put(&[entry(chan("#a"), vec![line(Some("m1"), 1, "lunch?"), reply])]).unwrap();
+        let got = c.latest("net", "#a", 10).unwrap();
+        assert_eq!(got.iter().map(|l| l.reply_to.as_deref()).collect::<Vec<_>>(), [None, Some("m1")]);
+    }
+
+    #[test]
+    fn version_3_gains_replies_and_reactions_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE lines (network TEXT NOT NULL, target TEXT NOT NULL, name TEXT NOT NULL, query INTEGER NOT NULL, msgid TEXT NOT NULL,
+                     time INTEGER NOT NULL, kind TEXT NOT NULL, nick TEXT, text TEXT NOT NULL, own INTEGER NOT NULL,
+                     brk INTEGER NOT NULL DEFAULT 0, via TEXT, PRIMARY KEY (network, target, msgid));
+                 CREATE TABLE meta (network TEXT PRIMARY KEY, discovered INTEGER);
+                 CREATE TABLE networks (network TEXT PRIMARY KEY, history INTEGER NOT NULL);
+                 INSERT INTO lines VALUES ('net', '#a', '#a', 0, 'o1', 1800000001000, 'privmsg', 'bob', 'one', 0, 1, NULL);
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+        let c = Cache::open(&path).unwrap();
+        let got = c.latest("net", "#a", 10).unwrap();
+        assert_eq!((texts(&got).as_slice(), got[0].reply_to.as_deref()), (["one"].as_slice(), None));
+        let v: i64 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, VERSION);
+        assert_eq!(VERSION, 4);
+        c.react("net", &chan("#a"), &reacted("o1", "👍", "bob", true, 10)).unwrap();
+        assert_eq!(c.reactions("net", "#a", &["o1"]).unwrap(), [reacted("o1", "👍", "bob", true, 10)]);
     }
 
     #[test]

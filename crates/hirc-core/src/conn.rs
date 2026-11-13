@@ -2,7 +2,7 @@
 //! task connects, feeds lines through its `Session`, sends events to the
 //! UI, and reconnects with backoff. The UI never waits on any of it.
 
-use crate::cache::{Reach, Shared};
+use crate::cache::{Reach, Reacted, Shared};
 use crate::config::{self, Config, ConfigError, Sasl, Server};
 use crate::event::{Command, ConnStatus, Event, Target};
 use crate::history::{self, Anchor, Book};
@@ -201,9 +201,41 @@ fn seed(name: &str, server: &Server, cache: &Shared, book: &mut Book) -> Vec<Eve
         // apart by order only, and the last is the newest.
         book.reach(&target, query, lines.first().map(Anchor::of).as_ref(), lines.last().map(Anchor::of).as_ref());
         let target = if query { Target::Query(target) } else { Target::Channel(target) };
-        out.push(Event::History { network: name.to_owned(), target, lines, start: false, older: false });
+        let page = Event::History { network: name.to_owned(), target, lines, start: false, older: false };
+        let reactions = cached_reactions(cache, &page);
+        out.push(page);
+        out.extend(reactions);
     }
     out
+}
+
+/// The cache's reactions to a page's lines, to follow the page out (the
+/// store keeps them till their lines are in).
+fn cached_reactions(cache: &Shared, ev: &Event) -> Vec<Event> {
+    let Event::History { network, target, lines, .. } = ev else { return Vec::new() };
+    let Some(name) = target.name() else { return Vec::new() };
+    let ids: Vec<&str> = lines.iter().filter_map(|l| l.msgid.as_deref()).filter(|m| !crate::msgid::is_made_up(m)).collect();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    match cache.read(|c| c.reactions(network, name, &ids)) {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| Event::Reaction {
+                network: network.clone(),
+                target: target.clone(),
+                parent: r.parent,
+                emoji: r.emoji,
+                nick: r.nick,
+                add: r.on,
+                time: r.time,
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!("{network}: history cache: {e}");
+            Vec::new()
+        }
+    }
 }
 
 /// Older lines for a window: the cache's while it has lines older than the
@@ -516,7 +548,20 @@ async fn connect_once(
                             Event::Parted { channel, .. } => carry.rejoin.retain(|c| !c.eq_ignore_ascii_case(channel)),
                             _ => {}
                         }
+                        if let (Some(cache), Event::Reaction { network, target, parent, emoji, nick, add, time }) = (&carry.cache, &e) {
+                            cache.write_reaction(
+                                network,
+                                target,
+                                Reacted { parent: parent.clone(), emoji: emoji.clone(), nick: nick.clone(), on: *add, time: *time },
+                            );
+                        }
+                        // A page is followed by what the cache holds of
+                        // reactions to its lines.
+                        let after = carry.cache.as_ref().map(|cache| cached_reactions(cache, &e)).unwrap_or_default();
                         let _ = events.send(e);
+                        for r in after {
+                            let _ = events.send(r);
+                        }
                     }
                     Output::Stop(reason) => {
                         let _ = w.flush().await;
@@ -645,6 +690,22 @@ mod tests {
         assert_eq!(book.newest("#a").and_then(|a| a.msgid.as_deref()), Some("a2"));
         assert_eq!(book.queries(), ["bob"]);
         assert_eq!(book.discovered(), None);
+    }
+
+    #[test]
+    fn a_seeded_page_is_followed_by_its_cached_reactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with(&dir, vec![(Target::Channel("#a".into()), vec![line("a1", 1), line("a2", 2)])]);
+        let when = DateTime::from_timestamp_millis(1_800_000_000_000).unwrap();
+        let r = |parent: &str, nick: &str, on: bool| crate::cache::Reacted { parent: parent.into(), emoji: "👍".into(), nick: nick.into(), on, time: when };
+        cache.write_reaction("net", &Target::Channel("#a".into()), r("a1", "bob", true));
+        cache.write_reaction("net", &Target::Channel("#a".into()), r("zzz", "bob", true));
+        assert!(cache.flush());
+        let got = seed("net", &Server { channels: vec!["#a".into()], ..Server::default() }, &cache, &mut Book::default());
+        match got.as_slice() {
+            [Event::History { .. }, Event::Reaction { parent, nick, add: true, .. }] => assert_eq!((parent.as_str(), nick.as_str()), ("a1", "bob")),
+            e => panic!("{e:?}"),
+        }
     }
 
     /// A bouncer joins us to channels the config doesn't name, so they
