@@ -111,6 +111,7 @@ On servers with `message-tags` (Ergo, soju; not ZNC or IRCCloud's bouncer), and 
 | `/me text` | Send an action |
 | `/nick newnick` | Change nick |
 | `/topic [text]` | Show or set the topic |
+| `/oper name password` | Become an IRC operator |
 | `/react <emoji>` | React to the marked line, else the last line someone else said |
 | `/reply <text>` | Reply to the marked line, else the last line someone else said |
 | `/raw line` (`/quote`) | Send a raw IRC line |
