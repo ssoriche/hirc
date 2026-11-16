@@ -93,6 +93,20 @@ history:
             - "+draft/react"
             - "+react"
             - "+draft/reply"
+# Test-only oper logins for /oper (hashes from `ergo genpasswd`):
+# tester / operpass, and spacey / "two words".
+oper-classes:
+    "tester":
+        title: Tester
+        capabilities:
+            - "nofakelag"
+opers:
+    tester:
+        class: "tester"
+        password: "$2a$04$tB4vvrBwH14w01FfSA9Me.gaobIaz3KpihYDLycekZH.TkZh52xzO"
+    spacey:
+        class: "tester"
+        password: "$2a$04$Vy7DIQ/p2Ri2lZHc4qr7Ke13hT1Tqhyg1p.uKqleKOydIZjf0amoa"
 logging:
     -
         method: stderr

@@ -488,3 +488,32 @@ async fn reactions_and_replies_go_both_ways_and_come_back_in_history() {
     assert!(buf.lines.iter().any(|l| l.reply_to.as_deref() == Some(m1.as_str())), "{:?}", buf.lines);
     assert_eq!(buf.reactions(&m1), [("🎉", vec!["alice"])]);
 }
+
+/// What `/oper` sends, as typed, is what Ergo takes: a password, one with
+/// a space in it, and a refusal for a wrong or missing one. Each try is its
+/// own client, since Ergo makes one wait 10s after a refused OPER.
+#[tokio::test(flavor = "multi_thread")]
+async fn oper_logs_in_and_is_refused_as_ergo_says() {
+    use hirc_core::command::{Input, parse};
+    let ergo = Ergo::start();
+    // Ergo's answer in the server window: 381, or 491 for any refusal.
+    let oper = async |nick: &str, typed: &str| {
+        let mut config = carol(&ergo);
+        config.servers.get_mut("test").unwrap().nickname = nick.into();
+        let (tx, mut rx) = net(config);
+        next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
+        let Ok(Input::Send(cmd)) = parse(typed, "test", None) else { panic!("{typed} is not a send") };
+        tx.send(cmd).unwrap();
+        next_matching(&mut rx, |e| match e {
+            Event::Line { target: Target::Server, line, .. } if line.text.contains("operator") || line.text.starts_with("OPER") => Some(line.text.clone()),
+            _ => None,
+        })
+        .await
+    };
+    assert!(oper("o1", "/oper tester wrong").await.starts_with("OPER failed"));
+    // No password is a certfp login to Ergo, not too few parameters (461):
+    // refused here only because the client has no certificate.
+    assert!(oper("o2", "/oper tester").await.starts_with("OPER failed"));
+    assert!(oper("o3", "/oper spacey two words").await.contains("You are now an IRC operator"));
+    assert!(oper("o4", "/oper tester operpass").await.contains("You are now an IRC operator"));
+}

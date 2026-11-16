@@ -43,6 +43,7 @@ pub const COMMANDS: &[&str] = &[
     "raw",
     "quote",
     "topic",
+    "oper",
     "react",
     "reply",
     "quit",
@@ -147,6 +148,15 @@ pub fn parse(input: &str, network: &str, target: Option<&str>) -> Result<Input, 
             let line = if args.is_empty() { format!("TOPIC {chan}") } else { format!("TOPIC {chan} :{args}") };
             Command::Raw { network: net, line }
         }
+        // The password is the last parameter, whole: a space or a leading
+        // colon would otherwise cut or eat it. None is sent bare, for an
+        // oper the server knows by client certificate (Ergo's certfp).
+        "oper" if !first.is_empty() && tail.is_empty() => Command::Raw { network: net, line: format!("OPER {first}") },
+        "oper" if !first.is_empty() => {
+            let colon = if tail.contains(' ') || tail.starts_with(':') { ":" } else { "" };
+            Command::Raw { network: net, line: format!("OPER {first} {colon}{tail}") }
+        }
+        "oper" => return Err("Usage: /oper <name> [password]".into()),
         "quit" | "disconnect" => Command::Disconnect { network: net, reason: opt(args) },
         "reconnect" => Command::Reconnect { network: net },
         "join" | "j" | "msg" | "privmsg" | "query" | "q" | "nick" | "raw" | "quote" => return Err(format!("/{cmd} needs more arguments")),
@@ -161,6 +171,21 @@ mod tests {
 
     fn p(s: &str) -> Result<Input, String> {
         parse(s, "net", Some("#chan"))
+    }
+
+    #[test]
+    fn oper_sends_name_and_password() {
+        let raw = |line: &str| Ok(Input::Send(Command::Raw { network: "net".into(), line: line.into() }));
+        assert_eq!(p("/oper alice s3cret"), raw("OPER alice s3cret"));
+        assert_eq!(p("/OPER alice s3cret"), raw("OPER alice s3cret"));
+        // Works from the server buffer, where there is no target.
+        assert_eq!(parse("/oper alice s3cret", "net", None), raw("OPER alice s3cret"));
+        // A password with spaces is not cut. None is sent bare, for an oper
+        // known by client certificate; no name is a usage error.
+        assert_eq!(p("/oper alice two words"), raw("OPER alice :two words"));
+        assert_eq!(p("/oper alice :colon"), raw("OPER alice ::colon"));
+        assert_eq!(p("/oper alice"), raw("OPER alice"));
+        assert_eq!(p("/oper"), Err("Usage: /oper <name> [password]".into()));
     }
 
     #[test]
