@@ -960,6 +960,7 @@ fn a_multiline_message_cut_off_by_the_drop_is_whole_after_the_gap_fill() {
 
 fn line(sec: u32, ms: u32, id: Option<&str>, text: &str) -> Line {
     Line {
+        raw: None,
         seq: 0,
         time: at(&stamp(sec, ms)),
         msgid: id.map(Into::into),

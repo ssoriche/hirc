@@ -56,6 +56,28 @@ pub struct Line {
     pub via: Option<String>,
     /// The msgid of the line this one answers (`+draft/reply`).
     pub reply_to: Option<String>,
+    /// The text as it came, when it held formatting codes (`format`);
+    /// `text` is it without them. What the cache keeps, and what made-up
+    /// msgids and duplicate checks read: `received()`.
+    pub raw: Option<String>,
+}
+
+impl Line {
+    /// The text as it came, formatting codes and all.
+    pub fn received(&self) -> &str {
+        self.raw.as_deref().unwrap_or(&self.text)
+    }
+
+    /// How the text is styled (`format`): empty for plain text.
+    pub fn spans(&self) -> Vec<crate::format::Span> {
+        self.raw.as_deref().map(|r| crate::format::parse(r).1).unwrap_or_default()
+    }
+}
+
+/// `text` and `raw` for a line that came as `received`: the codes go from
+/// the text and are kept in `raw`, if there were any.
+pub fn uncoded(received: String) -> (String, Option<String>) {
+    if crate::format::has_codes(&received) { (crate::format::strip(&received), Some(received)) } else { (received, None) }
 }
 
 /// Where a line we sent stands. Everything else is `Sent`.
@@ -248,7 +270,7 @@ impl Buffer {
         if !line.own || line.delivery != Delivery::Sent {
             return None;
         }
-        self.lines.iter().position(|l| l.delivery != Delivery::Sent && l.kind == line.kind && l.text == line.text)
+        self.lines.iter().position(|l| l.delivery != Delivery::Sent && l.kind == line.kind && l.received() == line.received())
     }
 
     /// Where the unread lines begin: the first of the last `unread`
@@ -521,6 +543,7 @@ impl Store {
     pub fn push_local(&mut self, network: usize, buffer: usize, kind: LineKind, text: String) -> usize {
         self.local_seq += 1;
         let line = Line {
+            raw: None,
             seq: u64::MAX / 2 + self.local_seq,
             time: self.clock.unwrap_or_else(Utc::now),
             msgid: None,
@@ -780,6 +803,7 @@ mod tests {
 
     fn line(seq: u64, secs: i64, msgid: Option<&str>, text: &str) -> Line {
         Line {
+            raw: None,
             seq,
             time: at(secs),
             msgid: msgid.map(Into::into),

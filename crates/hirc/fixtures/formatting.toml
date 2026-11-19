@@ -1,0 +1,22 @@
+# Invented content for `snapshot` runs: mIRC formatting codes, as bots and
+# other clients send them. No real nicks, servers or channels belong here.
+base_time = "2026-01-01T12:00:00Z"
+
+[[server]]
+name = "demo"
+nick = "me"
+lines = [
+  ":irc.example 001 me :Welcome to the Demo network",
+  ":me!u@h JOIN #game",
+  ":irc.example 353 me = #game :me tradebot alice",
+  ":irc.example 366 me #game :End of /NAMES list.",
+  ":tradebot!t@h PRIVMSG #game :🏆 Top traders: 1. \u0002alice\u000f \u0003035,300cr\u000f",
+  ":tradebot!t@h PRIVMSG #game :📉 \u000307Synthetics\u000f shortage in \u000310Oron Verge\u000f: prices doubled today.",
+  ":tradebot!t@h NOTICE #game :Sector \u00031014\u000f: \u000310Ithon\u000f",
+  ":alice!a@h PRIVMSG #game :\u0002bold\u0002 \u001ditalic\u001d \u001funderline\u001f \u001estrike\u001e \u0016reverse\u0016 plain",
+  ":alice!a@h PRIVMSG #game :\u00030white \u00031black \u00032navy \u00033green \u00034red \u00035brown \u00036purple \u00037orange",
+  ":alice!a@h PRIVMSG #game :\u00038yellow \u00039lime \u000310teal \u000311cyan \u000312blue \u000313pink \u000314grey \u000315silver",
+  ":alice!a@h PRIVMSG #game :\u00030,4 white on red \u0003 \u00031,8 black on yellow \u0003 \u000452 \u0004ff8800hex orange\u0004 see https://example.com/\u0002bold\u0002link",
+  ":alice!a@h ACTION #game :x",
+  ":alice!a@h PRIVMSG #game :\u0001ACTION hands \u000304me\u0003 a \u0002:tada:\u0002\u0001",
+]

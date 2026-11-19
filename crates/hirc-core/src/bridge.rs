@@ -3,6 +3,7 @@
 //! server's `bridges`, such a line is unwrapped to read as if `hacker` had
 //! said it. Only listed nicks are unwrapped; nothing here guesses.
 
+use crate::format;
 use crate::store::LineKind;
 
 /// What bridges put in a relayed name so it never pings its namesake on
@@ -15,20 +16,16 @@ pub fn is_bridge(bridges: &[String], nick: &str) -> bool {
     bridges.iter().any(|b| b.eq_ignore_ascii_case(nick))
 }
 
-/// IRC formatting toggles that take no argument: bold, reset, monospace,
-/// reverse, italics, strikethrough and underline.
-const FORMAT_TOGGLES: [char; 7] = ['\x02', '\x0f', '\x11', '\x16', '\x1d', '\x1e', '\x1f'];
-
 /// A bridge's line `text` as the relayed person's: `<name> rest` is a
 /// message from `name`, `* name rest` an action. `None` for anything else
 /// (the bot's own words, a malformed prefix), which stays the bot's. Many
 /// bridges bold or colour the name (`\x02<name>\x02`, `<\x0312name\x03>`),
 /// so formatting codes around and inside the name are ignored.
 pub fn unwrap(text: &str) -> Option<(LineKind, String, &str)> {
-    let text = skip_formatting(text);
+    let text = format::skip(text);
     if let Some(after) = text.strip_prefix('<') {
         let (name, rest) = after.split_once('>')?;
-        let rest = skip_formatting(rest);
+        let rest = format::skip(rest);
         let rest = if rest.is_empty() { rest } else { rest.strip_prefix(' ')? };
         let name = clean(name).filter(|n| !n.contains('<'))?;
         return Some((LineKind::Privmsg, name, rest));
@@ -60,56 +57,8 @@ pub fn unwrap_lines(text: &str) -> Option<(LineKind, String, String)> {
 /// `name` without its zero-width characters and formatting codes, if
 /// anything nameable is left.
 fn clean(name: &str) -> Option<String> {
-    let name: String = strip_formatting(name).chars().filter(|c| !ZERO_WIDTH.contains(c)).collect();
+    let name: String = format::strip(name).chars().filter(|c| !ZERO_WIDTH.contains(c)).collect();
     (!name.is_empty() && !name.contains(char::is_whitespace)).then_some(name)
-}
-
-/// The byte length of the formatting code at the start of `s`, if any: a
-/// toggle, or `\x03` with an optional `NN[,NN]` colour pair.
-fn code_len(s: &str) -> Option<usize> {
-    let mut chars = s.chars();
-    match chars.next()? {
-        c if FORMAT_TOGGLES.contains(&c) => Some(1),
-        '\x03' => {
-            let b = s.as_bytes();
-            let digits = |from: usize| b[from..].iter().take(2).take_while(|d| d.is_ascii_digit()).count();
-            let mut len = 1;
-            let fg = digits(len);
-            len += fg;
-            if fg > 0 && b.get(len) == Some(&b',') {
-                let bg = digits(len + 1);
-                if bg > 0 {
-                    len += 1 + bg;
-                }
-            }
-            Some(len)
-        }
-        _ => None,
-    }
-}
-
-/// `s` past any formatting codes at its start.
-fn skip_formatting(mut s: &str) -> &str {
-    while let Some(len) = code_len(s) {
-        s = &s[len..];
-    }
-    s
-}
-
-/// `s` with every formatting code removed.
-fn strip_formatting(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(c) = rest.chars().next() {
-        match code_len(rest) {
-            Some(len) => rest = &rest[len..],
-            None => {
-                out.push(c);
-                rest = &rest[c.len_utf8()..];
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]

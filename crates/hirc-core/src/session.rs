@@ -1687,7 +1687,9 @@ impl Session {
         self.seq += 1;
         let time = msg.tag("time").and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map_or(now, |t| t.with_timezone(&Utc));
         let msgid = msg.tag("msgid").filter(|m| !m.is_empty()).map(str::to_owned);
+        let (text, raw) = crate::store::uncoded(text);
         Line {
+            raw,
             seq: self.seq,
             time,
             msgid,
@@ -2088,7 +2090,9 @@ impl Session {
 
     fn local(&mut self, kind: LineKind, text: String, now: DateTime<Utc>) -> Line {
         self.seq += 1;
+        let (text, raw) = crate::store::uncoded(text);
         Line {
+            raw,
             seq: self.seq,
             time: now,
             msgid: None,
@@ -3519,6 +3523,7 @@ pub(crate) mod tests {
     /// A line to build on in tests.
     pub(crate) fn local_line() -> Line {
         Line {
+            raw: None,
             seq: 0,
             time: now(),
             msgid: None,
@@ -4159,6 +4164,17 @@ pub(crate) mod tests {
         assert_eq!(lines(&out)[0].1.text, "alice was kicked by bob (out)");
         assert_eq!(lines(&out)[0].1.nick.as_deref(), Some("alice"));
         assert!(out.contains(&Output::Event(Event::Parted { network: "net".into(), channel: "#test".into() })));
+    }
+
+    #[test]
+    fn formatting_codes_leave_the_text_and_are_kept() {
+        let mut s = registered(ECHO);
+        let (_, l) = lines(&feed(&mut s, ":bot!b@h PRIVMSG #test :\x02hide\x0f has \x03035,300cr\x0f")).remove(0);
+        assert_eq!((l.text.as_str(), l.raw.as_deref()), ("hide has 5,300cr", Some("\x02hide\x0f has \x03035,300cr\x0f")));
+        assert_eq!(l.spans().len(), 2);
+        // Plain text keeps no copy.
+        let (_, l) = lines(&feed(&mut s, ":bot!b@h NOTICE #test :plain")).remove(0);
+        assert_eq!(l.raw, None);
     }
 
     #[test]

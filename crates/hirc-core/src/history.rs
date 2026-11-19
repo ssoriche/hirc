@@ -279,6 +279,7 @@ mod tests {
 
     fn line(secs: i64, msgid: Option<&str>) -> Line {
         Line {
+            raw: None,
             seq: 0,
             time: at(secs),
             msgid: msgid.map(Into::into),

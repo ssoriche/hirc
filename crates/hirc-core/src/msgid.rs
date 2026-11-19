@@ -31,7 +31,7 @@ pub fn made_up_nth(target: &Target, line: &Line, nth: u32) -> String {
     let ms = line.time.timestamp_millis().to_string();
     let name = target.name().unwrap_or_default().to_ascii_lowercase();
     let place = nth.to_string();
-    let fields = [ms.as_str(), name.as_str(), crate::cache::kind_name(line.kind), line.nick.as_deref().unwrap_or_default(), line.text.as_str(), place.as_str()];
+    let fields = [ms.as_str(), name.as_str(), crate::cache::kind_name(line.kind), line.nick.as_deref().unwrap_or_default(), line.received(), place.as_str()];
     let fields = &fields[..if nth == 0 { 5 } else { 6 }];
     // A NUL after each field (IRC text never holds one), so fields can't
     // run into each other.

@@ -364,7 +364,10 @@ impl Cache {
             let (via, reply_to) = (r.get::<_, Option<String>>(7)?, r.get::<_, Option<String>>(8)?);
             // A row this hirc can't read (a later version's kind) is skipped.
             if let (Some(time), Some(kind)) = (DateTime::from_timestamp_millis(ms), kind_of(&kind)) {
+                // Kept as it came: rows from before hirc read the codes too.
+                let (text, raw) = crate::store::uncoded(text);
                 out.lines.push(Line {
+                    raw,
                     seq: 0,
                     time,
                     msgid: Some(msgid),
@@ -476,13 +479,14 @@ fn put_run(db: &Connection, e: &Entry) -> Result<usize, CacheError> {
         // same), so no join is claimed across it: not at the held copy, and
         // not at the next line that goes in.
         if !held.exists(params![e.network, target, l.msgid])?
-            && said.exists(params![e.network, target, ms, kind_name(l.kind), l.nick, l.text, l.msgid.as_deref().is_some_and(crate::msgid::is_made_up)])?
+            && said.exists(params![e.network, target, ms, kind_name(l.kind), l.nick, l.received(), l.msgid.as_deref().is_some_and(crate::msgid::is_made_up)])?
         {
             (skipped, newest_is_new) = (true, false);
             continue;
         }
         let rowid = below.map(|b| b + i64::try_from(i).unwrap_or(0));
-        let row = params![e.network, target, name, query, l.msgid, ms, kind_name(l.kind), l.nick, l.text, l.own, i == 0 || skipped, rowid, l.via, l.reply_to];
+        let row =
+            params![e.network, target, name, query, l.msgid, ms, kind_name(l.kind), l.nick, l.received(), l.own, i == 0 || skipped, rowid, l.via, l.reply_to];
         let new = insert.execute(row)? == 1;
         if !new && i > 0 && !skipped {
             heal.execute(params![e.network, target, l.msgid])?;
@@ -762,6 +766,7 @@ mod tests {
 
     fn line(id: Option<&str>, secs: i64, text: &str) -> Line {
         Line {
+            raw: None,
             seq: 7,
             time: at(secs),
             msgid: id.map(Into::into),
@@ -799,6 +804,22 @@ mod tests {
         assert_eq!(path_from(Some("".into()), Some("/home/me".into())), PathBuf::from("/home/me/.local/share/hirc/history.db"));
         assert_eq!(path_from(Some("relative".into()), Some("/home/me".into())), PathBuf::from("/home/me/.local/share/hirc/history.db"));
         assert_eq!(path_from(None, Some("/home/me".into())), PathBuf::from("/home/me/.local/share/hirc/history.db"));
+    }
+
+    #[test]
+    fn formatting_codes_are_kept_as_they_came() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let mut c = Cache::open(&path).unwrap();
+        let (text, raw) = crate::store::uncoded("\x0307Synthetics\x0f shortage".into());
+        let coded = Line { text, raw, ..line(Some("m1"), 1, "") };
+        assert_eq!(c.put(&[entry(chan("#a"), vec![coded.clone()])]).unwrap(), 1);
+        let stored: String = Connection::open(&path).unwrap().query_row("SELECT text FROM lines WHERE msgid = 'm1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(stored, "\x0307Synthetics\x0f shortage");
+        let got = c.latest("net", "#a", 10).unwrap();
+        assert_eq!((got[0].text.as_str(), got[0].raw.as_deref()), ("Synthetics shortage", Some("\x0307Synthetics\x0f shortage")));
+        // The same line again, codes and all, is not a second one.
+        assert_eq!(c.put(&[entry(chan("#a"), vec![coded])]).unwrap(), 0);
     }
 
     #[test]

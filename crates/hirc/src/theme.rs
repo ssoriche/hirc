@@ -77,6 +77,77 @@ pub struct Palette {
     pub action: Hsla,
     pub server: Hsla,
     pub topic: Hsla,
+    /// mIRC's colours 0–98 as message text (`colour`): the theme's own
+    /// colour where it has one for the name, else mIRC's, lifted to
+    /// `TEXT_CONTRAST` on the buffer and the mention fill.
+    pub mirc: Vec<Hsla>,
+    /// What a colour given as hex is lifted against: the buffer and the
+    /// mention fill.
+    surfaces: [Color; 2],
+}
+
+/// mIRC's colours 0–98, as sent (modern.ircdocs.horse/formatting).
+pub const MIRC: [u32; 99] = [
+    0xffffff, 0x000000, 0x00007f, 0x009300, 0xff0000, 0x7f0000, 0x9c009c, 0xfc7f00, 0xffff00, 0x00fc00, 0x009393, 0x00ffff, 0x0000fc, 0xff00ff, 0x7f7f7f,
+    0xd2d2d2, 0x470000, 0x472100, 0x474700, 0x324700, 0x004700, 0x00472c, 0x004747, 0x002747, 0x000047, 0x2e0047, 0x470047, 0x47002a, 0x740000, 0x743a00,
+    0x747400, 0x517400, 0x007400, 0x007449, 0x007474, 0x004074, 0x000074, 0x4b0074, 0x740074, 0x740045, 0xb50000, 0xb56300, 0xb5b500, 0x7db500, 0x00b500,
+    0x00b571, 0x00b5b5, 0x0063b5, 0x0000b5, 0x7500b5, 0xb500b5, 0xb5006b, 0xff0000, 0xff8c00, 0xffff00, 0xb2ff00, 0x00ff00, 0x00ffa0, 0x00ffff, 0x008cff,
+    0x0000ff, 0xa500ff, 0xff00ff, 0xff0098, 0xff5959, 0xffb459, 0xffff71, 0xcfff60, 0x6fff6f, 0x65ffc9, 0x6dffff, 0x59b4ff, 0x5959ff, 0xc459ff, 0xff66ff,
+    0xff59bc, 0xff9c9c, 0xffd39c, 0xffff9c, 0xe2ff9c, 0x9cff9c, 0x9cffdb, 0x9cffff, 0x9cd3ff, 0x9c9cff, 0xdc9cff, 0xff9cff, 0xff94d3, 0x000000, 0x131313,
+    0x282828, 0x363636, 0x4d4d4d, 0x656565, 0x818181, 0x9f9f9f, 0xbcbcbc, 0xe2e2e2, 0xffffff,
+];
+
+/// mIRC's colours as text on this theme: white is body text, grey the
+/// secondary text, and red, green, purple, orange, yellow and light blue
+/// the theme's colours of those names (error, success, tertiary, action,
+/// event, link). The rest are mIRC's own. All lifted to `TEXT_CONTRAST`
+/// on `on`, so black reads on a dark buffer and white on a light one.
+fn mirc_colours(t: &Theme, on: &[Color]) -> Vec<Color> {
+    let themed = |n: usize| match n {
+        0 => Some(t.text.primary),
+        3 => Some(t.text.success),
+        4 => Some(t.text.error),
+        6 => Some(t.text.tertiary),
+        7 => Some(t.buffer.action),
+        8 => Some(t.buffer.server_messages.default),
+        12 => Some(t.buffer.url),
+        14 => Some(t.text.secondary),
+        _ => None,
+    };
+    MIRC.iter().enumerate().map(|(n, &rgb)| readable(themed(n).unwrap_or(Color::rgb(rgb)), on)).collect()
+}
+
+/// `c` as text on `on` (the first is the surface): `lift`, but a colour
+/// on the near side of a surface (black on a dark one, white on a light
+/// one) crosses to the far side first, keeping its hue, where `lift`
+/// would only push it further into the surface.
+fn readable(c: Color, on: &[Color]) -> Color {
+    let dark = luminance(on[0]) < 0.5;
+    let near = (luminance(c) < luminance(on[0])) == dark;
+    if near && contrast(c, on[0]) < TEXT_CONTRAST {
+        let (chroma, hue) = chroma_hue(c);
+        return lift(at_contrast(hue, chroma, on[0], TEXT_CONTRAST), on, TEXT_CONTRAST);
+    }
+    lift(c, on, TEXT_CONTRAST)
+}
+
+impl Palette {
+    /// A formatting colour as message text: legible on the buffer.
+    pub fn mirc_text(&self, colour: hirc_core::format::Color) -> Hsla {
+        match colour {
+            hirc_core::format::Color::Mirc(n) => self.mirc.get(usize::from(n)).copied().unwrap_or(self.text),
+            hirc_core::format::Color::Rgb(rgb) => c(readable(Color::rgb(rgb), &self.surfaces)),
+        }
+    }
+
+    /// A formatting colour exactly as given: a background, or text on a
+    /// background the sender chose too.
+    pub fn mirc_exact(&self, colour: hirc_core::format::Color) -> Hsla {
+        match colour {
+            hirc_core::format::Color::Mirc(n) => c(Color::rgb(MIRC.get(usize::from(n)).copied().unwrap_or(0))),
+            hirc_core::format::Color::Rgb(rgb) => c(Color::rgb(rgb)),
+        }
+    }
 }
 
 fn c(c: Color) -> Hsla {
@@ -550,6 +621,8 @@ pub fn palette(t: &Theme) -> Palette {
         action: read(t.buffer.action, &[bg, highlight]),
         server: read(t.buffer.server_messages.default, &[bg, highlight]),
         topic: c(lift(t.buffer.topic, &[title, bg], QUIET_CONTRAST)),
+        mirc: mirc_colours(t, &[bg, highlight]).into_iter().map(c).collect(),
+        surfaces: [bg, highlight],
     }
 }
 
@@ -636,6 +709,20 @@ mod tests {
     fn a_crowded_wheel_still_gives_the_fewest_hues() {
         let wheel: Vec<Color> = (0..12).map(|i| at_contrast(i as f32 * 30., 0.12, Color::rgb(0x181825), 7.)).collect();
         assert!(nick_hues(Color::rgb(0x89dceb), &wheel, &[]).0.len() >= NICK_HUES_MIN);
+    }
+
+    #[test]
+    fn mirc_colours_read_on_dark_and_light_buffers() {
+        // Catppuccin Mocha's and Latte's buffers, and plain black and white.
+        for bg in [0x181825, 0xe6e9ef, 0x000000, 0xffffff].map(Color::rgb) {
+            for (n, &rgb) in MIRC.iter().enumerate() {
+                let got = readable(Color::rgb(rgb), &[bg]);
+                assert!(contrast(got, bg) >= TEXT_CONTRAST - 0.1, "colour {n} on {bg:?}: {:.2}", contrast(got, bg));
+            }
+        }
+        // Black on a dark buffer becomes a light grey, not a darker black.
+        let black = readable(Color::rgb(0x000000), &[Color::rgb(0x181825)]);
+        assert!(luminance(black) > luminance(Color::rgb(0x181825)));
     }
 
     #[test]
