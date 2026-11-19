@@ -226,6 +226,7 @@ mod tests {
 
     fn said(nick: &str, kind: LineKind) -> Line {
         Line {
+            raw: None,
             seq: 0,
             time: chrono::Utc::now(),
             msgid: None,

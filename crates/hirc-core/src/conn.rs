@@ -149,6 +149,7 @@ pub fn retry_delay(backoff: Duration, registered: bool) -> (Duration, Duration) 
 /// hirc's own error line, for the server buffer.
 fn note(text: String) -> Line {
     Line {
+        raw: None,
         seq: 0,
         time: Utc::now(),
         msgid: None,
@@ -643,6 +644,7 @@ mod tests {
 
     fn line(id: &str, secs: i64) -> Line {
         Line {
+            raw: None,
             seq: 0,
             time: DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap(),
             msgid: Some(id.into()),

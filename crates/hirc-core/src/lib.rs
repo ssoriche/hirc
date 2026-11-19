@@ -13,6 +13,7 @@ pub mod conn;
 pub mod display;
 pub mod emoji;
 pub mod event;
+pub mod format;
 pub mod history;
 pub mod irccloud;
 pub mod isupport;

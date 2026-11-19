@@ -31,8 +31,8 @@ use crate::theme::Palette;
 use crate::views::selection::{self, Log, Mark};
 use crate::wrap;
 use gpui::{
-    AnyElement, Bounds, FontWeight, HighlightStyle, Hsla, InteractiveText, IntoElement, Pixels, Point, SharedString, StyledText, TextLayout, TextRun,
-    UnderlineStyle, Window, div, prelude::*, px,
+    AnyElement, Bounds, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveText, IntoElement, Pixels, Point, SharedString, StrikethroughStyle, StyledText,
+    TextLayout, TextRun, UnderlineStyle, Window, div, prelude::*, px,
 };
 use hirc_core::display::{self, Part};
 use hirc_core::event::{ConnStatus, Target};
@@ -399,6 +399,56 @@ impl Runs {
         self
     }
 
+    /// A line's text (see `push_text`) in the styles its formatting codes
+    /// asked for (`Line::spans`): bold, italic, underline, strikethrough,
+    /// colours and reverse. Monospace changes nothing, as the whole buffer
+    /// is in one font. A link keeps the link colour.
+    fn push_line(&mut self, line: &Line, p: &Palette, color: Hsla, link: Hsla) -> &mut Runs {
+        let spans = line.spans();
+        if spans.is_empty() {
+            return self.push_text(&line.text, color, link);
+        }
+        let text = line.text.as_str();
+        let mut at = 0;
+        for span in &spans {
+            if span.range.start > at {
+                self.push_text(&text[at..span.range.start], color, link);
+            }
+            let style = span.style;
+            // Text and background as sent, or swapped by reverse. A colour
+            // alone is made legible on this theme; a pair is the sender's.
+            let (fg, bg) = match (style.fg, style.bg) {
+                (Some(f), None) => (Some(p.mirc_text(f)), None),
+                (f, b) => (f.map(|f| p.mirc_exact(f)), b.map(|b| p.mirc_exact(b))),
+            };
+            let (fg, bg) = if style.reverse { (Some(bg.unwrap_or(p.buffer_bg)), Some(fg.unwrap_or(color))) } else { (fg, bg) };
+            let start = self.runs.len();
+            self.push_text(&text[span.range.clone()], fg.unwrap_or(color), link);
+            for (_, run) in &mut self.runs[start..] {
+                if style.bold {
+                    run.font_weight = Some(FontWeight::BOLD);
+                }
+                if style.italic {
+                    run.font_style = Some(FontStyle::Italic);
+                }
+                if style.underline && run.underline.is_none() {
+                    run.underline = Some(UnderlineStyle { thickness: px(1.), color: None, wavy: false });
+                }
+                if style.strike {
+                    run.strikethrough = Some(StrikethroughStyle { thickness: px(1.), color: None });
+                }
+                if bg.is_some() {
+                    run.background_color = bg;
+                }
+            }
+            at = span.range.end;
+        }
+        if at < text.len() {
+            self.push_text(&text[at..], color, link);
+        }
+        self
+    }
+
     fn element(self) -> StyledText {
         StyledText::new(self.text).with_highlights(self.runs)
     }
@@ -462,7 +512,11 @@ impl Runs {
                     let len = range.end.min(line.end).saturating_sub(range.start.max(line.start));
                     (len > 0).then(|| TextRun {
                         len,
-                        font: gpui::Font { weight: style.font_weight.unwrap_or(app.font.weight), ..app.font.clone() },
+                        font: gpui::Font {
+                            weight: style.font_weight.unwrap_or(app.font.weight),
+                            style: style.font_style.unwrap_or(app.font.style),
+                            ..app.font.clone()
+                        },
                         color: style.color.unwrap_or_default(),
                         background_color: None,
                         underline: None,
@@ -564,7 +618,7 @@ fn compose(app: &HircApp, line: &Line, cx: &Context) -> Composed {
     match line.kind {
         LineKind::Privmsg => {
             nick_run(&mut prefix, p, &fit_nick(0), nick, cx, mention);
-            body.push_text(&line.text, if pending { p.quiet } else { p.text }, link);
+            body.push_line(line, p, if pending { p.quiet } else { p.text }, link);
         }
         // A notice: irssi's `-nick-`, the dashes in the event colour so
         // they read as a marker, and the text a step below conversation.
@@ -572,13 +626,13 @@ fn compose(app: &HircApp, line: &Line, cx: &Context) -> Composed {
             prefix.push("-", p.server, false);
             nick_run(&mut prefix, p, &fit_nick(2), nick, cx, mention);
             prefix.push("-", p.server, false);
-            body.push_text(&line.text, p.text_dim, link);
+            body.push_line(line, p, p.text_dim, link);
         }
         LineKind::Action => {
             prefix.push("*", p.action, false);
             nick_run(&mut body, p, nick, nick, cx, mention);
             let color = if pending { p.quiet } else { p.action };
-            body.push(" ", color, false).push_text(&line.text, color, link);
+            body.push(" ", color, false).push_line(line, p, color, link);
         }
         // The marker carries the error, as arrows carry joins; the
         // sentence is text, so red never covers a whole line.
@@ -595,7 +649,7 @@ fn compose(app: &HircApp, line: &Line, cx: &Context) -> Composed {
         }
         LineKind::Server | LineKind::Notice => {
             prefix.push(display::marker(line.kind), p.server, false);
-            body.push_text(&line.text, p.text_dim, link);
+            body.push_line(line, p, p.text_dim, link);
         }
         kind => {
             prefix.push(display::marker(kind), p.server, false);

@@ -1962,6 +1962,7 @@ mod tests {
     fn said(s: i64, id: Option<&str>) -> hirc_core::store::Line {
         use hirc_core::store::{Delivery, Line};
         Line {
+            raw: None,
             seq: 0,
             time: at(s),
             msgid: id.map(Into::into),

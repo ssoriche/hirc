@@ -88,6 +88,10 @@ The input line is vim-style and starts in Insert mode.
 - `Tab` completes nicks, irssi style: whoever spoke last first, then everyone else by name. Each further `Tab` gives the next match. At the start of the line it adds `: `. At the start of a `/` line it completes commands.
 - People a bridge relays (the server's `bridges`, a Discord bot say) complete like everyone else once they've said something in the window; the bridge itself doesn't.
 
+## Formatting
+
+Bold, italic, underline, strikethrough, reverse and colours that other clients and bots send (mIRC's codes) show as styles; the codes themselves never do. Colours 0–15 take your theme's colours where it has one of that name (red is the theme's error colour, green its success), and every colour on its own is made legible on your theme, so black reads on a dark one. A colour sent with a background shows exactly as sent. Copying copies the plain text.
+
 ## Reactions and replies
 
 On servers with `message-tags` (Ergo, soju; not ZNC or IRCCloud's bouncer), and only on lines the server gave an id:
