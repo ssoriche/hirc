@@ -44,6 +44,8 @@ pub const COMMANDS: &[&str] = &[
     "quote",
     "topic",
     "oper",
+    "whois",
+    "wi",
     "react",
     "reply",
     "quit",
@@ -157,6 +159,14 @@ pub fn parse(input: &str, network: &str, target: Option<&str>) -> Result<Input, 
             Command::Raw { network: net, line: format!("OPER {first} {colon}{tail}") }
         }
         "oper" => return Err("Usage: /oper <name> [password]".into()),
+        // Bare, in a private chat: the person on the other end.
+        "whois" | "wi" => {
+            let nick = match first {
+                "" => target.filter(|t| !is_channel(t)).ok_or("Usage: /whois <nick>")?,
+                n => n,
+            };
+            Command::Whois { network: net, nick: nick.to_owned(), window: target.map(str::to_owned) }
+        }
         "quit" | "disconnect" => Command::Disconnect { network: net, reason: opt(args) },
         "reconnect" => Command::Reconnect { network: net },
         "join" | "j" | "msg" | "privmsg" | "query" | "q" | "nick" | "raw" | "quote" => return Err(format!("/{cmd} needs more arguments")),
@@ -186,6 +196,19 @@ mod tests {
         assert_eq!(p("/oper alice :colon"), raw("OPER alice ::colon"));
         assert_eq!(p("/oper alice"), raw("OPER alice"));
         assert_eq!(p("/oper"), Err("Usage: /oper <name> [password]".into()));
+    }
+
+    #[test]
+    fn whois_asks_about_a_nick_from_this_window() {
+        let whois =
+            |nick: &str, window: Option<&str>| Ok(Input::Send(Command::Whois { network: "net".into(), nick: nick.into(), window: window.map(str::to_owned) }));
+        assert_eq!(p("/whois bob"), whois("bob", Some("#chan")));
+        assert_eq!(p("/WI bob"), whois("bob", Some("#chan")));
+        assert_eq!(parse("/whois bob", "net", None), whois("bob", None));
+        // Bare, in a private chat: the person on the other end.
+        assert_eq!(parse("/whois", "net", Some("bob")), whois("bob", Some("bob")));
+        assert_eq!(p("/whois"), Err("Usage: /whois <nick>".into()));
+        assert_eq!(parse("/whois", "net", None), Err("Usage: /whois <nick>".into()));
     }
 
     #[test]

@@ -211,6 +211,13 @@ pub enum Command {
         network: String,
         line: String,
     },
+    /// WHOIS `nick`; the replies show in `window` (the server window
+    /// when `None`).
+    Whois {
+        network: String,
+        nick: String,
+        window: Option<String>,
+    },
     Disconnect {
         network: String,
         reason: Option<String>,
@@ -263,6 +270,7 @@ impl Command {
             | Command::Part { network, .. }
             | Command::Nick { network, .. }
             | Command::Raw { network, .. }
+            | Command::Whois { network, .. }
             | Command::Disconnect { network, .. }
             | Command::Reconnect { network }
             | Command::Older { network, .. }

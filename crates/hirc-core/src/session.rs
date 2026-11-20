@@ -12,7 +12,7 @@ use crate::isupport::Isupport;
 use crate::multiline::{self, Limits};
 use crate::proto::Message;
 use crate::store::{Delivery, Line, LineKind};
-use crate::{bridge, playback, sasl, services, split};
+use crate::{bridge, playback, sasl, services, split, whois};
 use chrono::{DateTime, TimeDelta, Utc};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -201,6 +201,9 @@ pub struct Session {
     /// replay, or a batch) and target: the run at the newest millisecond
     /// seen there, by `msgid::made_up`, for `stamped` to number them.
     alike: HashMap<(String, String), Run>,
+    /// WHOIS asked and not yet ended, by nick (lowercase): the window its
+    /// replies show in.
+    whois: HashMap<String, Target>,
 }
 
 /// The live end of a target, as the cache holds it.
@@ -394,6 +397,7 @@ impl Session {
             play: None,
             playing: None,
             alike: HashMap::new(),
+            whois: HashMap::new(),
         }
     }
 
@@ -715,9 +719,7 @@ impl Session {
                 if let [_, nick, reason, ..] = msg.params.as_slice() {
                     out.push(self.peer(nick, PeerChange::Away(Some(reason.clone()))));
                 }
-                let text = msg.params.get(1..).unwrap_or_default().join(" ");
-                let line = self.line(&msg, now, LineKind::Server, None, text, false);
-                out.push(self.event_line(Target::Server, line));
+                self.numeric(&msg, now, out);
             }
             "MODE" => self.on_mode(&msg, now, out),
             // No line of its own: the close follows, and its status line
@@ -741,13 +743,26 @@ impl Session {
                 }
             }
             "TAGMSG" => out.extend(self.reaction(&msg, now).map(Output::Event)),
-            c if c.len() == 3 && c.bytes().all(|b| b.is_ascii_digit()) => {
-                let text = msg.params.get(1..).unwrap_or_default().join(" ");
-                let line = self.line(&msg, now, LineKind::Server, None, text, false);
-                out.push(self.event_line(Target::Server, line));
-            }
+            c if c.len() == 3 && c.bytes().all(|b| b.is_ascii_digit()) => self.numeric(&msg, now, out),
             _ => {}
         }
+    }
+
+    /// A numeric with no handling of its own: its words, in the server
+    /// window. A WHOIS reply reads as a sentence, in the window that asked.
+    fn numeric(&mut self, msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let code = msg.command.as_str();
+        let about = msg.params.get(1).map(|n| n.to_ascii_lowercase()).unwrap_or_default();
+        let asked = self.whois.get(&about).cloned();
+        if code == whois::END {
+            self.whois.remove(&about);
+        }
+        // 401 and 402 answer more than WHOIS: only ours read as its.
+        let reply = whois::REPLIES.contains(&code) && (asked.is_some() || !matches!(code, "401" | "402"));
+        let text = if reply { whois::text(code, &msg.params) } else { Some(msg.params.get(1..).unwrap_or_default().join(" ")) };
+        let Some(text) = text else { return };
+        let line = self.line(msg, now, LineKind::Server, None, text, false);
+        out.push(self.event_line(asked.unwrap_or(Target::Server), line));
     }
 
     /// Next nickname to try: alt_nicks in order, then (only when the nick
@@ -2059,6 +2074,11 @@ impl Session {
                     vec![self.event_line(Target::Server, line)]
                 }
             },
+            Command::Whois { nick, window, .. } => {
+                let shown = window.map_or(Target::Server, |w| self.dest(&w));
+                self.whois.insert(nick.to_ascii_lowercase(), shown);
+                vec![send("WHOIS", [nick])]
+            }
             Command::Disconnect { reason, .. } => {
                 vec![send("QUIT", reason.into_iter().collect::<Vec<_>>()), Output::Quit]
             }
@@ -4185,6 +4205,62 @@ pub(crate) mod tests {
         // ERROR is kept as the reason for the close that follows.
         assert!(lines(&feed(&mut s, "ERROR :Closing link")).is_empty());
         assert_eq!(s.closing(), Some("Closing link"));
+    }
+
+    fn whois(s: &mut Session, nick: &str, window: Option<&str>) -> Vec<String> {
+        sent(&s.command(Command::Whois { network: "net".into(), nick: nick.into(), window: window.map(str::to_owned) }, now()))
+    }
+
+    #[test]
+    fn whois_replies_read_as_sentences_in_the_asking_window() {
+        let mut s = registered(ECHO);
+        assert_eq!(whois(&mut s, "Hide", Some("#test")), ["WHOIS Hide"]);
+        let here = Target::Channel("#test".into());
+        let said = |s: &mut Session, raw: &str| {
+            let out = lines(&feed(s, raw));
+            assert_eq!(out.len(), 1, "{raw}: {out:?}");
+            let (t, l) = out.into_iter().next().unwrap();
+            assert_eq!(l.kind, LineKind::Server);
+            (t, l.text)
+        };
+        let cases = [
+            (":srv 311 alice hide ~u xsdk.irc * :Hide Away", "hide is ~u@xsdk.irc (Hide Away)"),
+            (":srv 319 alice hide :~#bofh ~#ibmrox", "hide is in ~#bofh ~#ibmrox"),
+            (":srv 312 alice hide c.s8i.io :s8i IRC", "hide is on c.s8i.io (s8i IRC)"),
+            (":srv 313 alice hide :is a meat popsicle", "hide is a meat popsicle"),
+            (":srv 330 alice hide hideacct :is logged in as", "hide is logged in as hideacct"),
+            (":srv 301 alice hide :gone fishing", "hide is away: gone fishing"),
+            (":srv 338 alice hide 142.188.130.83 :Actual user@host, Actual IP", "hide's actual host is 142.188.130.83"),
+            (":srv 379 alice hide :is using modes +Z", "hide is using modes +Z"),
+            (":srv 671 alice hide :is using a secure connection", "hide is using a secure connection"),
+            (":srv 276 alice hide :has client certificate fingerprint abc123", "hide has client certificate fingerprint abc123"),
+            (":srv 320 alice hide :is a bot", "hide is a bot"),
+            (":srv 399 alice hide some thing :odd", "hide some thing odd"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(said(&mut s, raw), (here.clone(), want.to_owned()), "{raw}");
+        }
+        // Idle and sign-on: seconds as a duration, the time as a date.
+        let (t, text) = said(&mut s, ":srv 317 alice hide 390 1792552267 :seconds idle, signon time");
+        let on = DateTime::from_timestamp(1_792_552_267, 0).unwrap().with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M");
+        assert_eq!((t, text), (here.clone(), format!("hide has been idle 6m 30s, signed on {on}")));
+        // The end shows nothing, and the next reply is unasked.
+        assert!(lines(&feed(&mut s, ":srv 318 alice hide :End of /WHOIS list")).is_empty());
+        assert_eq!(said(&mut s, ":srv 319 alice hide :#x"), (Target::Server, "hide is in #x".to_owned()));
+    }
+
+    #[test]
+    fn whois_without_a_window_and_for_no_one() {
+        let mut s = registered(ECHO);
+        whois(&mut s, "ghost", None);
+        let (t, l) = lines(&feed(&mut s, ":srv 401 alice ghost :No such nick")).remove(0);
+        assert_eq!((t, l.text.as_str()), (Target::Server, "ghost: No such nick"));
+        whois(&mut s, "bob", Some("bob"));
+        let (t, _) = lines(&feed(&mut s, ":srv 311 alice bob b h * :Bob")).remove(0);
+        assert_eq!(t, Target::Query("bob".into()));
+        // A 401 nobody asked about (a message to someone gone) reads as before.
+        let (_, l) = lines(&feed(&mut s, ":srv 401 alice carol :No such nick/channel")).remove(0);
+        assert_eq!(l.text, "carol No such nick/channel");
     }
 
     #[test]

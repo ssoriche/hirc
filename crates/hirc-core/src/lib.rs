@@ -29,4 +29,5 @@ pub mod session;
 pub mod split;
 pub mod store;
 pub mod theme;
+pub mod whois;
 pub mod wire;
