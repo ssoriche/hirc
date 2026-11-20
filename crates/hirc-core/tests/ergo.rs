@@ -517,3 +517,29 @@ async fn oper_logs_in_and_is_refused_as_ergo_says() {
     assert!(oper("o3", "/oper spacey two words").await.contains("You are now an IRC operator"));
     assert!(oper("o4", "/oper tester operpass").await.contains("You are now an IRC operator"));
 }
+
+#[tokio::test]
+async fn whois_answers_in_the_window_that_asked() {
+    use hirc_core::command::{Input, parse};
+    let ergo = Ergo::start();
+    let (tx, mut rx) = net(carol(&ergo));
+    next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
+    let Ok(Input::Send(cmd)) = parse("/whois carol", "test", Some("#test")) else { panic!("not a send") };
+    tx.send(cmd).unwrap();
+    let here = Target::Channel("#test".into());
+    // Ergo's 311 first; its 318 shows nothing, so the 319 (channels) must
+    // arrive in #test too, as a sentence.
+    let user = next_matching(&mut rx, |e| match e {
+        Event::Line { target, line, .. } if *target == here && line.text.starts_with("carol is ") && line.text.contains('@') => Some(line.text.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(user.starts_with("carol is "), "{user}");
+    let chans = next_matching(&mut rx, |e| match e {
+        Event::Line { target, line, .. } if *target == here && line.text.starts_with("carol is in ") => Some(line.text.clone()),
+        Event::Line { target: Target::Server, line, .. } if line.text.contains("End of") => panic!("the end showed: {}", line.text),
+        _ => None,
+    })
+    .await;
+    assert!(chans.contains("#test"), "{chans}");
+}
