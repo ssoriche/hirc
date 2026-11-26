@@ -117,7 +117,7 @@ On servers with `message-tags` (Ergo, soju; not ZNC or IRCCloud's bouncer), and 
 | `/topic [text]` | Show or set the topic |
 | `/oper name [password]` | Become an IRC operator (no password for a login by client certificate) |
 | `/whois [nick]`, `/wi` | Who someone is, shown in this window (no nick in a private chat: the person you're talking to) |
-| `/cert`, `/cert new` | Log in to this server by client certificate: makes one, adds it to your NickServ account, and shows its fingerprint for an oper block's `certfp` |
+| `/cert`, `/cert new confirm` | Log in to this server by client certificate: makes one, adds it to your NickServ account, and shows its fingerprint for an oper block's `certfp` |
 | `/react <emoji>` | React to the marked line, else the last line someone else said |
 | `/reply <text>` | Reply to the marked line, else the last line someone else said |
 | `/raw line` (`/quote`) | Send a raw IRC line |
@@ -130,15 +130,17 @@ Start a line with `//` to send a message that begins with a slash.
 ## Certificate login
 
 `/cert` in any window of a server makes a client certificate for it
-(`~/.local/share/hirc/certs/<server>.pem`, readable only by you), adds it
+(`<name>.pem` in `$XDG_DATA_HOME/hirc/certs/`, default
+`~/.local/share/hirc/certs/`, where `<name>` is the server's
+`[servers.<name>]` key in `config.toml`; readable only by you), adds it
 to your account with NickServ if you're logged in, and shows its
 fingerprint. `/reconnect`, and hirc logs in with it (SASL EXTERNAL),
 falling back to your password if the server refuses it. To become an
 operator by certificate on Ergo, put the fingerprint in your oper block as
 `certfp: "<fingerprint>"`, then `/oper <name>` with no password.
-`/cert` again shows the fingerprint and whether it's in use; `/cert new`
-replaces it. A certificate named in `config.toml` (`sasl.external`) is used
-instead, and `/cert` only shows it.
+`/cert` again shows the fingerprint and whether it's in use; `/cert new confirm`
+replaces it (`/cert new` first says what that breaks). A certificate named in
+`config.toml` (`sasl.external`) is used instead, and `/cert` only shows it.
 
 ## Wire log
 
