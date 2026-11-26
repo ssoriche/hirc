@@ -104,6 +104,7 @@ impl Client {
             chathistory: true,
             history_page: Some(20),
             self_replays: false,
+            cert: None,
         };
         let mut s = Session::new("net", cfg).with_book(book);
         if keep {
@@ -655,6 +656,7 @@ fn irccloud(store: Store, book: Book, clock: &str) -> Client {
         chathistory: true,
         history_page: Some(20),
         self_replays: true,
+        cert: None,
     };
     let mut store = store;
     store.apply(Event::Status { network: "net".into(), status: ConnStatus::Connecting });
@@ -766,6 +768,7 @@ fn a_znc_playback_that_repeats_held_lines_adds_no_duplicate() {
             chathistory: true,
             history_page: Some(20),
             self_replays: false,
+            cert: None,
         };
         let mut store = store;
         store.apply(Event::Status { network: "net".into(), status: ConnStatus::Connecting });

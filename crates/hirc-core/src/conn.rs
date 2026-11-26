@@ -442,6 +442,7 @@ fn session_config(s: &Server) -> Result<SessionConfig, ConfigError> {
         bridges: s.bridges.clone(),
         chathistory: s.chathistory,
         history_page: s.history_page_size,
+        cert: None,
     })
 }
 
