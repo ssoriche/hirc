@@ -15,6 +15,7 @@ use crate::store::{Delivery, Line, LineKind};
 use crate::{bridge, playback, sasl, services, split, whois};
 use chrono::{DateTime, TimeDelta, Utc};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 
 /// The read-marker cap.
 const READ_MARKER: &str = "draft/read-marker";
@@ -47,6 +48,31 @@ pub struct SaslPlain {
     pub password: String,
 }
 
+/// The client certificate this connection presents, for SASL EXTERNAL
+/// and for `/cert`'s report. Never the key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresentedCert {
+    pub path: PathBuf,
+    pub fingerprint: String,
+}
+
+/// How this connection logged in to an account.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Login {
+    #[default]
+    None,
+    External,
+    Plain,
+    /// The certificate was refused, so the password was used.
+    PlainAfterRefusal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mech {
+    External,
+    Plain,
+}
+
 /// A server's settings with every password already looked up.
 #[derive(Clone, Default)]
 pub struct SessionConfig {
@@ -67,6 +93,8 @@ pub struct SessionConfig {
     /// The bouncer replays what this client missed as it attaches, timed
     /// but unasked and unbatched: IRCCloud's, given a client id.
     pub self_replays: bool,
+    /// Presented on this connection (TLS only).
+    pub cert: Option<PresentedCert>,
 }
 
 impl std::fmt::Debug for SaslPlain {
@@ -90,6 +118,7 @@ impl std::fmt::Debug for SessionConfig {
             .field("chathistory", &self.chathistory)
             .field("history_page", &self.history_page)
             .field("self_replays", &self.self_replays)
+            .field("cert", &self.cert)
             .finish()
     }
 }
@@ -100,7 +129,7 @@ enum Reg {
     CapLs,
     /// Waiting for this many ACK/NAK replies.
     CapReq(usize),
-    Sasl,
+    Sasl(Mech),
     /// CAP END sent, waiting for 001.
     Registering,
     Done,
@@ -124,6 +153,12 @@ pub struct Session {
     seq: u64,
     /// SASL finished (903/907) on this connection.
     authed: bool,
+    /// How SASL logged us in.
+    login: Login,
+    /// The certificate was refused and the password tried.
+    refused: bool,
+    /// The account the server says we are logged in to (900/901).
+    account: Option<String>,
     /// The server's `ERROR` text: why it is about to close the connection.
     closing: Option<String>,
     /// `draft/multiline` batches still arriving, by ref, oldest first.
@@ -372,6 +407,9 @@ impl Session {
             members_changed: BTreeMap::new(),
             seq: 0,
             authed: false,
+            login: Login::None,
+            refused: false,
+            account: None,
             closing: None,
             incoming: Vec::new(),
             batches: Batches::default(),
@@ -405,6 +443,14 @@ impl Session {
     /// the reason to show once the socket closes.
     pub fn closing(&self) -> Option<&str> {
         self.closing.as_deref()
+    }
+
+    pub fn login(&self) -> Login {
+        self.login
+    }
+
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
     }
 
     pub fn caps(&self) -> &Caps {
@@ -534,6 +580,9 @@ impl Session {
         self.nick = self.cfg.nickname.clone();
         self.alt = 0;
         self.authed = false;
+        self.login = Login::None;
+        self.refused = false;
+        self.account = None;
         self.incoming.clear();
         self.batches.clear();
         self.pages.clear();
@@ -680,11 +729,25 @@ impl Session {
             "PONG" if self.playing.is_some() && msg.params.last().is_some_and(|t| t == playback::DONE) => self.played(),
             "CAP" => self.on_cap(&msg, out),
             "AUTHENTICATE" => self.on_authenticate(&msg, out),
-            "903" | "907" if self.reg == Reg::Sasl => {
+            "903" | "907" if matches!(self.reg, Reg::Sasl(_)) => {
                 self.authed = true;
+                self.login = match (self.reg, self.refused) {
+                    (Reg::Sasl(Mech::External), _) => Login::External,
+                    (_, true) => Login::PlainAfterRefusal,
+                    _ => Login::Plain,
+                };
                 self.end_cap(out);
             }
+            "904" if self.reg == Reg::Sasl(Mech::External) => self.cert_refused(&msg, now, out),
             "902" | "904" | "905" | "906" => out.push(Output::Stop(format!("SASL authentication failed: {}", last(&msg)))),
+            "900" => {
+                self.account = msg.params.get(2).cloned();
+                self.numeric(&msg, now, out);
+            }
+            "901" => {
+                self.account = None;
+                self.numeric(&msg, now, out);
+            }
             "432" | "433" if self.reg != Reg::Done => match self.next_nick(msg.command == "433") {
                 Some(n) => {
                     self.nick = n;
@@ -1645,15 +1708,29 @@ impl Session {
         }
     }
 
+    /// Whether the server's `sasl` cap offers `mech` (no list offers any).
+    fn offers(&self, mech: &str) -> bool {
+        self.caps.is_enabled("sasl") && self.caps.value("sasl").is_none_or(|v| v.split(',').any(|m| m.eq_ignore_ascii_case(mech)))
+    }
+
     /// Caps are settled. SASL must finish before CAP END, or the server
-    /// registers us unauthenticated.
+    /// registers us unauthenticated. A presented certificate is tried
+    /// first; without one offered, the password as before.
     fn after_caps(&mut self, out: &mut Vec<Output>) {
+        if self.cfg.cert.is_some() && self.offers("EXTERNAL") {
+            self.reg = Reg::Sasl(Mech::External);
+            out.push(send("AUTHENTICATE", ["EXTERNAL"]));
+        } else {
+            self.plain(out);
+        }
+    }
+
+    fn plain(&mut self, out: &mut Vec<Output>) {
         if self.cfg.sasl.is_none() {
             return self.end_cap(out);
         }
-        let plain = self.caps.value("sasl").is_none_or(|v| v.split(',').any(|m| m.eq_ignore_ascii_case("PLAIN")));
-        if self.caps.is_enabled("sasl") && plain {
-            self.reg = Reg::Sasl;
+        if self.offers("PLAIN") {
+            self.reg = Reg::Sasl(Mech::Plain);
             out.push(send("AUTHENTICATE", ["PLAIN"]));
         } else {
             out.push(Output::Stop("the server does not offer SASL PLAIN".into()));
@@ -1661,17 +1738,37 @@ impl Session {
     }
 
     fn on_authenticate(&mut self, msg: &Message, out: &mut Vec<Output>) {
-        if self.reg != Reg::Sasl || msg.params.first().map(String::as_str) != Some("+") {
+        if msg.params.first().map(String::as_str) != Some("+") {
             return;
         }
-        let Some(creds) = &self.cfg.sasl else { return };
-        for chunk in sasl::chunks(&sasl::plain("", &creds.username, &creds.password)) {
-            out.push(send("AUTHENTICATE", [chunk]));
+        match self.reg {
+            // The certificate says who we are: nothing to add.
+            Reg::Sasl(Mech::External) => out.push(send("AUTHENTICATE", ["+"])),
+            Reg::Sasl(Mech::Plain) => {
+                let Some(creds) = &self.cfg.sasl else { return };
+                for chunk in sasl::chunks(&sasl::plain("", &creds.username, &creds.password)) {
+                    out.push(send("AUTHENTICATE", [chunk]));
+                }
+            }
+            _ => {}
         }
     }
 
+    /// 904 to EXTERNAL: the certificate isn't on any account. The password
+    /// if there is one, else stop: never on unauthenticated by surprise.
+    fn cert_refused(&mut self, _msg: &Message, now: DateTime<Utc>, out: &mut Vec<Output>) {
+        let path = self.cfg.cert.as_ref().map(|c| c.path.display().to_string()).unwrap_or_default();
+        if self.cfg.sasl.is_none() {
+            return out.push(Output::Stop(format!("the server refused the certificate in {path}")));
+        }
+        self.refused = true;
+        let line = self.local(LineKind::Server, format!("The server refused the certificate ({path}); logging in with your password."), now);
+        out.push(self.event_line(Target::Server, line));
+        self.plain(out);
+    }
+
     fn end_cap(&mut self, out: &mut Vec<Output>) {
-        if matches!(self.reg, Reg::CapLs | Reg::CapReq(_) | Reg::Sasl) {
+        if matches!(self.reg, Reg::CapLs | Reg::CapReq(_) | Reg::Sasl(_)) {
             self.reg = Reg::Registering;
             out.push(send("CAP", ["END"]));
         }
@@ -2258,6 +2355,7 @@ pub(crate) mod tests {
             chathistory: true,
             history_page: None,
             self_replays: false,
+            cert: None,
         }
     }
 
@@ -2294,6 +2392,87 @@ pub(crate) mod tests {
         assert_eq!(sent(&out), ["JOIN #test"]);
         assert!(out.contains(&Output::Event(Event::Status { network: "net".into(), status: ConnStatus::Connected { nick: "alice".into() } })));
         assert!(s.caps().is_enabled("echo-message"));
+    }
+
+    fn presented() -> Option<PresentedCert> {
+        Some(PresentedCert { path: "/c/net.pem".into(), fingerprint: "ab".repeat(32) })
+    }
+
+    fn plain() -> Option<SaslPlain> {
+        Some(SaslPlain { username: "alice".into(), password: "hunter22".into() })
+    }
+
+    /// Through CAP to the SASL step, with `ls` as the server's caps.
+    fn to_sasl(cert: Option<PresentedCert>, sasl: Option<SaslPlain>, ls: &str) -> (Session, Vec<String>) {
+        let mut s = Session::new("net", SessionConfig { cert, sasl, ..cfg() });
+        s.start();
+        feed(&mut s, &format!(":srv CAP * LS :{ls}"));
+        let acked: Vec<&str> = ls.split(' ').map(|c| c.split('=').next().unwrap()).collect();
+        let out = sent(&feed(&mut s, &format!(":srv CAP alice ACK :{}", acked.join(" "))));
+        (s, out)
+    }
+
+    #[test]
+    fn a_presented_cert_logs_in_by_external() {
+        let (mut s, out) = to_sasl(presented(), None, "sasl=PLAIN,EXTERNAL");
+        assert_eq!(out, ["AUTHENTICATE EXTERNAL"]);
+        assert_eq!(sent(&feed(&mut s, "AUTHENTICATE +")), ["AUTHENTICATE +"]);
+        feed(&mut s, ":srv 900 alice alice!a@h alice :You are now logged in as alice");
+        assert_eq!(sent(&feed(&mut s, ":srv 903 alice :SASL authentication successful")), ["CAP END"]);
+        assert_eq!((s.login(), s.account()), (Login::External, Some("alice")));
+        // A bare `sasl` (no list) may offer it too.
+        assert_eq!(to_sasl(presented(), None, "sasl").1, ["AUTHENTICATE EXTERNAL"]);
+    }
+
+    #[test]
+    fn external_not_offered_uses_plain_or_nothing() {
+        assert_eq!(to_sasl(presented(), plain(), "sasl=PLAIN").1, ["AUTHENTICATE PLAIN"]);
+        // A cert alone and no EXTERNAL: register without SASL.
+        assert_eq!(to_sasl(presented(), None, "sasl=PLAIN").1, ["CAP END"]);
+        assert_eq!(to_sasl(presented(), None, "server-time").1, ["CAP END"]);
+        // No cert: PLAIN, as before.
+        assert_eq!(to_sasl(None, plain(), "sasl=PLAIN,EXTERNAL").1, ["AUTHENTICATE PLAIN"]);
+    }
+
+    #[test]
+    fn a_refused_cert_falls_back_to_the_password() {
+        let (mut s, _) = to_sasl(presented(), plain(), "sasl=PLAIN,EXTERNAL");
+        feed(&mut s, "AUTHENTICATE +");
+        let out = feed(&mut s, ":srv 904 alice :SASL authentication failed");
+        assert_eq!(sent(&out), ["AUTHENTICATE PLAIN"]);
+        let (t, l) = lines(&out).remove(0);
+        assert_eq!((t, l.text.as_str()), (Target::Server, "The server refused the certificate (/c/net.pem); logging in with your password."));
+        assert_eq!(sent(&feed(&mut s, "AUTHENTICATE +")), [format!("AUTHENTICATE {}", sasl::plain("", "alice", "hunter22"))]);
+        assert_eq!(sent(&feed(&mut s, ":srv 903 alice :ok")), ["CAP END"]);
+        assert_eq!(s.login(), Login::PlainAfterRefusal);
+    }
+
+    #[test]
+    fn a_refused_cert_without_a_password_stops() {
+        let (mut s, _) = to_sasl(presented(), None, "sasl=EXTERNAL");
+        feed(&mut s, "AUTHENTICATE +");
+        let out = feed(&mut s, ":srv 904 alice :SASL authentication failed");
+        assert!(out.contains(&Output::Stop("the server refused the certificate in /c/net.pem".into())), "{out:?}");
+    }
+
+    #[test]
+    fn a_cert_alone_never_stops_a_server_without_sasl() {
+        let mut s = Session::new("net", SessionConfig { cert: presented(), ..cfg() });
+        s.start();
+        let out = feed(&mut s, ":srv 001 alice :Welcome");
+        assert!(!out.iter().any(|o| matches!(o, Output::Stop(_))), "{out:?}");
+        assert_eq!(s.login(), Login::None);
+    }
+
+    #[test]
+    fn plain_login_is_recorded() {
+        let (mut s, _) = to_sasl(None, plain(), "sasl=PLAIN");
+        feed(&mut s, "AUTHENTICATE +");
+        feed(&mut s, ":srv 900 alice alice!a@h alice :You are now logged in as alice");
+        feed(&mut s, ":srv 903 alice :ok");
+        assert_eq!((s.login(), s.account()), (Login::Plain, Some("alice")));
+        feed(&mut s, ":srv 901 alice alice!a@h :You are now logged out");
+        assert_eq!(s.account(), None);
     }
 
     #[test]
