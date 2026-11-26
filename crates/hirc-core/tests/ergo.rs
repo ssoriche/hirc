@@ -9,7 +9,7 @@ mod common;
 use common::events::{applied_until, line_in, net, next_matching, page, said};
 use common::{Ergo, Raw, register_account, register_always_on};
 use hirc_core::config::{Config, Sasl, Server};
-use hirc_core::event::{Command, ConnStatus, Event, Target};
+use hirc_core::event::{CertAction, Command, ConnStatus, Event, Target};
 use hirc_core::store::{Delivery, Line, LineKind};
 use std::time::Duration;
 
@@ -542,4 +542,60 @@ async fn whois_answers_in_the_window_that_asked() {
     })
     .await;
     assert!(chans.contains("#test"), "{chans}");
+}
+
+/// alice on TLS with her password, and certificates kept in `certs`.
+fn alice_with_certs(ergo: &Ergo, certs: &std::path::Path) -> Config {
+    let mut config = alice(ergo, "printf hunter22");
+    config.certs = Some(certs.to_owned());
+    config
+}
+
+fn server_text(e: &Event, has: &str) -> Option<String> {
+    match e {
+        Event::Line { line, .. } if line.text.contains(has) => Some(line.text.clone()),
+        _ => None,
+    }
+}
+
+/// A line from NickServ (not our own to it) containing `has`.
+fn from_nickserv(e: &Event, has: &str) -> Option<String> {
+    match e {
+        Event::Line { line, .. } if line.nick.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("NickServ")) && line.text.contains(has) => {
+            Some(line.text.clone())
+        }
+        _ => None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cert_is_made_added_and_logs_in_by_external() {
+    let ergo = Ergo::start();
+    register_account(ergo.plain_port, "alice", "hunter22").await;
+    let certs = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = net(alice_with_certs(&ergo, certs.path()));
+    next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
+    tx.send(Command::Cert { network: "test".into(), window: None, action: CertAction::Show }).unwrap();
+    let fp = next_matching(&mut rx, |e| server_text(e, "Fingerprint: ")).await.trim_start_matches("Fingerprint: ").to_owned();
+    // NickServ answers the CERT ADD that /cert sent. (hirc's own lines and
+    // our echo of the command name the fingerprint too, so they prove nothing.)
+    next_matching(&mut rx, |e| from_nickserv(e, "successfully added")).await;
+    tx.send(Command::Reconnect { network: "test".into() }).unwrap();
+    next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
+    tx.send(Command::Cert { network: "test".into(), window: None, action: CertAction::Show }).unwrap();
+    next_matching(&mut rx, |e| server_text(e, "In use: logged in with it.")).await;
+    // Ergo sees the same fingerprint (WHOIS 276).
+    tx.send(Command::Whois { network: "test".into(), nick: "alice".into(), window: None }).unwrap();
+    next_matching(&mut rx, |e| server_text(e, &format!("fingerprint {fp}"))).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_cert_falls_back_to_the_password() {
+    let ergo = Ergo::start();
+    register_account(ergo.plain_port, "alice", "hunter22").await;
+    let certs = tempfile::tempdir().unwrap();
+    hirc_core::cert::make(&hirc_core::cert::file_in(certs.path(), "test"), "alice").unwrap();
+    let (_tx, mut rx) = net(alice_with_certs(&ergo, certs.path()));
+    next_matching(&mut rx, |e| server_text(e, "refused the certificate")).await;
+    next_matching(&mut rx, |e| matches!(e, Event::Joined { channel, .. } if channel == "#test").then_some(())).await;
 }
