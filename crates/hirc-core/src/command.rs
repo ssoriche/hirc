@@ -1,6 +1,6 @@
 //! What the user typed into the input box: plain text or a /command.
 
-use crate::event::Command;
+use crate::event::{CertAction, Command};
 
 /// irssi-style window commands; numbers are 1-based, as typed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +44,7 @@ pub const COMMANDS: &[&str] = &[
     "quote",
     "topic",
     "oper",
+    "cert",
     "whois",
     "wi",
     "react",
@@ -159,6 +160,15 @@ pub fn parse(input: &str, network: &str, target: Option<&str>) -> Result<Input, 
             Command::Raw { network: net, line: format!("OPER {first} {colon}{tail}") }
         }
         "oper" => return Err("Usage: /oper <name> [password]".into()),
+        "cert" => {
+            let action = match args.to_ascii_lowercase().as_str() {
+                "" => CertAction::Show,
+                "new" => CertAction::New,
+                "new confirm" => CertAction::NewConfirmed,
+                _ => return Err("Usage: /cert [new [confirm]]".into()),
+            };
+            Command::Cert { network: net, window: target.map(str::to_owned), action }
+        }
         // Bare, in a private chat: the person on the other end.
         "whois" | "wi" => {
             let nick = match first {
@@ -181,6 +191,16 @@ mod tests {
 
     fn p(s: &str) -> Result<Input, String> {
         parse(s, "net", Some("#chan"))
+    }
+
+    #[test]
+    fn cert_shows_makes_or_replaces() {
+        let cert = |action, window: Option<&str>| Ok(Input::Send(Command::Cert { network: "net".into(), window: window.map(str::to_owned), action }));
+        assert_eq!(p("/cert"), cert(CertAction::Show, Some("#chan")));
+        assert_eq!(parse("/cert", "net", None), cert(CertAction::Show, None));
+        assert_eq!(p("/cert new"), cert(CertAction::New, Some("#chan")));
+        assert_eq!(p("/CERT NEW CONFIRM"), cert(CertAction::NewConfirmed, Some("#chan")));
+        assert_eq!(p("/cert old"), Err("Usage: /cert [new [confirm]]".into()));
     }
 
     #[test]
