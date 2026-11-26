@@ -6,6 +6,7 @@ pub mod batch;
 pub mod bridge;
 pub mod cache;
 pub mod caps;
+pub mod cert;
 pub mod command;
 pub mod complete;
 pub mod config;
