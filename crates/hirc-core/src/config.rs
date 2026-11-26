@@ -26,6 +26,9 @@ pub struct Config {
     pub font: Font,
     /// In file order, which is the order the sidebar shows them.
     pub servers: IndexMap<String, Server>,
+    /// Where per-server certificates live (`cert::dir()`); `None` (tests, snapshots) uses no known-location certificate. Set by the app, never read from the file.
+    #[serde(skip)]
+    pub certs: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
