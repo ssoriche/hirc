@@ -3,6 +3,7 @@
 //! UI, and reconnects with backoff. The UI never waits on any of it.
 
 use crate::cache::{Reach, Reacted, Shared};
+use crate::cert::{self, Cert, CertError};
 use crate::config::{self, Config, ConfigError, Sasl, Server};
 use crate::event::{Command, ConnStatus, Event, Target};
 use crate::history::{self, Anchor, Book};
@@ -10,14 +11,14 @@ use crate::irccloud;
 use crate::isupport::Isupport;
 use crate::proto::Message;
 use crate::services;
-use crate::session::{Output, SaslPlain, Session, SessionConfig};
+use crate::session::{Output, PresentedCert, SaslPlain, Session, SessionConfig};
 use crate::store::{Delivery, Line, LineKind};
 use crate::wire::LineReader;
 use chrono::{DateTime, Utc};
 use rustls::ClientConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
-use rustls_platform_verifier::ConfigVerifierExt;
+use rustls_platform_verifier::BuilderVerifierExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -100,7 +101,7 @@ pub fn spawn(config: Config, cache: Option<PathBuf>) -> (UnboundedSender<Command
                 for (name, server) in config.servers {
                     let (tx, rx) = unbounded_channel();
                     routes.insert(name.clone(), tx);
-                    tokio::spawn(run_server(name, server, rx, ev_tx.clone(), shared.clone()));
+                    tokio::spawn(run_server(name, server, rx, ev_tx.clone(), shared.clone(), config.certs.clone()));
                 }
                 while let Some(cmd) = cmd_rx.recv().await {
                     if let Some(tx) = routes.get(cmd.network()) {
@@ -326,7 +327,14 @@ fn keep_discovered(cache: &Shared, network: &str, book: &Book, said: &mut Option
     }
 }
 
-async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Command>, events: UnboundedSender<Event>, cache: Option<Shared>) {
+async fn run_server(
+    name: String,
+    server: Server,
+    mut cmds: UnboundedReceiver<Command>,
+    events: UnboundedSender<Event>,
+    cache: Option<Shared>,
+    certs: Option<PathBuf>,
+) {
     let status = |status| {
         let _ = events.send(Event::Status { network: name.clone(), status });
     };
@@ -359,7 +367,7 @@ async fn run_server(name: String, server: Server, mut cmds: UnboundedReceiver<Co
     loop {
         status(ConnStatus::Connecting);
         let mut registered = false;
-        let reason = match connect_once(&name, &server, &mut cached, &mut carry, &mut registered, &mut cmds, &events).await {
+        let reason = match connect_once(&name, &server, certs.clone(), &mut cached, &mut carry, &mut registered, &mut cmds, &events).await {
             Ok(end @ (End::Stopped(_) | End::Quit)) => {
                 cached = None;
                 status(match end {
@@ -446,20 +454,37 @@ fn session_config(s: &Server) -> Result<SessionConfig, ConfigError> {
     })
 }
 
+/// The certificate to present: the config's `sasl.external`, else the
+/// known file for `name` when it exists. A broken file is an error.
+fn client_cert(certs: Option<&Path>, name: &str, server: &Server) -> Result<Option<Cert>, CertError> {
+    if let Some(Sasl::External { cert, key }) = &server.sasl {
+        return cert::load_parts(cert, key.as_deref()).map(Some);
+    }
+    match certs.map(|d| cert::file_in(d, name)) {
+        Some(path) if path.exists() => cert::load(&path).map(Some),
+        _ => Ok(None),
+    }
+}
+
 /// A configured `root_cert_path` adds roots on top of the platform's (Halloy
 /// semantics). A missing, empty or invalid PEM is an error, not a fallback.
-fn tls_config(root_cert: Option<&Path>) -> Result<Arc<ClientConfig>, Error> {
-    let config = match root_cert {
+/// `client` is presented when the server asks (SASL EXTERNAL, certfp).
+fn tls_config(root_cert: Option<&Path>, client: Option<&Cert>) -> Result<Arc<ClientConfig>, Error> {
+    let builder = ClientConfig::builder();
+    let builder = match root_cert {
         Some(path) => {
             let certs = CertificateDer::pem_file_iter(path)?.collect::<Result<Vec<_>, _>>()?;
             if certs.is_empty() {
                 return Err(format!("no certificates in {}", path.display()).into());
             }
-            let builder = ClientConfig::builder();
             let verifier = rustls_platform_verifier::Verifier::new_with_extra_roots(certs, builder.crypto_provider().clone())?;
-            builder.dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_no_client_auth()
+            builder.dangerous().with_custom_certificate_verifier(Arc::new(verifier))
         }
-        None => ClientConfig::with_platform_verifier()?,
+        None => builder.with_platform_verifier()?,
+    };
+    let config = match client {
+        Some(c) => builder.with_client_auth_cert(c.chain.clone(), c.key.clone_key())?,
+        None => builder.with_no_client_auth(),
     };
     Ok(Arc::new(config))
 }
@@ -468,25 +493,34 @@ fn is_loopback(host: &str) -> bool {
     host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_once(
     name: &str,
     server: &Server,
+    certs: Option<PathBuf>,
     cached: &mut Option<SessionConfig>,
     carry: &mut Carry,
     registered: &mut bool,
     cmds: &mut UnboundedReceiver<Command>,
     events: &UnboundedSender<Event>,
 ) -> Result<End, Error> {
-    if matches!(server.sasl, Some(Sasl::External { .. })) {
-        return Ok(End::Stopped("SASL EXTERNAL isn't supported yet".into()));
-    }
     let host = server.server.clone();
     // Refuse before touching any secret.
     if !server.use_tls && !is_loopback(&host) {
         return Ok(End::Stopped("plaintext is only allowed to localhost; set use_tls = true".into()));
     }
+    // Read before connecting: a broken file is the user's to fix, not retry.
+    let presented = if server.use_tls {
+        let (certs, name2, s) = (certs.clone(), name.to_owned(), server.clone());
+        match tokio::task::spawn_blocking(move || client_cert(certs.as_deref(), &name2, &s)).await? {
+            Ok(c) => c,
+            Err(e) => return Ok(End::Stopped(format!("client certificate: {e}"))),
+        }
+    } else {
+        None
+    };
     let connector = if server.use_tls {
-        match tls_config(server.root_cert_path.as_deref()) {
+        match tls_config(server.root_cert_path.as_deref(), presented.as_ref()) {
             Ok(c) => Some(TlsConnector::from(c)),
             Err(e) => return Ok(End::Stopped(format!("TLS setup failed: {e}"))),
         }
@@ -518,6 +552,7 @@ async fn connect_once(
     let (r, mut w) = tokio::io::split(stream);
     let mut reader = LineReader::new(BufReader::new(r));
     let mut cfg = cfg;
+    cfg.cert = presented.as_ref().map(|c| PresentedCert { path: c.path.clone(), fingerprint: c.fingerprint.clone() });
     cfg.channels = merge_channels(&cfg.channels, &carry.rejoin);
     let mut session = Session::new(name, cfg).with_book(std::mem::take(&mut carry.book));
     if carry.cache.is_some() {
@@ -1140,12 +1175,36 @@ mod tests {
     #[test]
     fn bad_root_cert_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(tls_config(Some(&dir.path().join("missing.pem"))).is_err());
+        assert!(tls_config(Some(&dir.path().join("missing.pem")), None).is_err());
         let empty = dir.path().join("empty.pem");
         std::fs::write(&empty, "").unwrap();
-        assert!(tls_config(Some(&empty)).is_err());
+        assert!(tls_config(Some(&empty), None).is_err());
         std::fs::write(&empty, "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n").unwrap();
-        assert!(tls_config(Some(&empty)).is_err());
+        assert!(tls_config(Some(&empty), None).is_err());
+    }
+
+    #[test]
+    fn the_config_cert_wins_then_the_known_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let known = crate::cert::make(&crate::cert::file_in(tmp.path(), "net"), "a").unwrap();
+        let mut server = Server { server: "irc.example".into(), use_tls: true, ..Server::default() };
+        assert_eq!(client_cert(Some(tmp.path()), "net", &server).unwrap().unwrap().fingerprint, known.fingerprint);
+        assert!(client_cert(None, "net", &server).unwrap().is_none());
+        assert!(client_cert(Some(tmp.path()), "other", &server).unwrap().is_none());
+        let own = crate::cert::make(&tmp.path().join("own.pem"), "a").unwrap();
+        server.sasl = Some(Sasl::External { cert: tmp.path().join("own.pem"), key: None });
+        assert_eq!(client_cert(Some(tmp.path()), "net", &server).unwrap().unwrap().fingerprint, own.fingerprint);
+        // A configured file that is missing is an error, not a quiet "none".
+        server.sasl = Some(Sasl::External { cert: tmp.path().join("gone.pem"), key: None });
+        assert!(client_cert(Some(tmp.path()), "net", &server).is_err());
+    }
+
+    #[test]
+    fn tls_config_takes_a_client_cert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = crate::cert::make(&tmp.path().join("n.pem"), "a").unwrap();
+        assert!(tls_config(None, Some(&c)).unwrap().client_auth_cert_resolver.has_certs());
+        assert!(!tls_config(None, None).unwrap().client_auth_cert_resolver.has_certs());
     }
 
     #[test]

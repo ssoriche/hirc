@@ -105,6 +105,7 @@ fn main() {
     // system's monospace face rather than gpui's proportional default.
     let font_family = config.font.family.clone().or_else(|| Some(DEFAULT_FAMILY.to_owned()));
     let font_size = config.font.size.unwrap_or(14.);
+    config.certs = Some(hirc_core::cert::dir());
     let start = |config| {
         let (commands, events, flush) = hirc_core::conn::spawn(config, Some(hirc_core::cache::path()));
         (commands, events, Some(flush))
