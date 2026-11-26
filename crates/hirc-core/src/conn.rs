@@ -5,13 +5,13 @@
 use crate::cache::{Reach, Reacted, Shared};
 use crate::cert::{self, Cert, CertError};
 use crate::config::{self, Config, ConfigError, Sasl, Server};
-use crate::event::{Command, ConnStatus, Event, Target};
+use crate::event::{CertAction, Command, ConnStatus, Event, Target};
 use crate::history::{self, Anchor, Book};
 use crate::irccloud;
 use crate::isupport::Isupport;
 use crate::proto::Message;
 use crate::services;
-use crate::session::{Output, PresentedCert, SaslPlain, Session, SessionConfig};
+use crate::session::{CertOutcome, Output, PresentedCert, SaslPlain, Session, SessionConfig};
 use crate::store::{Delivery, Line, LineKind};
 use crate::wire::LineReader;
 use chrono::{DateTime, Utc};
@@ -454,6 +454,35 @@ fn session_config(s: &Server) -> Result<SessionConfig, ConfigError> {
     })
 }
 
+/// `/cert`'s file work: show, make or (confirmed) replace the certificate.
+fn cert_outcome(certs: Option<&Path>, name: &str, server: &Server, nick: &str, action: CertAction) -> CertOutcome {
+    let failed = |e: CertError| CertOutcome::Failed(e.to_string());
+    if let Some(Sasl::External { cert, key }) = &server.sasl {
+        if action != CertAction::Show {
+            return CertOutcome::ConfiguredNoNew;
+        }
+        return match cert::load_parts(cert, key.as_deref()) {
+            Ok(c) => CertOutcome::Configured { path: c.path, fingerprint: c.fingerprint },
+            Err(e) => failed(e),
+        };
+    }
+    let Some(dir) = certs else { return CertOutcome::NoPlace };
+    let path = cert::file_in(dir, name);
+    let made = |path: &Path| match cert::make(path, nick) {
+        Ok(c) => CertOutcome::Made { path: c.path, fingerprint: c.fingerprint },
+        Err(e) => failed(e),
+    };
+    match (path.exists(), action) {
+        (false, _) | (true, CertAction::NewConfirmed) => made(&path),
+        (true, CertAction::New) => CertOutcome::ConfirmFirst,
+        // Unreadable or broken: say so, and never overwrite it.
+        (true, CertAction::Show) => match cert::load(&path) {
+            Ok(c) => CertOutcome::Have { path: c.path, fingerprint: c.fingerprint },
+            Err(e) => failed(e),
+        },
+    }
+}
+
 /// The certificate to present: the config's `sasl.external`, else the
 /// known file for `name` when it exists. A broken file is an error.
 fn client_cert(certs: Option<&Path>, name: &str, server: &Server) -> Result<Option<Cert>, CertError> {
@@ -639,6 +668,11 @@ async fn connect_once(
                         return Ok(End::Closed(None));
                     }
                     Some(c @ Command::Older { .. }) => outs = older(&mut session, carry.cache.as_ref(), name, c),
+                    Some(Command::Cert { window, action, .. }) => {
+                        let (certs, n, s, nick) = (certs.clone(), name.to_owned(), server.clone(), session.nick().to_owned());
+                        let outcome = tokio::task::spawn_blocking(move || cert_outcome(certs.as_deref(), &n, &s, &nick, action)).await?;
+                        outs = session.cert_report(window.as_deref(), outcome, Utc::now());
+                    }
                     Some(c) => outs = session.command(c, Utc::now()),
                 },
                 _ = tick.tick() => {
@@ -677,6 +711,21 @@ mod tests {
     use super::*;
     use crate::cache::{Above, Below, Cache, Entry};
     use crate::session::tests::{asked, feed, historied, histories, irccloud, now, played, sent, zncd};
+
+    #[test]
+    fn cert_outcomes_from_the_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Server { server: "irc.example".into(), use_tls: true, ..Server::default() };
+        let go = |a| cert_outcome(Some(tmp.path()), "net", &s, "alice", a);
+        let CertOutcome::Made { fingerprint: first, .. } = go(CertAction::Show) else { panic!() };
+        assert!(matches!(go(CertAction::Show), CertOutcome::Have { ref fingerprint, .. } if *fingerprint == first));
+        assert_eq!(go(CertAction::New), CertOutcome::ConfirmFirst);
+        assert!(matches!(go(CertAction::NewConfirmed), CertOutcome::Made { ref fingerprint, .. } if *fingerprint != first));
+        assert_eq!(cert_outcome(None, "net", &s, "alice", CertAction::Show), CertOutcome::NoPlace);
+        std::fs::write(cert::file_in(tmp.path(), "net"), "junk").unwrap();
+        assert!(matches!(go(CertAction::Show), CertOutcome::Failed(_)));
+        assert_eq!(std::fs::read_to_string(cert::file_in(tmp.path(), "net")).unwrap(), "junk", "never overwritten");
+    }
 
     fn line(id: &str, secs: i64) -> Line {
         Line {

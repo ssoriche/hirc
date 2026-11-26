@@ -392,6 +392,28 @@ fn mode_text(by: &str, modes: &str) -> String {
     format!("{by} set mode {modes}")
 }
 
+/// What `/cert` found or did, for `Session::cert_report` to tell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CertOutcome {
+    Made {
+        path: PathBuf,
+        fingerprint: String,
+    },
+    Have {
+        path: PathBuf,
+        fingerprint: String,
+    },
+    Configured {
+        path: PathBuf,
+        fingerprint: String,
+    },
+    ConfirmFirst,
+    ConfiguredNoNew,
+    /// No known place for certificates (tests, snapshots).
+    NoPlace,
+    Failed(String),
+}
+
 impl Session {
     pub fn new(network: &str, cfg: SessionConfig) -> Session {
         let wanted = if cfg.chathistory { caps::WANTED } else { caps::WITHOUT_PLAYBACK };
@@ -2176,6 +2198,8 @@ impl Session {
                 self.whois.insert(nick.to_ascii_lowercase(), shown);
                 vec![send("WHOIS", [nick])]
             }
+            // conn handles it (file work) before it reaches the session.
+            Command::Cert { .. } => Vec::new(),
             Command::Disconnect { reason, .. } => {
                 vec![send("QUIT", reason.into_iter().collect::<Vec<_>>()), Output::Quit]
             }
@@ -2203,6 +2227,66 @@ impl Session {
             }
             Command::Reconnect { .. } => Vec::new(),
         }
+    }
+
+    /// `/cert`'s lines in `window`, and `NickServ CERT ADD` when logged in
+    /// to an account the certificate isn't logging in to yet.
+    pub fn cert_report(&mut self, window: Option<&str>, outcome: CertOutcome, now: DateTime<Utc>) -> Vec<Output> {
+        const CONFIGURED: &str = "Set in config.toml (sasl.external); /cert makes nothing.";
+        let mut said: Vec<(LineKind, String)> = Vec::new();
+        let mut say = |s: String| said.push((LineKind::Server, s));
+        let mut add = None;
+        let logged_in = self.account.is_some();
+        match &outcome {
+            CertOutcome::Made { path, fingerprint } => {
+                say(format!("Made a certificate for {}: {}", self.network, path.display()));
+                say(format!("Fingerprint: {fingerprint}"));
+                say(format!("For ircd.yaml (an oper block): certfp: \"{fingerprint}\""));
+                if logged_in {
+                    add = Some(fingerprint.clone());
+                } else {
+                    say("Log in, then /cert again to add it to your account.".into());
+                }
+                say("/reconnect to log in with it.".into());
+            }
+            CertOutcome::Have { path, fingerprint } | CertOutcome::Configured { path, fingerprint } => {
+                say(format!("Certificate: {}", path.display()));
+                say(format!("Fingerprint: {fingerprint}"));
+                say(format!("For ircd.yaml (an oper block): certfp: \"{fingerprint}\""));
+                let presented = self.cfg.cert.as_ref().is_some_and(|c| &c.fingerprint == fingerprint);
+                say(match (presented, self.login) {
+                    (true, Login::External) => "In use: logged in with it.",
+                    (true, Login::PlainAfterRefusal) => "In use, but the server refused it; logged in with your password.",
+                    (true, _) => "Presented, not used to log in.",
+                    (false, _) => "Not in use yet: /reconnect to use it.",
+                }
+                .into());
+                if logged_in && !(presented && self.login == Login::External) {
+                    add = Some(fingerprint.clone());
+                }
+                if matches!(outcome, CertOutcome::Configured { .. }) {
+                    say(CONFIGURED.into());
+                }
+            }
+            CertOutcome::ConfirmFirst => {
+                say("Replacing the certificate stops the old fingerprint working for NickServ and your oper block. /cert new confirm to replace it.".into())
+            }
+            CertOutcome::ConfiguredNoNew => say(CONFIGURED.into()),
+            CertOutcome::NoPlace => say("Certificates aren't available here.".into()),
+            CertOutcome::Failed(why) => said.push((LineKind::Error, format!("Certificate: {why}"))),
+        }
+        let shown = window.map_or(Target::Server, |w| self.dest(w));
+        let mut out: Vec<Output> = said
+            .into_iter()
+            .map(|(kind, text)| {
+                let line = self.local(kind, text, now);
+                self.event_line(shown.clone(), line)
+            })
+            .collect();
+        if let Some(fp) = add {
+            out.push(send("PRIVMSG", ["NickServ".to_owned(), format!("CERT ADD {fp}")]));
+        }
+        out
     }
 
     fn local(&mut self, kind: LineKind, text: String, now: DateTime<Utc>) -> Line {
@@ -4384,6 +4468,94 @@ pub(crate) mod tests {
         // ERROR is kept as the reason for the close that follows.
         assert!(lines(&feed(&mut s, "ERROR :Closing link")).is_empty());
         assert_eq!(s.closing(), Some("Closing link"));
+    }
+
+    fn report(s: &mut Session, outcome: CertOutcome) -> (Vec<String>, Vec<(Target, String)>) {
+        let out = s.cert_report(Some("#test"), outcome, now());
+        (sent(&out), lines(&out).into_iter().map(|(t, l)| (t, l.text)).collect())
+    }
+
+    fn cert_texts(ls: &[(Target, String)]) -> Vec<&str> {
+        ls.iter().map(|(_, t)| t.as_str()).collect()
+    }
+
+    #[test]
+    fn cert_made_while_logged_in_is_added_to_the_account() {
+        let fp = "ab".repeat(32);
+        let (mut s, _) = to_sasl(None, plain(), "sasl=PLAIN");
+        feed(&mut s, "AUTHENTICATE +");
+        feed(&mut s, ":srv 900 alice alice!a@h alice :You are now logged in as alice");
+        feed(&mut s, ":srv 903 alice :ok");
+        feed(&mut s, ":srv 001 alice :hi");
+        let (sends, ls) = report(&mut s, CertOutcome::Made { path: "/c/net.pem".into(), fingerprint: fp.clone() });
+        assert_eq!(sends, [format!("PRIVMSG NickServ :CERT ADD {fp}")]);
+        assert!(ls.iter().all(|(t, _)| *t == Target::Channel("#test".into())));
+        let got: Vec<String> = ls.into_iter().map(|(_, t)| t).collect();
+        assert_eq!(
+            got,
+            [
+                "Made a certificate for net: /c/net.pem".to_owned(),
+                format!("Fingerprint: {fp}"),
+                format!("For ircd.yaml (an oper block): certfp: \"{fp}\""),
+                "/reconnect to log in with it.".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cert_made_logged_out_says_to_log_in() {
+        let mut s = registered(ECHO);
+        let (sends, ls) = report(&mut s, CertOutcome::Made { path: "/c/net.pem".into(), fingerprint: "cd".repeat(32) });
+        assert!(sends.is_empty());
+        assert!(cert_texts(&ls).contains(&"Log in, then /cert again to add it to your account."));
+    }
+
+    #[test]
+    fn cert_status_lines() {
+        let fp = "ab".repeat(32);
+        let have = || CertOutcome::Have { path: "/c/net.pem".into(), fingerprint: "ab".repeat(32) };
+        // Logged in with it.
+        let (mut s, _) = to_sasl(presented(), None, "sasl=EXTERNAL");
+        feed(&mut s, "AUTHENTICATE +");
+        feed(&mut s, ":srv 900 alice alice!a@h alice :in");
+        feed(&mut s, ":srv 903 alice :ok");
+        let (sends, ls) = report(&mut s, have());
+        assert!(sends.is_empty(), "already on the account");
+        assert_eq!(cert_texts(&ls)[0], "Certificate: /c/net.pem");
+        assert_eq!(cert_texts(&ls)[1], format!("Fingerprint: {fp}"));
+        assert_eq!(*cert_texts(&ls).last().unwrap(), "In use: logged in with it.");
+        // Refused, password used: it is added.
+        let (mut s, _) = to_sasl(presented(), plain(), "sasl=PLAIN,EXTERNAL");
+        feed(&mut s, "AUTHENTICATE +");
+        feed(&mut s, ":srv 904 alice :no");
+        feed(&mut s, "AUTHENTICATE +");
+        feed(&mut s, ":srv 900 alice alice!a@h alice :in");
+        feed(&mut s, ":srv 903 alice :ok");
+        let (sends, ls) = report(&mut s, have());
+        assert_eq!(sends, [format!("PRIVMSG NickServ :CERT ADD {fp}")]);
+        assert!(cert_texts(&ls).contains(&"In use, but the server refused it; logged in with your password."));
+        // Presented, no SASL login.
+        let (mut s, _) = to_sasl(presented(), None, "server-time");
+        assert!(cert_texts(&report(&mut s, have()).1).contains(&"Presented, not used to log in."));
+        // Made after this connection began.
+        let mut s = registered(ECHO);
+        assert!(cert_texts(&report(&mut s, have()).1).contains(&"Not in use yet: /reconnect to use it."));
+    }
+
+    #[test]
+    fn cert_other_outcomes() {
+        let mut s = registered(ECHO);
+        assert_eq!(
+            cert_texts(&report(&mut s, CertOutcome::ConfirmFirst).1),
+            ["Replacing the certificate stops the old fingerprint working for NickServ and your oper block. /cert new confirm to replace it."]
+        );
+        let fp = "ef".repeat(32);
+        let ls = report(&mut s, CertOutcome::Configured { path: "/own.pem".into(), fingerprint: fp.clone() }).1;
+        assert_eq!(*cert_texts(&ls).last().unwrap(), "Set in config.toml (sasl.external); /cert makes nothing.");
+        assert_eq!(cert_texts(&report(&mut s, CertOutcome::ConfiguredNoNew).1), ["Set in config.toml (sasl.external); /cert makes nothing."]);
+        let (_, ls) = report(&mut s, CertOutcome::Failed("can't read /c/net.pem: denied".into()));
+        assert_eq!(cert_texts(&ls), ["Certificate: can't read /c/net.pem: denied"]);
+        assert_eq!(cert_texts(&report(&mut s, CertOutcome::NoPlace).1), ["Certificates aren't available here."]);
     }
 
     fn whois(s: &mut Session, nick: &str, window: Option<&str>) -> Vec<String> {

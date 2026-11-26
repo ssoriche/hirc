@@ -218,6 +218,12 @@ pub enum Command {
         nick: String,
         window: Option<String>,
     },
+    /// `/cert`: lines show in `window` (the server window when `None`).
+    Cert {
+        network: String,
+        window: Option<String>,
+        action: CertAction,
+    },
     Disconnect {
         network: String,
         reason: Option<String>,
@@ -261,6 +267,15 @@ pub enum Command {
     },
 }
 
+/// What `/cert` was asked to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CertAction {
+    Show,
+    New,
+    /// `/cert new confirm`: replace it.
+    NewConfirmed,
+}
+
 impl Command {
     pub fn network(&self) -> &str {
         match self {
@@ -271,6 +286,7 @@ impl Command {
             | Command::Nick { network, .. }
             | Command::Raw { network, .. }
             | Command::Whois { network, .. }
+            | Command::Cert { network, .. }
             | Command::Disconnect { network, .. }
             | Command::Reconnect { network }
             | Command::Older { network, .. }
