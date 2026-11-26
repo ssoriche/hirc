@@ -90,9 +90,15 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), CertError> {
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent).map_err(werr)?;
     }
     let tmp = path.with_extension("pem.new");
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).map_err(werr)?;
-    f.write_all(bytes).and_then(|_| f.sync_all()).map_err(werr)?;
-    std::fs::rename(&tmp, path).map_err(werr)
+    // A stale file would keep its old mode; start from a fresh, private one.
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).map_err(werr)?;
+    let done = f.write_all(bytes).and_then(|_| f.sync_all()).and_then(|_| std::fs::rename(&tmp, path));
+    if let Err(source) = done {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(werr(source));
+    }
+    Ok(())
 }
 
 /// The certificate(s) and key in one PEM file.
@@ -149,6 +155,20 @@ mod tests {
         assert_eq!(mode(path.parent().unwrap()), 0o700);
         // Making again replaces it.
         assert_ne!(make(&path, "alice").unwrap().fingerprint, made.fingerprint);
+        assert!(!path.with_extension("pem.new").exists());
+    }
+
+    #[test]
+    fn a_stale_loose_temp_file_does_not_leak_into_the_certificate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("net.pem");
+        let stale = path.with_extension("pem.new");
+        std::fs::write(&stale, "junk").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+        make(&path, "a").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!stale.exists());
+        load(&path).unwrap();
     }
 
     #[test]
